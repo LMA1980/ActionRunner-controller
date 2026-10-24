@@ -85,11 +85,14 @@ stages:
     ));
     tokio::spawn(scheduler.run_loop());
 
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+
     let state = Arc::new(AppState {
         config: config.clone(),
         job_store: job_store.clone(),
         cluster: cluster.clone(),
         tx,
+        log_broadcaster,
     });
 
     let app = create_router(state.clone());

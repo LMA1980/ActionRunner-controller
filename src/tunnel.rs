@@ -19,7 +19,7 @@ use action_runner_ipc::{
     MSG_TYPE_WORKER_HEARTBEAT, MSG_TYPE_WORKER_REGISTRATION, MSG_TYPE_WORKER_SHUTDOWN,
 };
 
-use crate::aggregator::{aggregate_metrics, append_logs};
+use crate::aggregator::{aggregate_metrics, append_logs, format_log_entries};
 use crate::cluster::WorkerCommand;
 use crate::job::StageStatus;
 use crate::webhook::AppState;
@@ -197,6 +197,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                                 use tokio::io::AsyncWriteExt;
                                                 let _ = f.write_all(note.as_bytes()).await;
                                             }
+                                            state.broadcast_log(job_id, &note);
                                         }
                                     }
                                     state.cluster.release_slot(&node_id).await;
@@ -209,6 +210,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         if let Some(record) = state.job_store.get_job(&first.job_id).await {
                                             let full_path = state.config.workspace_dir.join(&record.log_file);
                                             let _ = append_logs(&full_path, &entries);
+                                            let chunk = format_log_entries(&entries);
+                                            state.broadcast_log(&first.job_id, &chunk);
                                         }
                                     }
                                 }
@@ -259,6 +262,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     use tokio::io::AsyncWriteExt;
                     let _ = f.write_all(note.as_bytes()).await;
                 }
+                state.broadcast_log(job_id, &note);
             }
         }
         state.job_store.notify_event();

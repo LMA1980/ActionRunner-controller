@@ -45,11 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     tokio::spawn(scheduler.run_loop());
 
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(4096);
+
     let state = Arc::new(AppState {
         config,
         job_store,
         cluster,
         tx,
+        log_broadcaster,
     });
 
     let app = create_router(state);
