@@ -358,13 +358,58 @@ pub async fn get_job_log(
                 )
                     .into_response()
             }
+            JobStatus::Running { started_at } => {
+                let mut stage_info = String::new();
+                for s in &record.stages {
+                    let node_str = s.assigned_node.as_deref().unwrap_or("unassigned");
+                    stage_info.push_str(&format!("  - {} (id: {}): {:?} [node: {}]\n", s.name, s.id, s.status, node_str));
+                }
+                let msg = format!(
+                    "[ActionRunner-rs] Job '{}' is currently EXECUTING across cluster.\nRepository: {}\nRef:        {}\nCommit SHA: {}\nStarted At: {}\n\nActive Pipeline Stages:\n{}",
+                    record.job.id,
+                    record.job.repo_name,
+                    record.job.ref_name,
+                    record.job.commit_sha,
+                    started_at.to_rfc3339(),
+                    stage_info
+                );
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                    ],
+                    msg,
+                )
+                    .into_response()
+            }
+            JobStatus::Completed { duration_secs, exit_code } => {
+                let msg = format!(
+                    "[ActionRunner-rs] Job '{}' completed in {}s with exit code {}.\nLog file was empty or has finished recording.",
+                    record.job.id,
+                    duration_secs,
+                    exit_code
+                );
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                    ],
+                    msg,
+                )
+                    .into_response()
+            }
             _ => (
-                StatusCode::NOT_FOUND,
+                StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
                     (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                 ],
-                "Log file not found or not yet generated".to_string(),
+                format!("[ActionRunner-rs] Job '{}' log is initializing...\nRepository: {}\nRef: {}\n", record.job.id, record.job.repo_name, record.job.ref_name),
             )
                 .into_response(),
         },

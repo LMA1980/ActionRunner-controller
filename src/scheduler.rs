@@ -97,6 +97,7 @@ impl DAGScheduler {
                 toolchain: s.toolchain.clone(),
                 depends_on: s.depends_on.clone(),
                 status: StageStatus::Pending,
+                assigned_node: None,
             })
             .collect();
 

@@ -100,6 +100,8 @@ pub struct StageRecord {
     pub toolchain: Option<String>,
     pub depends_on: Vec<String>,
     pub status: StageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +465,9 @@ impl JobStore {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
+                    if let StageStatus::Assigned { ref node_id, .. } | StageStatus::Running { ref node_id, .. } = status {
+                        stage.assigned_node = Some(node_id.clone());
+                    }
                     stage.status = status;
                     record.updated_at = Utc::now();
                 }
