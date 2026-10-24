@@ -448,6 +448,33 @@ pub async fn handle_webhook(
 
     let enqueue_res = state.job_store.enqueue_job(job.clone(), log_file).await;
     let final_job_id = enqueue_res.job_id;
+
+    if enqueue_res.ignored {
+        let reason = enqueue_res
+            .ignore_reason
+            .unwrap_or_else(|| "Event ignored: existing event won for commit".to_string());
+        info!(
+            event = %event_type,
+            repo = %repo_name,
+            commit = %commit_sha,
+            reason = %reason,
+            winning_job_id = ?enqueue_res.winning_job_id,
+            "Incoming webhook ignored: competing event already won for commit"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ignored",
+                "reason": reason,
+                "winning_job_id": enqueue_res.winning_job_id,
+                "event": event_type,
+                "repository": repo_name,
+                "commit_sha": commit_sha,
+                "ref": ref_name
+            })),
+        ));
+    }
+
     let _ = state.tx.try_send(job);
 
     if !enqueue_res.superseded_jobs.is_empty() {
@@ -628,5 +655,133 @@ mod tests {
         let (status, json) = res.unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(json["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_merge_and_push_deduplication() {
+        let secret = "testsecret";
+        let (state, _rx) = make_test_state(Some(secret), false, false);
+        let commit = "deadbeef12345678deadbeef12345678deadbeef";
+
+        // 1. First event: Pull Request merged (closed & merged) -> event_type = "merge"
+        let merge_payload = serde_json::json!({
+            "repository": {
+                "full_name": "LMA1980/ActionRunner-rs",
+                "clone_url": "https://github.com/LMA1980/ActionRunner-rs.git"
+            },
+            "action": "closed",
+            "pull_request": {
+                "merged": true,
+                "merge_commit_sha": commit,
+                "head": {"repo": {"full_name": "LMA1980/ActionRunner-rs"}, "sha": commit, "ref": "feat/my-branch"},
+                "base": {"repo": {"full_name": "LMA1980/ActionRunner-rs"}, "ref": "main"},
+                "author_association": "OWNER"
+            }
+        }).to_string();
+
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-github-event", "pull_request".parse().unwrap());
+        headers1.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, merge_payload.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        let res1 = handle_webhook(State(state.clone()), headers1, Bytes::from(merge_payload)).await;
+        assert!(res1.is_ok());
+        let (status1, json1) = res1.unwrap();
+        assert_eq!(status1, StatusCode::ACCEPTED);
+        assert_eq!(json1["status"], "queued");
+        assert_eq!(json1["event"], "merge");
+        let winning_job_id = json1["job_id"].as_str().unwrap().to_string();
+
+        // 2. Second event: Push to main for the exact same merge commit SHA
+        let push_payload = serde_json::json!({
+            "repository": {
+                "full_name": "LMA1980/ActionRunner-rs",
+                "clone_url": "https://github.com/LMA1980/ActionRunner-rs.git"
+            },
+            "ref": "refs/heads/main",
+            "after": commit,
+            "sender": {"login": "LMA1980"}
+        })
+        .to_string();
+
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-github-event", "push".parse().unwrap());
+        headers2.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, push_payload.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        let res2 = handle_webhook(State(state), headers2, Bytes::from(push_payload)).await;
+        assert!(res2.is_ok());
+        let (status2, json2) = res2.unwrap();
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(json2["status"], "ignored");
+        assert_eq!(json2["winning_job_id"], winning_job_id);
+        assert!(json2["reason"].as_str().unwrap().contains("Merge event"));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_pull_request_wins_over_push() {
+        let secret = "testsecret";
+        let (state, _rx) = make_test_state(Some(secret), false, false);
+        let commit = "ca11ab1e12345678ca11ab1e12345678ca11ab1e";
+
+        // 1. Push arrives first for PR branch
+        let push_payload = serde_json::json!({
+            "repository": {
+                "full_name": "LMA1980/ActionRunner-rs",
+                "clone_url": "https://github.com/LMA1980/ActionRunner-rs.git"
+            },
+            "ref": "refs/heads/feat/patch-1",
+            "after": commit,
+            "sender": {"login": "LMA1980"}
+        })
+        .to_string();
+
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("x-github-event", "push".parse().unwrap());
+        headers1.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, push_payload.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        let res1 = handle_webhook(State(state.clone()), headers1, Bytes::from(push_payload)).await;
+        assert!(res1.is_ok());
+        let (status1, json1) = res1.unwrap();
+        assert_eq!(status1, StatusCode::ACCEPTED);
+        let push_job_id = json1["job_id"].as_str().unwrap().to_string();
+
+        // 2. Pull Request arrives second (synchronize) -> pull_request MUST WIN and supersede push!
+        let pr_payload = serde_json::json!({
+            "repository": {
+                "full_name": "LMA1980/ActionRunner-rs",
+                "clone_url": "https://github.com/LMA1980/ActionRunner-rs.git"
+            },
+            "action": "synchronize",
+            "pull_request": {
+                "head": {"repo": {"full_name": "LMA1980/ActionRunner-rs"}, "sha": commit, "ref": "feat/patch-1"},
+                "base": {"repo": {"full_name": "LMA1980/ActionRunner-rs"}, "ref": "main"},
+                "author_association": "OWNER"
+            }
+        }).to_string();
+
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-github-event", "pull_request".parse().unwrap());
+        headers2.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, pr_payload.as_bytes()).parse().unwrap(),
+        );
+        let res2 = handle_webhook(State(state), headers2, Bytes::from(pr_payload)).await;
+        assert!(res2.is_ok());
+        let (status2, json2) = res2.unwrap();
+        assert_eq!(status2, StatusCode::ACCEPTED);
+        assert_eq!(json2["status"], "queued");
+        assert_eq!(json2["event"], "pull_request");
+        assert_eq!(json2["superseded_jobs"], serde_json::json!([push_job_id]));
     }
 }

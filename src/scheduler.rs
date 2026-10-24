@@ -145,6 +145,9 @@ impl DAGScheduler {
                 JobStatus::Completed { .. }
                 | JobStatus::Failed { .. }
                 | JobStatus::Skipped { .. } => {
+                    for node_id in leased_slots.values() {
+                        self.cluster.release_slot(node_id).await;
+                    }
                     break;
                 }
                 _ => {}
