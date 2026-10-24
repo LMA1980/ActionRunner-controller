@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/ActionRunner-controller"
 
 [dependencies]
-action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git" }
+action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "feat/worker-shutdown-signal" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process"] }
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
@@ -27,6 +27,7 @@ arrow = { version = "54", default-features = false, features = ["ipc"] }
 futures-util = "0.3"
 thiserror = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-stream = "0.3.6"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

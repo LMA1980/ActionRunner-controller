@@ -1,12 +1,16 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
     routing::{get, post},
     Router,
 };
 use chrono::Utc;
 use serde::Deserialize;
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::badge;
@@ -20,6 +24,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/webhook", post(handle_webhook))
         .route("/queue", get(get_queue))
         .route("/api/queue", get(get_queue))
+        .route("/events", get(handle_events))
+        .route("/api/events", get(handle_events))
+        .route("/jobs/{id}/events", get(handle_job_events))
+        .route("/api/jobs/{id}/events", get(handle_job_events))
         .route("/jobs", get(list_jobs))
         .route("/api/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job))
@@ -464,6 +472,7 @@ pub async fn resume_job_handler(
                 use tokio::io::AsyncWriteExt;
                 let _ = f.write_all(note.as_bytes()).await;
             }
+            state.broadcast_log(&job_id, &note);
             json_response(
                 StatusCode::OK,
                 serde_json::json!({
@@ -503,6 +512,7 @@ pub async fn restart_job_handler(
                 use tokio::io::AsyncWriteExt;
                 let _ = f.write_all(note.as_bytes()).await;
             }
+            state.broadcast_log(&job_id, &note);
             json_response(
                 StatusCode::OK,
                 serde_json::json!({
@@ -904,4 +914,246 @@ fn svg_response(svg: String) -> Response {
         svg,
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EventsQuery {
+    pub view: Option<String>,
+    pub job_id: Option<String>,
+    pub token: Option<String>,
+    pub api_key: Option<String>,
+}
+
+pub async fn handle_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    if let Some(ref required_key) = state.config.log_api_key {
+        let auth_hdr = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        let api_key_hdr = headers.get("x-api-key").and_then(|h| h.to_str().ok());
+        let query_key = query.api_key.as_deref().or(query.token.as_deref());
+
+        let authed = auth_hdr == Some(required_key.as_str())
+            || api_key_hdr == Some(required_key.as_str())
+            || query_key == Some(required_key.as_str());
+        if !authed {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                ],
+                serde_json::to_string(&serde_json::json!({
+                    "error": "Unauthorized: valid api key or bearer token required"
+                }))
+                .unwrap(),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(ref job_id) = query.job_id {
+        return stream_job_events(state, job_id.clone()).await;
+    }
+
+    if let Some(ref view) = query.view {
+        if view == "job" {
+            if let Some(ref job_id) = query.job_id {
+                return stream_job_events(state, job_id.clone()).await;
+            }
+        }
+    }
+
+    stream_dashboard_events(state)
+}
+
+pub async fn handle_job_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    if let Some(ref required_key) = state.config.log_api_key {
+        let auth_hdr = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        let api_key_hdr = headers.get("x-api-key").and_then(|h| h.to_str().ok());
+        let query_key = query.api_key.as_deref().or(query.token.as_deref());
+
+        let authed = auth_hdr == Some(required_key.as_str())
+            || api_key_hdr == Some(required_key.as_str())
+            || query_key == Some(required_key.as_str());
+        if !authed {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                ],
+                serde_json::to_string(&serde_json::json!({
+                    "error": "Unauthorized: valid api key or bearer token required"
+                }))
+                .unwrap(),
+            )
+                .into_response();
+        }
+    }
+
+    stream_job_events(state, job_id).await
+}
+
+fn stream_dashboard_events(state: Arc<AppState>) -> Response {
+    let stream = async_stream::stream! {
+        // 1. Initial snapshot push
+        let snap = state.job_store.queue_snapshot().await;
+        if let Ok(data) = serde_json::to_string(&snap) {
+            yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
+        }
+
+        let jobs = state.job_store.list_jobs().await;
+        if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
+            yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
+        }
+
+        let cluster = state.cluster.list_nodes_view().await;
+        if let Ok(data) = serde_json::to_string(&cluster) {
+            yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
+        }
+
+        // 2. Continuous notification loop
+        loop {
+            state.job_store.wait_for_event().await;
+
+            let snap = state.job_store.queue_snapshot().await;
+            if let Ok(data) = serde_json::to_string(&snap) {
+                yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
+            }
+
+            let jobs = state.job_store.list_jobs().await;
+            if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
+                yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
+            }
+
+            let cluster = state.cluster.list_nodes_view().await;
+            if let Ok(data) = serde_json::to_string(&cluster) {
+                yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
+            }
+        }
+    };
+
+    let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+    let mut resp = sse.into_response();
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        header::HeaderValue::from_static("no"),
+    );
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp
+}
+
+async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
+    let Some(initial_job) = state.job_store.get_job(&job_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
+            serde_json::to_string(&serde_json::json!({
+                "error": "Job not found",
+                "job_id": job_id
+            }))
+            .unwrap(),
+        )
+            .into_response();
+    };
+
+    let full_path = state.config.workspace_dir.join(&initial_job.log_file);
+    let initial_log = tokio::fs::read_to_string(&full_path)
+        .await
+        .unwrap_or_default();
+
+    let mut log_rx = state.log_broadcaster.subscribe();
+    let jid = job_id.clone();
+    let initial_job_json = serde_json::to_string(&initial_job).unwrap_or_default();
+
+    let stream = async_stream::stream! {
+        // Send initial job state
+        yield Ok::<_, Infallible>(Event::default().event("job").data(&initial_job_json));
+
+        // Send initial log text serialized as JSON string to preserve all formatting & newlines cleanly
+        if let Ok(json_log) = serde_json::to_string(&initial_log) {
+            yield Ok::<_, Infallible>(Event::default().event("log_init").data(json_log));
+        }
+
+        let mut last_job_version = initial_job_json;
+
+        loop {
+            tokio::select! {
+                // New log chunks broadcast from workers or manual actions
+                recv_res = log_rx.recv() => {
+                    match recv_res {
+                        Ok(msg) => {
+                            if msg.job_id == jid {
+                                if let Ok(json_chunk) = serde_json::to_string(&msg.chunk) {
+                                    yield Ok::<_, Infallible>(Event::default().event("log_chunk").data(json_chunk));
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Subscriber lagged: read fresh log from disk and re-initialize
+                            if let Ok(full_log) = tokio::fs::read_to_string(&full_path).await {
+                                if let Ok(json_log) = serde_json::to_string(&full_log) {
+                                    yield Ok::<_, Infallible>(Event::default().event("log_init").data(json_log));
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+
+                // Job status / stage status changes
+                _ = state.job_store.wait_for_event() => {
+                    if let Some(curr_job) = state.job_store.get_job(&jid).await {
+                        if let Ok(curr_str) = serde_json::to_string(&curr_job) {
+                            if curr_str != last_job_version {
+                                last_job_version = curr_str.clone();
+                                yield Ok::<_, Infallible>(Event::default().event("job").data(curr_str));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+    let mut resp = sse.into_response();
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        header::HeaderValue::from_static("no"),
+    );
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp
 }

@@ -6,6 +6,30 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
+pub fn format_log_entries(entries: &[LogEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let ts_sec = entry.timestamp_us / 1_000_000;
+        let ts_nsec = ((entry.timestamp_us % 1_000_000) * 1000) as u32;
+        let dt = DateTime::<Utc>::from_timestamp(ts_sec, ts_nsec).unwrap_or_else(Utc::now);
+
+        let stream_tag = if entry.stream == 2 {
+            "[stderr]"
+        } else {
+            "[stdout]"
+        };
+        out.push_str(&format!(
+            "{} [{}] [{}] {} {}\n",
+            dt.to_rfc3339(),
+            entry.node_id,
+            entry.stage_id,
+            stream_tag,
+            entry.content
+        ));
+    }
+    out
+}
+
 pub fn append_logs(log_file_path: &Path, entries: &[LogEntry]) -> Result<(), std::io::Error> {
     if let Some(parent) = log_file_path.parent() {
         std::fs::create_dir_all(parent)?;

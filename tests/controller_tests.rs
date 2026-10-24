@@ -108,11 +108,14 @@ async fn test_job_card_svg_route_and_headers() {
         cluster.clone(),
     ));
 
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+
     let state = Arc::new(AppState {
         config,
         job_store: job_store.clone(),
         cluster,
         tx,
+        log_broadcaster,
     });
 
     let job = Job {
@@ -163,4 +166,123 @@ async fn test_job_card_svg_route_and_headers() {
     assert!(svg_str.contains("LMA1980/ActionRunner-web"));
     assert!(svg_str.contains("9ca1c51a"));
     assert!(svg_str.contains("✓ PASSING"));
+}
+
+#[tokio::test]
+async fn test_sse_dashboard_and_job_events_push() {
+    use action_runner_controller::app::create_router;
+    use action_runner_controller::cluster::ClusterRegistry;
+    use action_runner_controller::config::Config;
+    use action_runner_controller::job::{Job, JobStore};
+    use action_runner_controller::webhook::AppState;
+    use axum::http::{Request, StatusCode};
+    use chrono::Utc;
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let tmp_ws = tempfile::tempdir().unwrap();
+    let config = Config {
+        bind_addr: "127.0.0.1:0".to_string(),
+        webhook_secret: None,
+        allow_insecure_no_secret: true,
+        workspace_dir: tmp_ws.path().to_path_buf(),
+        allowed_repositories: vec!["*".to_string()],
+        allowed_actors: vec![],
+        allow_fork_prs: true,
+        allowed_pr_authors: vec![],
+        cluster_token: "test".to_string(),
+        job_timeout_seconds: 60,
+        log_api_key: None,
+        max_concurrent_jobs: 2,
+        github_token: None,
+    };
+
+    let job_store = JobStore::new(10, Some(tmp_ws.path()));
+    let cluster = ClusterRegistry::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        job_store: job_store.clone(),
+        cluster,
+        tx,
+        log_broadcaster,
+    });
+
+    let job_id = "job-sse-456".to_string();
+    let log_file = std::path::PathBuf::from("logs/sample_sse.log");
+    let full_log_path = tmp_ws.path().join(&log_file);
+    if let Some(parent) = full_log_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &full_log_path,
+        "[2026-10-24T12:00:00Z] Initial SSE test log line\n",
+    )
+    .unwrap();
+
+    let job = Job {
+        id: job_id.clone(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/ActionRunner-web".to_string(),
+        clone_url: String::new(),
+        commit_sha: "abcd1234abcd1234".to_string(),
+        ref_name: "refs/heads/feat/sse-test".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now(),
+    };
+    job_store.enqueue_job(job, log_file).await;
+
+    let app = create_router(state.clone());
+
+    // 1. Test Dashboard Events SSE Endpoint (/api/events)
+    let req = Request::builder()
+        .uri("/api/events")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-accel-buffering")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no"
+    );
+
+    let mut body_stream = resp.into_body().into_data_stream();
+    let first_chunk = body_stream.next().await.unwrap().unwrap();
+    let sse_text = String::from_utf8(first_chunk.to_vec()).unwrap();
+    assert!(
+        sse_text.contains("event: queue")
+            || sse_text.contains("event: jobs")
+            || sse_text.contains("event: cluster")
+    );
+
+    // 2. Test Job-Specific Events SSE Endpoint (/api/jobs/{id}/events)
+    let req = Request::builder()
+        .uri(format!("/api/jobs/{}/events", job_id))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-accel-buffering")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no"
+    );
+
+    let mut job_body_stream = resp.into_body().into_data_stream();
+    let first_job_chunk = job_body_stream.next().await.unwrap().unwrap();
+    let sse_job_text = String::from_utf8(first_job_chunk.to_vec()).unwrap();
+    assert!(sse_job_text.contains("event: job") || sse_job_text.contains("event: log_init"));
+    assert!(
+        sse_job_text.contains("job-sse-456") || sse_job_text.contains("Initial SSE test log line")
+    );
 }

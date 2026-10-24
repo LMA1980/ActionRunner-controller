@@ -6,9 +6,10 @@ use axum::{
 };
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::config::{is_safe_repo_name, Config};
@@ -16,11 +17,27 @@ use crate::job::{Job, JobStore};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogBroadcast {
+    pub job_id: String,
+    pub chunk: String,
+}
+
 pub struct AppState {
     pub config: Config,
     pub job_store: JobStore,
     pub cluster: crate::cluster::ClusterRegistry,
     pub tx: mpsc::Sender<Job>,
+    pub log_broadcaster: broadcast::Sender<LogBroadcast>,
+}
+
+impl AppState {
+    pub fn broadcast_log(&self, job_id: &str, chunk: &str) {
+        let _ = self.log_broadcaster.send(LogBroadcast {
+            job_id: job_id.to_string(),
+            chunk: chunk.to_string(),
+        });
+    }
 }
 
 pub fn verify_signature(secret: &str, signature_header: &str, body: &[u8]) -> bool {
@@ -541,12 +558,14 @@ mod tests {
         };
         let job_store = JobStore::new(10, None);
         let cluster = crate::cluster::ClusterRegistry::new();
+        let (log_broadcaster, _) = broadcast::channel(128);
         (
             Arc::new(AppState {
                 config,
                 job_store,
                 cluster,
                 tx,
+                log_broadcaster,
             }),
             rx,
         )
