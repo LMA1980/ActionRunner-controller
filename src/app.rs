@@ -482,13 +482,20 @@ pub async fn resume_job_handler(
                 }),
             )
         }
-        Err(err) => json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({
-                "status": "error",
-                "error": err
-            }),
-        ),
+        Err(err) => {
+            let status = if err.contains("currently running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            json_response(
+                status,
+                serde_json::json!({
+                    "status": "error",
+                    "error": err
+                }),
+            )
+        }
     }
 }
 
@@ -522,13 +529,20 @@ pub async fn restart_job_handler(
                 }),
             )
         }
-        Err(err) => json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({
-                "status": "error",
-                "error": err
-            }),
-        ),
+        Err(err) => {
+            let status = if err.contains("currently running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            json_response(
+                status,
+                serde_json::json!({
+                    "status": "error",
+                    "error": err
+                }),
+            )
+        }
     }
 }
 

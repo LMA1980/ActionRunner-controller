@@ -128,9 +128,10 @@ stages:
         isolation_mode: IsolationMode::None,
     };
 
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = WorkerAgent::new(worker_config);
     tokio::spawn(async move {
-        let _ = worker.connect_and_process().await;
+        let _ = worker.connect_and_process(&mut shutdown_rx).await;
     });
 
     // Wait for worker registration
