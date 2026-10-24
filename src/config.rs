@@ -68,7 +68,7 @@ impl Config {
         let job_timeout_seconds = std::env::var("ACTION_RUNNER_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(600);
+            .unwrap_or(1800);
 
         let max_concurrent_jobs = std::env::var("ACTION_RUNNER_MAX_CONCURRENT_JOBS")
             .ok()
