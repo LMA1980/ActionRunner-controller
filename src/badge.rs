@@ -434,6 +434,40 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
     let footer_y = div3_y + 16;
     let card_height = footer_y + 16;
 
+    // Responsive, collision-free header pill layout:
+    // Right margin: 20px. Overall Score Pill ends at x=500.
+    let score_pill_w = 76;
+    let score_pill_x = 520 - 20 - score_pill_w; // 424
+    let score_text_x = score_pill_x + score_pill_w / 2; // 462
+
+    // Status Pill: placed to the left of the score pill with an 8px gap.
+    let status_pill_w = 104;
+    let status_pill_x = score_pill_x - 8 - status_pill_w; // 312
+    let status_text_x = status_pill_x + status_pill_w / 2; // 364
+
+    // Truncate branch name if too long for the pill to prevent SVG text overlap.
+    let branch_clean = branch.trim();
+    let display_branch = if branch_clean.chars().count() > 18 {
+        let prefix: String = branch_clean.chars().take(14).collect();
+        format!("{}…", prefix)
+    } else {
+        branch_clean.to_string()
+    };
+
+    // Dynamic branch pill width based on text length (~7px per char + 16px padding).
+    let branch_text_len = display_branch.chars().count();
+    let computed_branch_w = ((branch_text_len as u32 * 7) + 16).clamp(48, 110);
+    let branch_pill_x = status_pill_x - 8 - computed_branch_w;
+    let branch_text_x = branch_pill_x + computed_branch_w / 2;
+
+    // Clean repository display title if excessively long to prevent collision with branch pill.
+    let display_repo = if repo.chars().count() > 30 {
+        let prefix: String = repo.chars().take(29).collect();
+        format!("{}…", prefix)
+    } else {
+        repo.to_string()
+    };
+
     format!(
         r###"<svg xmlns="http://www.w3.org/2000/svg" width="520" height="{card_height}" viewBox="0 0 520 {card_height}" fill="none">
   <style>
@@ -459,19 +493,22 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
   <rect width="520" height="{card_height}" class="card-bg"/>
 
   <!-- Header -->
-  <text x="20" y="28" class="title">{repo}</text>
+  <g>
+    <title>{repo_full} @ {branch_full}</title>
+    <text x="20" y="28" class="title">{repo_display}</text>
+  </g>
 
   <!-- Branch Pill -->
-  <rect x="230" y="14" width="75" height="20" class="branch-pill"/>
-  <text x="267" y="28" text-anchor="middle" class="branch-text">{branch}</text>
+  <rect x="{branch_pill_x}" y="14" width="{branch_pill_w}" height="20" class="branch-pill"/>
+  <text x="{branch_text_x}" y="28" text-anchor="middle" class="branch-text">{branch_display}</text>
 
   <!-- Status Pill -->
-  <rect x="312" y="14" width="105" height="20" class="status-pill"/>
-  <text x="364" y="28" text-anchor="middle" class="status-text">{icon_char} {status_uppercase}</text>
+  <rect x="{status_pill_x}" y="14" width="{status_pill_w}" height="20" class="status-pill"/>
+  <text x="{status_text_x}" y="28" text-anchor="middle" class="status-text">{icon_char} {status_uppercase}</text>
 
   <!-- Overall Score Pill -->
-  <rect x="424" y="14" width="76" height="20" class="score-pill"/>
-  <text x="462" y="28" text-anchor="middle" class="score-text">{quality_score}% {letter_grade}</text>
+  <rect x="{score_pill_x}" y="14" width="{score_pill_w}" height="20" class="score-pill"/>
+  <text x="{score_text_x}" y="28" text-anchor="middle" class="score-text">{quality_score}% {letter_grade}</text>
 
   <!-- Divider -->
   <line x1="20" y1="42" x2="500" y2="42" stroke="#21262d" stroke-width="1"/>
@@ -528,8 +565,19 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
   <text x="20" y="{footer_y}" class="footer-text">SpacemiT Key Stone K3 (8× X100 RISC-V @ 1.6GHz) • ActionRunner-rs Factory Pipeline</text>
 </svg>"###,
         card_height = card_height,
-        repo = xml_escape(repo),
-        branch = xml_escape(branch),
+        repo_full = xml_escape(repo),
+        branch_full = xml_escape(branch),
+        repo_display = xml_escape(&display_repo),
+        branch_display = xml_escape(&display_branch),
+        branch_pill_x = branch_pill_x,
+        branch_pill_w = computed_branch_w,
+        branch_text_x = branch_text_x,
+        status_pill_x = status_pill_x,
+        status_pill_w = status_pill_w,
+        status_text_x = status_text_x,
+        score_pill_x = score_pill_x,
+        score_pill_w = score_pill_w,
+        score_text_x = score_text_x,
         card_badge_bg = info.card_badge_bg,
         score_badge_bg = score_badge_bg,
         icon_char = info.icon_char,
@@ -850,5 +898,34 @@ mod tests {
         assert!(svg.contains(r#"<text x="20" y="216" class="label">Duration:</text>"#));
         assert!(svg.contains(r#"<text x="180" y="216" class="label">Updated:</text>"#));
         assert!(svg.contains(r#"<text x="230" y="216" class="value">"#));
+    }
+
+    #[test]
+    fn test_render_card_svg_long_branch_and_repo_no_overlap() {
+        let record = JobRecord {
+            job: sample_job("refs/heads/feat/first-view-host-attribution"),
+            status: JobStatus::Completed {
+                duration_secs: 143,
+                exit_code: 0,
+            },
+            log_file: PathBuf::from("logs/sample.log"),
+            updated_at: Utc::now(),
+            metrics: None,
+            stages: Vec::new(),
+        };
+
+        let svg = render_card_svg(
+            "LMA1980/ActionRunner-web",
+            "feat/first-view-host-attribution",
+            Some(&record),
+        );
+
+        // Branch name should be truncated with ellipsis in header pill to prevent overlap
+        assert!(svg.contains("feat/first-vie…"));
+        // Repo title should be present
+        assert!(svg.contains("LMA1980/ActionRunner-web"));
+        // Passing status
+        assert!(svg.contains("✓ PASSING"));
+        assert!(svg.contains("100% A+"));
     }
 }

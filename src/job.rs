@@ -608,68 +608,74 @@ impl JobStore {
         branch: Option<&str>,
     ) -> Option<JobRecord> {
         let parent_record = self.find_latest_job(parent_repo, branch).await?;
-        let metrics = parent_record.metrics.as_ref()?;
-        let clean_target = submodule
+        extract_submodule_job(&parent_record, submodule)
+    }
+}
+
+pub fn extract_submodule_job(parent_record: &JobRecord, submodule: &str) -> Option<JobRecord> {
+    let metrics = parent_record.metrics.as_ref()?;
+    let clean_target = submodule
+        .rsplit_once('/')
+        .map(|(_, r)| r)
+        .unwrap_or(submodule);
+
+    for (sub_name, sub) in &metrics.submodules {
+        let sub_short = sub_name
             .rsplit_once('/')
             .map(|(_, r)| r)
-            .unwrap_or(submodule);
+            .unwrap_or(sub_name);
+        let path_short = sub
+            .path
+            .rsplit_once('/')
+            .map(|(_, r)| r)
+            .unwrap_or(&sub.path);
 
-        for (sub_name, sub) in &metrics.submodules {
-            let sub_short = sub_name
-                .rsplit_once('/')
-                .map(|(_, r)| r)
-                .unwrap_or(sub_name);
-            let path_short = sub
-                .path
-                .rsplit_once('/')
-                .map(|(_, r)| r)
-                .unwrap_or(&sub.path);
+        let is_match = sub_name.eq_ignore_ascii_case(submodule)
+            || sub_short.eq_ignore_ascii_case(clean_target)
+            || path_short.eq_ignore_ascii_case(clean_target)
+            || sub_name
+                .replace('-', "_")
+                .eq_ignore_ascii_case(&clean_target.replace('-', "_"));
 
-            let is_match = sub_name.eq_ignore_ascii_case(submodule)
-                || sub_short.eq_ignore_ascii_case(clean_target)
-                || path_short.eq_ignore_ascii_case(clean_target)
-                || sub_name
-                    .replace('-', "_")
-                    .eq_ignore_ascii_case(&clean_target.replace('-', "_"));
-
-            if is_match {
-                let owner = parent_repo
-                    .split_once('/')
-                    .map(|(o, _)| o)
-                    .unwrap_or("LMA1980");
-                let sub_job = Job {
-                    id: format!("{}-{}", parent_record.job.id, sub_short),
-                    event_type: parent_record.job.event_type.clone(),
-                    repo_name: format!("{}/{}", owner, sub_short),
-                    clone_url: String::new(),
-                    commit_sha: parent_record.job.commit_sha.clone(),
-                    ref_name: parent_record.job.ref_name.clone(),
-                    sender: parent_record.job.sender.clone(),
-                    queued_at: parent_record.job.queued_at,
-                };
-                return Some(JobRecord {
-                    job: sub_job,
-                    status: parent_record.status.clone(),
-                    log_file: parent_record.log_file.clone(),
-                    updated_at: parent_record.updated_at,
-                    metrics: Some(JobMetrics {
-                        quality_score: sub.quality_score,
-                        letter_grade: sub.letter_grade.clone(),
-                        coverage_pct: sub.coverage_pct,
-                        benchmark_summary: sub.benchmark_summary.clone(),
-                        tests_passed: sub.tests_passed,
-                        tests_total: sub.tests_total,
-                        advisories_count: 0,
-                        clippy_warnings: sub.clippy_warnings,
-                        submodules: BTreeMap::new(),
-                    }),
-                    stages: Vec::new(),
-                });
-            }
+        if is_match {
+            let owner = parent_record
+                .job
+                .repo_name
+                .split_once('/')
+                .map(|(o, _)| o)
+                .unwrap_or("LMA1980");
+            let sub_job = Job {
+                id: format!("{}-{}", parent_record.job.id, sub_short),
+                event_type: parent_record.job.event_type.clone(),
+                repo_name: format!("{}/{}", owner, sub_short),
+                clone_url: String::new(),
+                commit_sha: parent_record.job.commit_sha.clone(),
+                ref_name: parent_record.job.ref_name.clone(),
+                sender: parent_record.job.sender.clone(),
+                queued_at: parent_record.job.queued_at,
+            };
+            return Some(JobRecord {
+                job: sub_job,
+                status: parent_record.status.clone(),
+                log_file: parent_record.log_file.clone(),
+                updated_at: parent_record.updated_at,
+                metrics: Some(JobMetrics {
+                    quality_score: sub.quality_score,
+                    letter_grade: sub.letter_grade.clone(),
+                    coverage_pct: sub.coverage_pct,
+                    benchmark_summary: sub.benchmark_summary.clone(),
+                    tests_passed: sub.tests_passed,
+                    tests_total: sub.tests_total,
+                    advisories_count: 0,
+                    clippy_warnings: sub.clippy_warnings,
+                    submodules: BTreeMap::new(),
+                }),
+                stages: Vec::new(),
+            });
         }
-
-        None
     }
+
+    None
 }
 
 #[cfg(test)]
