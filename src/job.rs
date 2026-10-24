@@ -121,6 +121,12 @@ pub struct EnqueueResult {
     pub job_id: String,
     pub queue_position: usize,
     pub superseded_jobs: Vec<String>,
+    #[serde(default)]
+    pub ignored: bool,
+    #[serde(default)]
+    pub ignore_reason: Option<String>,
+    #[serde(default)]
+    pub winning_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,9 +227,15 @@ impl JobStore {
     }
 
     /// Enqueues a job into the coalescing FIFO queue.
-    /// If any older job for the same `(repo_name, ref_name, event_type)` is currently `Queued`
-    /// waiting for execution, it is marked as `Skipped` (superseded by this newer commit) so
-    /// limited host resources only build the latest commit on that ref.
+    ///
+    /// Rules:
+    /// - Same commit ID conflict resolution & deduplication:
+    ///   - `merge` vs `push` on the same commit ID: the first event received wins.
+    ///   - `pull_request` vs `push` on the same commit ID: `pull_request` always wins.
+    ///   - Duplicate events of the same type on the same commit ID: first event received wins.
+    /// - If any older job for the same `(repo_name, ref_name, event_type)` is currently `Queued`
+    ///   waiting for execution, it is marked as `Skipped` (superseded by this newer commit) so
+    ///   limited host resources only build the latest commit on that ref.
     pub async fn enqueue_job(&self, mut job: Job, mut log_file: PathBuf) -> EnqueueResult {
         let now = Utc::now();
         let mut superseded_jobs = Vec::new();
@@ -231,6 +243,119 @@ impl JobStore {
 
         {
             let mut store = self.inner.write().await;
+
+            let sha_short = &job.commit_sha[..8.min(job.commit_sha.len())];
+            let norm_incoming_ref = normalize_ref(&job.ref_name);
+
+            // Same-commit ID conflict resolution & deduplication:
+            // 1. merge vs push on the same commit ID: the first event received wins.
+            // 2. pull_request vs push on the same commit ID: pull_request always wins.
+            // 3. duplicate events of the same type on the same commit ID: first event wins.
+            if !job.commit_sha.is_empty() {
+                let incoming_event = job.event_type.to_ascii_lowercase();
+
+                // Find any existing active or finished jobs for this repo, normalized ref, and commit SHA (ignore Skipped jobs)
+                let existing_commit_job = store.iter().find(|r| {
+                    !matches!(r.status, JobStatus::Skipped { .. })
+                        && r.job.repo_name.eq_ignore_ascii_case(&job.repo_name)
+                        && !r.job.commit_sha.is_empty()
+                        && r.job.commit_sha.eq_ignore_ascii_case(&job.commit_sha)
+                        && normalize_ref(&r.job.ref_name) == norm_incoming_ref
+                });
+
+                if let Some(existing) = existing_commit_job {
+                    let existing_event = existing.job.event_type.to_ascii_lowercase();
+
+                    if incoming_event == "push" && existing_event == "merge" {
+                        // Merge was received first; merge wins. Push is ignored.
+                        return EnqueueResult {
+                            job_id: job.id,
+                            queue_position: 0,
+                            superseded_jobs: Vec::new(),
+                            ignored: true,
+                            ignore_reason: Some(format!(
+                                "Merge event ({}) already received for commit {}",
+                                existing.job.id, sha_short
+                            )),
+                            winning_job_id: Some(existing.job.id.clone()),
+                        };
+                    } else if incoming_event == "merge" && existing_event == "push" {
+                        // Push was received first; push wins. Merge is ignored.
+                        return EnqueueResult {
+                            job_id: job.id,
+                            queue_position: 0,
+                            superseded_jobs: Vec::new(),
+                            ignored: true,
+                            ignore_reason: Some(format!(
+                                "Push event ({}) already received for commit {}",
+                                existing.job.id, sha_short
+                            )),
+                            winning_job_id: Some(existing.job.id.clone()),
+                        };
+                    } else if incoming_event == "push" && existing_event == "pull_request" {
+                        // pull_request always wins over push for the same commit ID. Push is ignored.
+                        return EnqueueResult {
+                            job_id: job.id,
+                            queue_position: 0,
+                            superseded_jobs: Vec::new(),
+                            ignored: true,
+                            ignore_reason: Some(format!(
+                                "Pull request event ({}) wins over push for commit {}",
+                                existing.job.id, sha_short
+                            )),
+                            winning_job_id: Some(existing.job.id.clone()),
+                        };
+                    } else if incoming_event == existing_event
+                        && matches!(
+                            existing.status,
+                            JobStatus::Queued
+                                | JobStatus::Running { .. }
+                                | JobStatus::Completed { exit_code: 0, .. }
+                        )
+                    {
+                        // Duplicate event of the same type for this commit ID: first received wins.
+                        return EnqueueResult {
+                            job_id: job.id,
+                            queue_position: 0,
+                            superseded_jobs: Vec::new(),
+                            ignored: true,
+                            ignore_reason: Some(format!(
+                                "Duplicate {} event ({}) already received for commit {}",
+                                incoming_event, existing.job.id, sha_short
+                            )),
+                            winning_job_id: Some(existing.job.id.clone()),
+                        };
+                    }
+                }
+
+                // If incoming is pull_request and existing is push:
+                // pull_request ALWAYS wins over push for the same commit ID!
+                // Supersede any Queued or Running push jobs for this commit ID.
+                if incoming_event == "pull_request" {
+                    for record in store.iter_mut() {
+                        let rec_event = record.job.event_type.to_ascii_lowercase();
+                        if rec_event == "push"
+                            && record.job.repo_name.eq_ignore_ascii_case(&job.repo_name)
+                            && !record.job.commit_sha.is_empty()
+                            && record.job.commit_sha.eq_ignore_ascii_case(&job.commit_sha)
+                            && normalize_ref(&record.job.ref_name) == norm_incoming_ref
+                            && matches!(
+                                record.status,
+                                JobStatus::Queued | JobStatus::Running { .. }
+                            )
+                        {
+                            superseded_jobs.push(record.job.id.clone());
+                            record.status = JobStatus::Skipped {
+                                reason: format!(
+                                    "Superseded by pull_request event for commit {} ({})",
+                                    sha_short, job.id
+                                ),
+                            };
+                            record.updated_at = now;
+                        }
+                    }
+                }
+            }
 
             // Ensure unique job.id even when multiple webhooks arrive within the same second
             let base_id = job.id.clone();
@@ -243,13 +368,11 @@ impl JobStore {
                 suffix += 1;
             }
 
-            let sha_short = &job.commit_sha[..8.min(job.commit_sha.len())];
-
             // Coalesce any older still-Queued jobs for the same repo + ref + event_type
             for record in store.iter_mut() {
                 if matches!(record.status, JobStatus::Queued)
                     && record.job.repo_name.eq_ignore_ascii_case(&job.repo_name)
-                    && record.job.ref_name == job.ref_name
+                    && normalize_ref(&record.job.ref_name) == norm_incoming_ref
                     && record.job.event_type == job.event_type
                 {
                     superseded_jobs.push(record.job.id.clone());
@@ -295,6 +418,9 @@ impl JobStore {
             job_id: job.id,
             queue_position,
             superseded_jobs,
+            ignored: false,
+            ignore_reason: None,
+            winning_job_id: None,
         }
     }
 
@@ -678,6 +804,13 @@ pub fn extract_submodule_job(parent_record: &JobRecord, submodule: &str) -> Opti
     None
 }
 
+/// Normalizes a git reference by stripping any leading `/` and `refs/heads/` prefix,
+/// returning the bare branch or tag name.
+pub fn normalize_ref(r: &str) -> &str {
+    let trimmed = r.trim().trim_start_matches('/');
+    trimmed.strip_prefix("refs/heads/").unwrap_or(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,5 +1091,331 @@ mod tests {
         // Now repo-a is free: repo-a2 can finally be claimed!
         let c5 = store.claim_next_queued_job(2).await;
         assert_eq!(c5.unwrap().id, "job-a2");
+    }
+
+    #[tokio::test]
+    async fn test_merge_vs_push_first_received_wins() {
+        let store = JobStore::new(10, None);
+
+        // Case 1: Merge arrives first -> merge enqueued, subsequent push on same commit ID is ignored
+        let merge_job = Job {
+            id: "job-merge-1".to_string(),
+            event_type: "merge".to_string(),
+            repo_name: "LMA1980/model-runner".to_string(),
+            clone_url: String::new(),
+            commit_sha: "abcd111122223333".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_merge = store
+            .enqueue_job(merge_job, PathBuf::from("logs/merge.log"))
+            .await;
+        assert!(!res_merge.ignored);
+        assert_eq!(res_merge.job_id, "job-merge-1");
+        assert_eq!(res_merge.queue_position, 1);
+
+        let push_job = Job {
+            id: "job-push-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/model-runner".to_string(),
+            clone_url: String::new(),
+            commit_sha: "abcd111122223333".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_push = store
+            .enqueue_job(push_job, PathBuf::from("logs/push.log"))
+            .await;
+        assert!(res_push.ignored);
+        assert_eq!(res_push.winning_job_id, Some("job-merge-1".to_string()));
+        assert!(res_push
+            .ignore_reason
+            .as_ref()
+            .unwrap()
+            .contains("Merge event (job-merge-1) already received"));
+
+        // Case 2: Push arrives first -> push enqueued, subsequent merge on same commit ID is ignored
+        let push_first = Job {
+            id: "job-push-first".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-rs".to_string(),
+            clone_url: String::new(),
+            commit_sha: "beef444455556666".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_push_first = store
+            .enqueue_job(push_first, PathBuf::from("logs/push2.log"))
+            .await;
+        assert!(!res_push_first.ignored);
+        assert_eq!(res_push_first.job_id, "job-push-first");
+
+        let merge_second = Job {
+            id: "job-merge-second".to_string(),
+            event_type: "merge".to_string(),
+            repo_name: "LMA1980/ActionRunner-rs".to_string(),
+            clone_url: String::new(),
+            commit_sha: "beef444455556666".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_merge_second = store
+            .enqueue_job(merge_second, PathBuf::from("logs/merge2.log"))
+            .await;
+        assert!(res_merge_second.ignored);
+        assert_eq!(
+            res_merge_second.winning_job_id,
+            Some("job-push-first".to_string())
+        );
+        assert!(res_merge_second
+            .ignore_reason
+            .as_ref()
+            .unwrap()
+            .contains("Push event (job-push-first) already received"));
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_vs_push_pull_request_always_wins() {
+        let store = JobStore::new(10, None);
+
+        // Subcase A: pull_request arrives FIRST, push arrives SECOND for same commit ID
+        let pr_first = Job {
+            id: "job-pr-1".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: String::new(),
+            commit_sha: "face1234567890ab".to_string(),
+            ref_name: "feat/my-feature".to_string(), // PR format
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_pr = store
+            .enqueue_job(pr_first, PathBuf::from("logs/pr1.log"))
+            .await;
+        assert!(!res_pr.ignored);
+        assert_eq!(res_pr.job_id, "job-pr-1");
+
+        let push_second = Job {
+            id: "job-push-second".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: String::new(),
+            commit_sha: "face1234567890ab".to_string(),
+            ref_name: "refs/heads/feat/my-feature".to_string(), // push format
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_push = store
+            .enqueue_job(push_second, PathBuf::from("logs/push_sec.log"))
+            .await;
+        assert!(res_push.ignored);
+        assert_eq!(res_push.winning_job_id, Some("job-pr-1".to_string()));
+        assert!(res_push
+            .ignore_reason
+            .as_ref()
+            .unwrap()
+            .contains("Pull request event (job-pr-1) wins over push"));
+
+        // Subcase B: push arrives FIRST (queued), pull_request arrives SECOND -> pull_request wins and supersedes push!
+        let push_queued = Job {
+            id: "job-push-queued".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: String::new(),
+            commit_sha: "deadbeef99998888".to_string(),
+            ref_name: "refs/heads/feat/another".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_push_q = store
+            .enqueue_job(push_queued, PathBuf::from("logs/push_q.log"))
+            .await;
+        assert!(!res_push_q.ignored);
+        assert_eq!(res_push_q.job_id, "job-push-queued");
+
+        let pr_second = Job {
+            id: "job-pr-wins".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: String::new(),
+            commit_sha: "deadbeef99998888".to_string(),
+            ref_name: "feat/another".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_pr_wins = store
+            .enqueue_job(pr_second, PathBuf::from("logs/pr_wins.log"))
+            .await;
+        assert!(!res_pr_wins.ignored);
+        assert_eq!(res_pr_wins.job_id, "job-pr-wins");
+        assert_eq!(
+            res_pr_wins.superseded_jobs,
+            vec!["job-push-queued".to_string()]
+        );
+
+        // Verify the push job was marked as Skipped
+        let push_rec = store.get_job("job-push-queued").await.unwrap();
+        assert!(matches!(
+            push_rec.status,
+            JobStatus::Skipped { reason } if reason.contains("Superseded by pull_request event")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_supersedes_running_push() {
+        let store = JobStore::new(10, None);
+
+        let push_running = Job {
+            id: "job-push-active".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-rs".to_string(),
+            clone_url: String::new(),
+            commit_sha: "c0ffee1122334455".to_string(),
+            ref_name: "refs/heads/feat/hotfix".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        store
+            .enqueue_job(push_running, PathBuf::from("logs/push_act.log"))
+            .await;
+        let claimed = store.claim_next_queued_job(10).await.unwrap();
+        assert_eq!(claimed.id, "job-push-active");
+
+        // Now pull_request arrives for the same commit ID while push is Running
+        let pr_incoming = Job {
+            id: "job-pr-override".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/ActionRunner-rs".to_string(),
+            clone_url: String::new(),
+            commit_sha: "c0ffee1122334455".to_string(),
+            ref_name: "feat/hotfix".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res = store
+            .enqueue_job(pr_incoming, PathBuf::from("logs/pr_ovr.log"))
+            .await;
+        assert!(!res.ignored);
+        assert_eq!(res.job_id, "job-pr-override");
+        assert_eq!(res.superseded_jobs, vec!["job-push-active".to_string()]);
+
+        // Running push must now be marked Skipped so scheduler stops it
+        let push_rec = store.get_job("job-push-active").await.unwrap();
+        assert!(matches!(
+            push_rec.status,
+            JobStatus::Skipped { reason } if reason.contains("Superseded by pull_request event")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_same_event_ignored() {
+        let store = JobStore::new(10, None);
+
+        let job1 = Job {
+            id: "job-orig-push".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/model-runner".to_string(),
+            clone_url: String::new(),
+            commit_sha: "9988776655443322".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res1 = store.enqueue_job(job1, PathBuf::from("logs/j1.log")).await;
+        assert!(!res1.ignored);
+
+        let job2 = Job {
+            id: "job-dupe-push".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/model-runner".to_string(),
+            clone_url: String::new(),
+            commit_sha: "9988776655443322".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res2 = store.enqueue_job(job2, PathBuf::from("logs/j2.log")).await;
+        assert!(res2.ignored);
+        assert_eq!(res2.winning_job_id, Some("job-orig-push".to_string()));
+        assert!(res2
+            .ignore_reason
+            .as_ref()
+            .unwrap()
+            .contains("Duplicate push event (job-orig-push) already received"));
+    }
+
+    #[tokio::test]
+    async fn test_pr_on_branch_does_not_block_main_merge() {
+        let store = JobStore::new(10, None);
+
+        // 1. PR event on feature branch runs and completes
+        let pr_job = Job {
+            id: "job-pr-feature".to_string(),
+            event_type: "pull_request".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "1234abcd1234abcd".to_string(),
+            ref_name: "feat/cool-thing".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        store
+            .enqueue_job(pr_job, PathBuf::from("logs/pr.log"))
+            .await;
+        store
+            .update_status(
+                "job-pr-feature",
+                JobStatus::Completed {
+                    duration_secs: 15,
+                    exit_code: 0,
+                },
+            )
+            .await;
+
+        // 2. PR is fast-forward merged to main with the same commit SHA:
+        // Merge event arrives for refs/heads/main -> must NOT be blocked by PR on feat/cool-thing!
+        let merge_main = Job {
+            id: "job-merge-main".to_string(),
+            event_type: "merge".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "1234abcd1234abcd".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_merge = store
+            .enqueue_job(merge_main, PathBuf::from("logs/merge.log"))
+            .await;
+        assert!(
+            !res_merge.ignored,
+            "Merge to main should not be blocked by PR on feature branch"
+        );
+        assert_eq!(res_merge.job_id, "job-merge-main");
+
+        // 3. GitHub also fires push event for refs/heads/main with the same commit SHA:
+        // Because merge was received first for main, push to main is ignored!
+        let push_main = Job {
+            id: "job-push-main".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "1234abcd1234abcd".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let res_push = store
+            .enqueue_job(push_main, PathBuf::from("logs/push.log"))
+            .await;
+        assert!(
+            res_push.ignored,
+            "Push to main should be ignored since merge already won on main"
+        );
+        assert_eq!(res_push.winning_job_id, Some("job-merge-main".to_string()));
     }
 }
