@@ -28,7 +28,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}/log", get(get_job_log))
         // Cluster Fabric Nodes & Tunnel
         .route("/api/cluster/nodes", get(get_cluster_nodes))
-        .route("/api/cluster/tunnel", get(crate::tunnel::handle_cluster_tunnel))
+        .route(
+            "/api/cluster/tunnel",
+            get(crate::tunnel::handle_cluster_tunnel),
+        )
         // Dynamic Status Badges & Cards
         .route("/badges/{owner}/{repo}/status.svg", get(get_repo_badge))
         .route(
@@ -362,7 +365,10 @@ pub async fn get_job_log(
                 let mut stage_info = String::new();
                 for s in &record.stages {
                     let node_str = s.assigned_node.as_deref().unwrap_or("unassigned");
-                    stage_info.push_str(&format!("  - {} (id: {}): {:?} [node: {}]\n", s.name, s.id, s.status, node_str));
+                    stage_info.push_str(&format!(
+                        "  - {} (id: {}): {:?} [node: {}]\n",
+                        s.name, s.id, s.status, node_str
+                    ));
                 }
                 let msg = format!(
                     "[ActionRunner-rs] Job '{}' is currently EXECUTING across cluster.\nRepository: {}\nRef:        {}\nCommit SHA: {}\nStarted At: {}\n\nActive Pipeline Stages:\n{}",
@@ -384,7 +390,10 @@ pub async fn get_job_log(
                 )
                     .into_response()
             }
-            JobStatus::Completed { duration_secs, exit_code } => {
+            JobStatus::Completed {
+                duration_secs,
+                exit_code,
+            } => {
                 let msg = format!(
                     "[ActionRunner-rs] Job '{}' completed in {}s with exit code {}.\nLog file was empty or has finished recording.",
                     record.job.id,
@@ -409,7 +418,10 @@ pub async fn get_job_log(
                     (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
                     (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                 ],
-                format!("[ActionRunner-rs] Job '{}' log is initializing...\nRepository: {}\nRef: {}\n", record.job.id, record.job.repo_name, record.job.ref_name),
+                format!(
+                    "[ActionRunner-rs] Job '{}' log is initializing...\nRepository: {}\nRef: {}\n",
+                    record.job.id, record.job.repo_name, record.job.ref_name
+                ),
             )
                 .into_response(),
         },

@@ -14,12 +14,14 @@ pub struct Config {
     pub cluster_token: String,
     pub job_timeout_seconds: u64,
     pub allow_insecure_no_secret: bool,
+    pub max_concurrent_jobs: usize,
+    pub github_token: Option<String>,
 }
 
 impl Config {
     pub fn load() -> Self {
-        let bind_addr = std::env::var("ACTION_RUNNER_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:8000".to_string());
+        let bind_addr =
+            std::env::var("ACTION_RUNNER_BIND").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
 
         let workspace_dir = std::env::var("ACTION_RUNNER_WORKSPACE")
             .map(PathBuf::from)
@@ -68,6 +70,13 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(600);
 
+        let max_concurrent_jobs = std::env::var("ACTION_RUNNER_MAX_CONCURRENT_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+
+        let github_token = Self::resolve_secret("GITHUB_TOKEN");
+
         Self {
             bind_addr,
             workspace_dir,
@@ -80,6 +89,8 @@ impl Config {
             cluster_token,
             job_timeout_seconds,
             allow_insecure_no_secret,
+            max_concurrent_jobs,
+            github_token,
         }
     }
 

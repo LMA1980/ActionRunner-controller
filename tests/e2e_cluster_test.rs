@@ -17,7 +17,9 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_end_to_end_distributed_dag_execution() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("action_runner=debug,action_runner_controller=debug,action_runner_ipc=debug")
+        .with_env_filter(
+            "action_runner=debug,action_runner_controller=debug,action_runner_ipc=debug",
+        )
         .try_init();
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -68,6 +70,8 @@ stages:
         cluster_token: "test-e2e-secret-token".to_string(),
         job_timeout_seconds: 30,
         allow_insecure_no_secret: true,
+        max_concurrent_jobs: 2,
+        github_token: None,
     };
 
     let job_store = JobStore::new(100, Some(&ws_path));
