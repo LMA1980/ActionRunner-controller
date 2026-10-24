@@ -182,6 +182,15 @@ impl JobStore {
                             if matches!(rec.status, JobStatus::Running { .. }) {
                                 rec.status = JobStatus::Queued;
                                 rec.updated_at = Utc::now();
+                                for stage in rec.stages.iter_mut() {
+                                    if matches!(
+                                        stage.status,
+                                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                                    ) {
+                                        stage.status = StageStatus::Pending;
+                                        stage.assigned_node = None;
+                                    }
+                                }
                             }
                             if matches!(rec.status, JobStatus::Queued) {
                                 has_queued = true;
@@ -621,6 +630,125 @@ impl JobStore {
         }
         self.persist().await;
         self.notify.notify_waiters();
+    }
+
+    pub async fn get_stages(&self, job_id: &str) -> Vec<StageRecord> {
+        let store = self.inner.read().await;
+        store
+            .iter()
+            .find(|r| r.job.id == job_id)
+            .map(|r| r.stages.clone())
+            .unwrap_or_default()
+    }
+
+    /// Recovers stages assigned or running on a given worker node by resetting them to Pending.
+    /// Returns the list of `(job_id, stage_id)` tuples recovered.
+    pub async fn recover_stages_for_node(
+        &self,
+        node_id: &str,
+        stage_filter: Option<&[String]>,
+    ) -> Vec<(String, String)> {
+        let mut recovered = Vec::new();
+        {
+            let mut store = self.inner.write().await;
+            let now = Utc::now();
+            for record in store.iter_mut() {
+                if matches!(record.status, JobStatus::Running { .. } | JobStatus::Queued) {
+                    for stage in record.stages.iter_mut() {
+                        let is_node_match = stage.assigned_node.as_deref() == Some(node_id)
+                            || match &stage.status {
+                                StageStatus::Assigned { node_id: n, .. }
+                                | StageStatus::Running { node_id: n, .. } => n == node_id,
+                                _ => false,
+                            };
+                        let is_stage_match = match stage_filter {
+                            Some(filter) => filter.iter().any(|f| f == &stage.id),
+                            None => true,
+                        };
+
+                        if is_node_match
+                            && is_stage_match
+                            && matches!(
+                                stage.status,
+                                StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                            )
+                        {
+                            stage.status = StageStatus::Pending;
+                            stage.assigned_node = None;
+                            record.updated_at = now;
+                            recovered.push((record.job.id.clone(), stage.id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !recovered.is_empty() {
+            self.persist().await;
+            self.notify.notify_waiters();
+        }
+
+        recovered
+    }
+
+    /// Resumes a job by leaving completed stages intact and returning failed/in-flight stages to Pending.
+    pub async fn resume_job(&self, job_id: &str) -> Result<JobRecord, String> {
+        let res = {
+            let mut store = self.inner.write().await;
+            let now = Utc::now();
+            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                for stage in record.stages.iter_mut() {
+                    if matches!(
+                        stage.status,
+                        StageStatus::Failed { .. }
+                            | StageStatus::Assigned { .. }
+                            | StageStatus::Running { .. }
+                    ) {
+                        stage.status = StageStatus::Pending;
+                        stage.assigned_node = None;
+                    }
+                }
+                record.status = JobStatus::Queued;
+                record.updated_at = now;
+                Ok(record.clone())
+            } else {
+                Err(format!("Job '{}' not found", job_id))
+            }
+        };
+
+        if res.is_ok() {
+            self.persist().await;
+            self.notify.notify_waiters();
+        }
+
+        res
+    }
+
+    /// Fully restarts a job by resetting all stages back to Pending.
+    pub async fn restart_job(&self, job_id: &str) -> Result<JobRecord, String> {
+        let res = {
+            let mut store = self.inner.write().await;
+            let now = Utc::now();
+            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                for stage in record.stages.iter_mut() {
+                    stage.status = StageStatus::Pending;
+                    stage.assigned_node = None;
+                }
+                record.status = JobStatus::Queued;
+                record.metrics = None;
+                record.updated_at = now;
+                Ok(record.clone())
+            } else {
+                Err(format!("Job '{}' not found", job_id))
+            }
+        };
+
+        if res.is_ok() {
+            self.persist().await;
+            self.notify.notify_waiters();
+        }
+
+        res
     }
 
     pub async fn wait_for_event(&self) {
@@ -1417,5 +1545,166 @@ mod tests {
             "Push to main should be ignored since merge already won on main"
         );
         assert_eq!(res_push.winning_job_id, Some("job-merge-main".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_job_resume_and_restart() {
+        let store = JobStore::new(10, None);
+        let job = Job {
+            id: "job-resume-test".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "beef1234beef".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+
+        store
+            .add_job(job.clone(), PathBuf::from("logs/test.log"))
+            .await;
+        let stages = vec![
+            StageRecord {
+                id: "fmt".to_string(),
+                name: "Format".to_string(),
+                tags: vec![],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Completed {
+                    duration_secs: 1,
+                    exit_code: 0,
+                },
+                assigned_node: Some("node-1".to_string()),
+            },
+            StageRecord {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                tags: vec![],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec!["fmt".to_string()],
+                status: StageStatus::Failed {
+                    error: "test failed".to_string(),
+                },
+                assigned_node: Some("node-2".to_string()),
+            },
+            StageRecord {
+                id: "bench".to_string(),
+                name: "Bench".to_string(),
+                tags: vec![],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec!["test".to_string()],
+                status: StageStatus::Pending,
+                assigned_node: None,
+            },
+        ];
+        store.set_stages(&job.id, stages).await;
+        store
+            .update_status(
+                &job.id,
+                JobStatus::Failed {
+                    error: "Stage failed".to_string(),
+                },
+            )
+            .await;
+
+        // 1. Resume should preserve Completed "fmt", and reset Failed "test" to Pending
+        let resumed = store.resume_job(&job.id).await.expect("resume succeeds");
+        assert!(matches!(resumed.status, JobStatus::Queued));
+        assert!(matches!(
+            resumed.stages[0].status,
+            StageStatus::Completed { .. }
+        ));
+        assert_eq!(resumed.stages[1].status, StageStatus::Pending);
+        assert_eq!(resumed.stages[1].assigned_node, None);
+        assert_eq!(resumed.stages[2].status, StageStatus::Pending);
+
+        // 2. Restart should reset ALL stages to Pending
+        let restarted = store.restart_job(&job.id).await.expect("restart succeeds");
+        assert!(matches!(restarted.status, JobStatus::Queued));
+        assert_eq!(restarted.stages[0].status, StageStatus::Pending);
+        assert_eq!(restarted.stages[0].assigned_node, None);
+        assert_eq!(restarted.stages[1].status, StageStatus::Pending);
+        assert_eq!(restarted.stages[2].status, StageStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_recover_stages_for_node() {
+        let store = JobStore::new(10, None);
+        let job = Job {
+            id: "job-recover-node".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "c0ffee1234".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+
+        store
+            .add_job(job.clone(), PathBuf::from("logs/test.log"))
+            .await;
+        store
+            .update_status(
+                &job.id,
+                JobStatus::Running {
+                    started_at: Utc::now(),
+                },
+            )
+            .await;
+
+        let stages = vec![
+            StageRecord {
+                id: "stage-1".to_string(),
+                name: "Stage 1".to_string(),
+                tags: vec![],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Assigned {
+                    node_id: "pey-wail-deu".to_string(),
+                    started_at: Utc::now(),
+                },
+                assigned_node: Some("pey-wail-deu".to_string()),
+            },
+            StageRecord {
+                id: "stage-2".to_string(),
+                name: "Stage 2".to_string(),
+                tags: vec![],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Assigned {
+                    node_id: "rubicon".to_string(),
+                    started_at: Utc::now(),
+                },
+                assigned_node: Some("rubicon".to_string()),
+            },
+        ];
+        store.set_stages(&job.id, stages).await;
+
+        // Node pey-wail-deu restarts or disconnects:
+        let recovered = store.recover_stages_for_node("pey-wail-deu", None).await;
+        assert_eq!(
+            recovered,
+            vec![("job-recover-node".to_string(), "stage-1".to_string())]
+        );
+
+        let updated_job = store.get_job(&job.id).await.unwrap();
+        assert_eq!(updated_job.stages[0].status, StageStatus::Pending);
+        assert_eq!(updated_job.stages[0].assigned_node, None);
+        // stage-2 on rubicon should remain untouched
+        assert!(matches!(
+            updated_job.stages[1].status,
+            StageStatus::Assigned { .. }
+        ));
+        assert_eq!(
+            updated_job.stages[1].assigned_node.as_deref(),
+            Some("rubicon")
+        );
     }
 }

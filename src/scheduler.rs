@@ -107,21 +107,61 @@ impl DAGScheduler {
             }
         };
 
-        // 2. Initialize stage records in job store
-        let stage_records: Vec<StageRecord> = workflow
-            .stages
-            .iter()
-            .map(|s| StageRecord {
-                id: s.id.clone(),
-                name: s.name.clone(),
-                tags: s.tags.clone(),
-                threads: s.threads,
-                toolchain: s.toolchain.clone(),
-                depends_on: s.depends_on.clone(),
-                status: StageStatus::Pending,
-                assigned_node: None,
-            })
-            .collect();
+        // 2. Initialize or preserve existing stage records in job store
+        let existing_stages = self.job_store.get_stages(&job.id).await;
+        let stage_records: Vec<StageRecord> = if !existing_stages.is_empty() {
+            info!(
+                job_id = %job.id,
+                "Resuming existing DAG stage progression; preserving completed stages"
+            );
+            let existing_by_id: HashMap<String, StageRecord> = existing_stages
+                .into_iter()
+                .map(|s| (s.id.clone(), s))
+                .collect();
+
+            workflow
+                .stages
+                .iter()
+                .map(|s| {
+                    if let Some(mut existing) = existing_by_id.get(&s.id).cloned() {
+                        if matches!(
+                            existing.status,
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                        ) {
+                            existing.status = StageStatus::Pending;
+                            existing.assigned_node = None;
+                        }
+                        existing
+                    } else {
+                        StageRecord {
+                            id: s.id.clone(),
+                            name: s.name.clone(),
+                            tags: s.tags.clone(),
+                            threads: s.threads,
+                            toolchain: s.toolchain.clone(),
+                            depends_on: s.depends_on.clone(),
+                            status: StageStatus::Pending,
+                            assigned_node: None,
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            workflow
+                .stages
+                .iter()
+                .map(|s| StageRecord {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    tags: s.tags.clone(),
+                    threads: s.threads,
+                    toolchain: s.toolchain.clone(),
+                    depends_on: s.depends_on.clone(),
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                })
+                .collect()
+        };
 
         self.job_store.set_stages(&job.id, stage_records).await;
 
@@ -151,6 +191,28 @@ impl DAGScheduler {
                     break;
                 }
                 _ => {}
+            }
+
+            // Watchdog: verify if assigned worker nodes are still online in cluster
+            for stage in &job_record.stages {
+                if let StageStatus::Assigned { node_id, .. }
+                | StageStatus::Running { node_id, .. } = &stage.status
+                {
+                    let is_online = self.cluster.is_node_online(node_id).await;
+                    if !is_online {
+                        warn!(
+                            job_id = %job.id,
+                            stage = %stage.id,
+                            node = %node_id,
+                            "Watchdog detected assigned worker node is offline; returning stage to Pending"
+                        );
+                        self.job_store
+                            .update_stage_status(&job.id, &stage.id, StageStatus::Pending)
+                            .await;
+                        self.cluster.release_slot(node_id).await;
+                        leased_slots.remove(&stage.id);
+                    }
+                }
             }
 
             let mut all_completed = true;
