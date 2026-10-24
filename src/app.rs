@@ -26,6 +26,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/jobs/{id}/log", get(get_job_log))
         .route("/api/jobs/{id}/log", get(get_job_log))
+        .route("/jobs/{id}/card.svg", get(get_job_card))
+        .route("/api/jobs/{id}/card.svg", get(get_job_card))
+        .route(
+            "/jobs/{id}/submodules/{submodule}/card.svg",
+            get(get_job_submodule_card),
+        )
+        .route(
+            "/api/jobs/{id}/submodules/{submodule}/card.svg",
+            get(get_job_submodule_card),
+        )
         // Cluster Fabric Nodes & Tunnel
         .route("/api/cluster/nodes", get(get_cluster_nodes))
         .route(
@@ -573,15 +583,34 @@ pub async fn get_branch_shield(
     )
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct CardQuery {
+    pub branch: Option<String>,
+    pub job_id: Option<String>,
+    #[serde(rename = "ref")]
+    pub ref_name: Option<String>,
+}
+
 pub async fn get_repo_card(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<CardQuery>,
 ) -> Response {
     let repo_full = format!("{}/{}", owner, repo);
-    let record = state.job_store.find_latest_job(&repo_full, None).await;
-    let branch = record
-        .as_ref()
-        .map(|r| r.job.ref_name.trim_start_matches("refs/heads/").to_string())
+    let record = if let Some(job_id) = query.job_id.as_deref() {
+        state.job_store.get_job(job_id).await
+    } else {
+        let branch_filter = query.branch.as_deref().or(query.ref_name.as_deref());
+        state.job_store.find_latest_job(&repo_full, branch_filter).await
+    };
+    let branch = query
+        .branch
+        .or(query.ref_name)
+        .or_else(|| {
+            record
+                .as_ref()
+                .map(|r| r.job.ref_name.trim_start_matches("refs/heads/").to_string())
+        })
         .unwrap_or_else(|| "main".to_string());
     let svg = badge::render_card_svg(&repo_full, &branch, record.as_ref());
     svg_response(svg)
@@ -736,12 +765,54 @@ pub async fn get_branch_submodule_card(
     svg_response(svg)
 }
 
+pub async fn get_job_card(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(record) = state.job_store.get_job(&job_id).await else {
+        return (StatusCode::NOT_FOUND, "Job not found").into_response();
+    };
+    let branch = record
+        .job
+        .ref_name
+        .trim_start_matches("refs/heads/")
+        .to_string();
+    let svg = badge::render_card_svg(&record.job.repo_name, &branch, Some(&record));
+    svg_response(svg)
+}
+
+pub async fn get_job_submodule_card(
+    State(state): State<Arc<AppState>>,
+    Path((job_id, submodule)): Path<(String, String)>,
+) -> Response {
+    let Some(record) = state.job_store.get_job(&job_id).await else {
+        return (StatusCode::NOT_FOUND, "Job not found").into_response();
+    };
+    let sub_record = crate::job::extract_submodule_job(&record, &submodule);
+    let owner = record
+        .job
+        .repo_name
+        .split_once('/')
+        .map(|(o, _)| o)
+        .unwrap_or("LMA1980");
+    let sub_name = format!("{}/{}", owner, submodule);
+    let branch = record
+        .job
+        .ref_name
+        .trim_start_matches("refs/heads/")
+        .to_string();
+    let svg = badge::render_card_svg(&sub_name, &branch, sub_record.as_ref());
+    svg_response(svg)
+}
+
 fn svg_response(svg: String) -> Response {
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=3600, s-maxage=3600"),
+            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
         ],
         svg,
     )
