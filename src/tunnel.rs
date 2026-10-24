@@ -94,12 +94,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 seq += 1;
                 match cmd {
                     WorkerCommand::Dispatch(task) => {
-                        if let Ok(payload) = fory.serialize(&task) {
-                            let header = IpcHeader::new(MSG_TYPE_STAGE_DISPATCH, payload.len() as u32, 0, seq);
-                            let mut frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
-                            frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
-                            frame.extend_from_slice(&payload);
-                            let _ = ws_sender.send(Message::Binary(frame.into())).await;
+                        match fory.serialize(&task) {
+                            Ok(payload) => {
+                                let header = IpcHeader::new(MSG_TYPE_STAGE_DISPATCH, payload.len() as u32, 0, seq);
+                                let mut frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
+                                frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
+                                frame.extend_from_slice(&payload);
+                                if let Err(e) = ws_sender.send(Message::Binary(frame.into())).await {
+                                    error!("Failed to send dispatch frame over ws: {}", e);
+                                } else {
+                                    info!(stage = %task.stage_id, "Dispatched stage frame successfully sent to ws_sender");
+                                }
+                            }
+                            Err(e) => {
+                                error!(stage = %task.stage_id, error = %e, "Failed to serialize StageDispatchTask with Fory");
+                            }
                         }
                     }
                     WorkerCommand::Cancel(cancel) => {
@@ -161,8 +170,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             MSG_TYPE_ARROW_LOG => {
                                 if let Ok(entries) = decode_log_batch(payload) {
                                     if let Some(first) = entries.first() {
-                                        if let Some(record) = state.job_store.get_job(&first.stage_id).await {
-                                            let _ = append_logs(&record.log_file, &entries);
+                                        if let Some(record) = state.job_store.get_job(&first.job_id).await {
+                                            let full_path = state.config.workspace_dir.join(&record.log_file);
+                                            let _ = append_logs(&full_path, &entries);
                                         }
                                     }
                                 }
@@ -171,7 +181,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 if let Ok(metric_entries) = decode_metric_batch(payload) {
                                     if let Some(first) = metric_entries.first() {
                                         let aggregated = aggregate_metrics(&metric_entries, true);
-                                        state.job_store.update_metrics(&first.stage_id, aggregated).await;
+                                        state.job_store.update_metrics(&first.job_id, aggregated).await;
                                     }
                                 }
                             }

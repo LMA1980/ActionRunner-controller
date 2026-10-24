@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod app;
 pub mod badge;
 pub mod cluster;
 pub mod config;
