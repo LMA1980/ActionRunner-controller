@@ -244,7 +244,7 @@ impl DAGScheduler {
 
             if any_failed {
                 // Cancel running stages
-                for (_s_id, node_id) in &leased_slots {
+                for node_id in leased_slots.values() {
                     self.cluster.release_slot(node_id).await;
                 }
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
@@ -322,7 +322,77 @@ impl DAGScheduler {
             candidates.push("on-pullrequest.yaml".to_string());
         }
 
-        // Check if workspace already has repo cloned locally
+        // 1. Sync or initialize repo_workspace and fetch commit_sha if commit_sha is provided
+        if !job.commit_sha.is_empty() {
+            if !repo_workspace.exists() {
+                if let Some(parent) = repo_workspace.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let clone_target = if !job.clone_url.is_empty() {
+                    job.clone_url.clone()
+                } else {
+                    format!("https://github.com/{}.git", job.repo_name)
+                };
+
+                let clone_res = tokio::process::Command::new("git")
+                    .arg("clone")
+                    .arg("--no-checkout")
+                    .arg(&clone_target)
+                    .arg(repo_workspace)
+                    .output()
+                    .await;
+
+                if let Err(e) = clone_res {
+                    warn!(
+                        repo = %job.repo_name,
+                        error = %e,
+                        "Failed to execute git clone for workflow resolution"
+                    );
+                }
+            }
+
+            if repo_workspace.exists() {
+                let _ = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_workspace)
+                    .arg("fetch")
+                    .arg("origin")
+                    .arg(&job.commit_sha)
+                    .output()
+                    .await;
+
+                for cand in &candidates {
+                    let git_spec = format!("{}:.actionrunner/{}", job.commit_sha, cand);
+                    let show_res = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo_workspace)
+                        .arg("show")
+                        .arg(&git_spec)
+                        .output()
+                        .await;
+
+                    if let Ok(out) = show_res {
+                        if out.status.success() {
+                            if let Ok(content) = String::from_utf8(out.stdout) {
+                                info!(
+                                    job_id = %job.id,
+                                    commit = %job.commit_sha,
+                                    candidate = %cand,
+                                    "Resolved workflow configuration from commit tree via git show"
+                                );
+                                return WorkflowConfig::load_from_str(
+                                    &content,
+                                    repo_workspace,
+                                    self.config.job_timeout_seconds,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to existing disk file if git show didn't resolve
         for cand in &candidates {
             let path = actionrunner_dir.join(cand);
             if path.exists() {
