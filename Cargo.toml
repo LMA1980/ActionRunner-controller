@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/ActionRunner-controller"
 
 [dependencies]
-action-runner-ipc = { path = "../ActionRunner-ipc" }
+action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process"] }
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
