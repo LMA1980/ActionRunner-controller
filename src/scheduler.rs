@@ -244,7 +244,7 @@ impl DAGScheduler {
 
             if any_failed {
                 // Cancel running stages
-                for (_s_id, node_id) in &leased_slots {
+                for node_id in leased_slots.values() {
                     self.cluster.release_slot(node_id).await;
                 }
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
