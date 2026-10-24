@@ -472,7 +472,7 @@ impl DAGScheduler {
             }
         }
 
-        // If not found locally, create a default 3-stage distributed workflow (fmt on x86, clippy on x86, verify on k3)
+        // If not found locally, create a default 4-stage distributed workflow (fmt, clippy, coverage, verify on k3)
         let default_yaml = r#"
 version: "2"
 name: "Default Distributed Pipeline"
@@ -487,6 +487,12 @@ stages:
     tags: ["clippy"]
     threads: 4
     run: "cargo clippy --all-targets -- -D warnings"
+  - id: coverage-test
+    name: "Evaluate Test Suite & Line Code Coverage"
+    tags: ["test"]
+    depends_on: ["fmt-check", "clippy-check"]
+    threads: 4
+    run: "cargo llvm-cov --summary-only"
   - id: native-k3
     name: "Native Verification"
     tags: ["k3"]

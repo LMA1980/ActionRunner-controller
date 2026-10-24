@@ -1,5 +1,5 @@
 version: "2"
-name: "ActionRunner-controller Distributed Pipeline: Formatting, Clippy & Verification"
+name: "ActionRunner-controller Distributed Pipeline: Formatting, Clippy, Coverage & Verification"
 
 stages:
   - id: fmt-check
@@ -14,9 +14,15 @@ stages:
     threads: 4
     run: "cargo clippy --all-targets -- -D warnings"
 
-  - id: test-controller
-    name: "Validate Controller Suite & Tests"
-    tags: ["build", "test"]
+  - id: audit-check
+    name: "Verify Security Advisories"
+    tags: ["audit"]
+    threads: 2
+    run: "cargo audit"
+
+  - id: coverage-test
+    name: "Evaluate Test Suite & Line Code Coverage (cargo llvm-cov)"
+    tags: ["test"]
     depends_on: ["fmt-check", "clippy-check"]
     threads: 4
-    run: "cargo test --lib --bins"
+    run: "cargo llvm-cov --summary-only"
