@@ -28,6 +28,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}/log", get(get_job_log))
         .route("/jobs/{id}/card.svg", get(get_job_card))
         .route("/api/jobs/{id}/card.svg", get(get_job_card))
+        .route("/jobs/{id}/resume", post(resume_job_handler))
+        .route("/api/jobs/{id}/resume", post(resume_job_handler))
+        .route("/jobs/{id}/retry", post(resume_job_handler))
+        .route("/api/jobs/{id}/retry", post(resume_job_handler))
+        .route("/jobs/{id}/restart", post(restart_job_handler))
+        .route("/api/jobs/{id}/restart", post(restart_job_handler))
         .route(
             "/jobs/{id}/submodules/{submodule}/card.svg",
             get(get_job_submodule_card),
@@ -435,6 +441,84 @@ pub async fn get_job_log(
             )
                 .into_response(),
         },
+    }
+}
+
+pub async fn resume_job_handler(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    match state.job_store.resume_job(&job_id).await {
+        Ok(record) => {
+            let full_path = state.config.workspace_dir.join(&record.log_file);
+            let note = format!(
+                "{} [controller] Manual pipeline resume initiated; queuing pending stages\n",
+                Utc::now().to_rfc3339()
+            );
+            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&full_path)
+                .await
+            {
+                use tokio::io::AsyncWriteExt;
+                let _ = f.write_all(note.as_bytes()).await;
+            }
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "ok",
+                    "message": "Job resumed successfully; in-flight and failed stages re-queued",
+                    "job_id": job_id
+                }),
+            )
+        }
+        Err(err) => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "status": "error",
+                "error": err
+            }),
+        ),
+    }
+}
+
+pub async fn restart_job_handler(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    match state.job_store.restart_job(&job_id).await {
+        Ok(record) => {
+            let full_path = state.config.workspace_dir.join(&record.log_file);
+            let note = format!(
+                "{} [controller] Manual pipeline full restart initiated; resetting all stages to Pending\n",
+                Utc::now().to_rfc3339()
+            );
+            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&full_path)
+                .await
+            {
+                use tokio::io::AsyncWriteExt;
+                let _ = f.write_all(note.as_bytes()).await;
+            }
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "ok",
+                    "message": "Job restarted successfully; all stages reset to Pending",
+                    "job_id": job_id
+                }),
+            )
+        }
+        Err(err) => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "status": "error",
+                "error": err
+            }),
+        ),
     }
 }
 
