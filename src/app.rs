@@ -601,7 +601,10 @@ pub async fn get_repo_card(
         state.job_store.get_job(job_id).await
     } else {
         let branch_filter = query.branch.as_deref().or(query.ref_name.as_deref());
-        state.job_store.find_latest_job(&repo_full, branch_filter).await
+        state
+            .job_store
+            .find_latest_job(&repo_full, branch_filter)
+            .await
     };
     let branch = query
         .branch
