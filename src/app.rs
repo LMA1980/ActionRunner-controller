@@ -1063,10 +1063,7 @@ fn stream_dashboard_events(state: Arc<AppState>) -> Response {
     resp
 }
 
-async fn stream_job_events(
-    state: Arc<AppState>,
-    job_id: String,
-) -> Response {
+async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
     let Some(initial_job) = state.job_store.get_job(&job_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -1084,7 +1081,9 @@ async fn stream_job_events(
     };
 
     let full_path = state.config.workspace_dir.join(&initial_job.log_file);
-    let initial_log = tokio::fs::read_to_string(&full_path).await.unwrap_or_default();
+    let initial_log = tokio::fs::read_to_string(&full_path)
+        .await
+        .unwrap_or_default();
 
     let mut log_rx = state.log_broadcaster.subscribe();
     let jid = job_id.clone();

@@ -217,7 +217,11 @@ async fn test_sse_dashboard_and_job_events_push() {
     if let Some(parent) = full_log_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
-    std::fs::write(&full_log_path, "[2026-10-24T12:00:00Z] Initial SSE test log line\n").unwrap();
+    std::fs::write(
+        &full_log_path,
+        "[2026-10-24T12:00:00Z] Initial SSE test log line\n",
+    )
+    .unwrap();
 
     let job = Job {
         id: job_id.clone(),
@@ -241,14 +245,22 @@ async fn test_sse_dashboard_and_job_events_push() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("x-accel-buffering").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-accel-buffering")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "no"
     );
 
     let mut body_stream = resp.into_body().into_data_stream();
     let first_chunk = body_stream.next().await.unwrap().unwrap();
     let sse_text = String::from_utf8(first_chunk.to_vec()).unwrap();
-    assert!(sse_text.contains("event: queue") || sse_text.contains("event: jobs") || sse_text.contains("event: cluster"));
+    assert!(
+        sse_text.contains("event: queue")
+            || sse_text.contains("event: jobs")
+            || sse_text.contains("event: cluster")
+    );
 
     // 2. Test Job-Specific Events SSE Endpoint (/api/jobs/{id}/events)
     let req = Request::builder()
@@ -258,7 +270,11 @@ async fn test_sse_dashboard_and_job_events_push() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("x-accel-buffering").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-accel-buffering")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "no"
     );
 
@@ -266,5 +282,7 @@ async fn test_sse_dashboard_and_job_events_push() {
     let first_job_chunk = job_body_stream.next().await.unwrap().unwrap();
     let sse_job_text = String::from_utf8(first_job_chunk.to_vec()).unwrap();
     assert!(sse_job_text.contains("event: job") || sse_job_text.contains("event: log_init"));
-    assert!(sse_job_text.contains("job-sse-456") || sse_job_text.contains("Initial SSE test log line"));
+    assert!(
+        sse_job_text.contains("job-sse-456") || sse_job_text.contains("Initial SSE test log line")
+    );
 }
