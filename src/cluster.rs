@@ -120,14 +120,17 @@ impl ClusterRegistry {
                 }
             }
 
-            // Verify required tags
+            // Verify required tags (empty tags or "default" matches any available node)
             let node_tags: HashSet<&str> = worker
                 .registration
                 .tags
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            let matches_tags = required_tags.iter().all(|req| node_tags.contains(req.as_str()));
+            let matches_tags = required_tags.is_empty()
+                || required_tags
+                    .iter()
+                    .all(|req| req == "default" || node_tags.contains(req.as_str()));
 
             if matches_tags {
                 worker.active_slots += 1;
