@@ -78,6 +78,8 @@ pub enum StageStatus {
     Running {
         node_id: String,
         started_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
     },
     Completed {
         duration_secs: u64,
@@ -692,11 +694,22 @@ impl JobStore {
     }
 
     /// Resumes a job by leaving completed stages intact and returning failed/in-flight stages to Pending.
+    /// To ensure strict FIFO fairness without line-cutting, the resumed job is moved to the tail
+    /// of the queue (push_front in the storage deque) with an updated queued_at timestamp.
+    /// Fails with an error if the job is currently actively Running.
     pub async fn resume_job(&self, job_id: &str) -> Result<JobRecord, String> {
         let res = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
-            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+            let pos = store.iter().position(|r| r.job.id == job_id);
+            if let Some(idx) = pos {
+                if matches!(store[idx].status, JobStatus::Running { .. }) {
+                    return Err(format!(
+                        "Job '{}' is currently running; cannot resume an active job",
+                        job_id
+                    ));
+                }
+                let mut record = store.remove(idx).unwrap();
                 for stage in record.stages.iter_mut() {
                     if matches!(
                         stage.status,
@@ -709,8 +722,10 @@ impl JobStore {
                     }
                 }
                 record.status = JobStatus::Queued;
+                record.job.queued_at = now;
                 record.updated_at = now;
-                Ok(record.clone())
+                store.push_front(record.clone());
+                Ok(record)
             } else {
                 Err(format!("Job '{}' not found", job_id))
             }
@@ -725,19 +740,30 @@ impl JobStore {
     }
 
     /// Fully restarts a job by resetting all stages back to Pending.
+    /// Resets metrics, moves to the tail of the queue, and rejects if currently running.
     pub async fn restart_job(&self, job_id: &str) -> Result<JobRecord, String> {
         let res = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
-            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+            let pos = store.iter().position(|r| r.job.id == job_id);
+            if let Some(idx) = pos {
+                if matches!(store[idx].status, JobStatus::Running { .. }) {
+                    return Err(format!(
+                        "Job '{}' is currently running; cannot restart an active job",
+                        job_id
+                    ));
+                }
+                let mut record = store.remove(idx).unwrap();
                 for stage in record.stages.iter_mut() {
                     stage.status = StageStatus::Pending;
                     stage.assigned_node = None;
                 }
                 record.status = JobStatus::Queued;
                 record.metrics = None;
+                record.job.queued_at = now;
                 record.updated_at = now;
-                Ok(record.clone())
+                store.push_front(record.clone());
+                Ok(record)
             } else {
                 Err(format!("Job '{}' not found", job_id))
             }
@@ -749,6 +775,29 @@ impl JobStore {
         }
 
         res
+    }
+
+    pub async fn update_stage_running(
+        &self,
+        job_id: &str,
+        stage_id: &str,
+        node_id: &str,
+        pid: u32,
+    ) {
+        let mut store = self.inner.write().await;
+        if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+            for stage in record.stages.iter_mut() {
+                if stage.id == stage_id {
+                    stage.status = StageStatus::Running {
+                        node_id: node_id.to_string(),
+                        started_at: Utc::now(),
+                        pid: Some(pid),
+                    };
+                    stage.assigned_node = Some(node_id.to_string());
+                    break;
+                }
+            }
+        }
     }
 
     pub async fn wait_for_event(&self) {
@@ -1629,6 +1678,70 @@ mod tests {
         assert_eq!(restarted.stages[0].assigned_node, None);
         assert_eq!(restarted.stages[1].status, StageStatus::Pending);
         assert_eq!(restarted.stages[2].status, StageStatus::Pending);
+
+        // 3. Resuming or restarting a currently running job must fail to avoid phantom jobs
+        store
+            .update_status(
+                &job.id,
+                JobStatus::Running {
+                    started_at: Utc::now(),
+                },
+            )
+            .await;
+        assert!(store.resume_job(&job.id).await.is_err());
+        assert!(store.restart_job(&job.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resumed_job_does_not_cut_queue_line() {
+        let store = JobStore::new(10, None);
+        let job1 = Job {
+            id: "job-1-early".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/repo-a".to_string(),
+            clone_url: String::new(),
+            commit_sha: "sha1".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(100),
+        };
+        let job2 = Job {
+            id: "job-2-queued".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/repo-b".to_string(),
+            clone_url: String::new(),
+            commit_sha: "sha2".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(50),
+        };
+
+        store
+            .add_job(job1.clone(), PathBuf::from("logs/j1.log"))
+            .await;
+        store
+            .update_status(
+                &job1.id,
+                JobStatus::Failed {
+                    error: "failed".to_string(),
+                },
+            )
+            .await;
+
+        store
+            .add_job(job2.clone(), PathBuf::from("logs/j2.log"))
+            .await;
+        // job2 is currently Queued
+
+        // Now resume failed job1
+        store.resume_job(&job1.id).await.expect("resumes ok");
+
+        // When claiming next queued job, job2 must be claimed FIRST because it was queued before job1 was resumed!
+        let claimed_first = store.claim_next_queued_job(10).await.expect("claim 1");
+        assert_eq!(claimed_first.id, "job-2-queued");
+
+        let claimed_second = store.claim_next_queued_job(10).await.expect("claim 2");
+        assert_eq!(claimed_second.id, "job-1-early");
     }
 
     #[tokio::test]

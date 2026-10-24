@@ -14,9 +14,10 @@ use tracing::{error, info, warn};
 
 use action_runner_ipc::{
     create_fory_runtime, decode_log_batch, decode_metric_batch, IpcHeader, StageCompletionReport,
-    WorkerHeartbeat, WorkerRegistration, WorkerShutdown, MSG_TYPE_ARROW_LOG, MSG_TYPE_ARROW_METRIC,
-    MSG_TYPE_STAGE_CANCEL, MSG_TYPE_STAGE_COMPLETION, MSG_TYPE_STAGE_DISPATCH,
-    MSG_TYPE_WORKER_HEARTBEAT, MSG_TYPE_WORKER_REGISTRATION, MSG_TYPE_WORKER_SHUTDOWN,
+    StageStarted, WorkerHeartbeat, WorkerRegistration, WorkerShutdown, MSG_TYPE_ARROW_LOG,
+    MSG_TYPE_ARROW_METRIC, MSG_TYPE_STAGE_CANCEL, MSG_TYPE_STAGE_COMPLETION,
+    MSG_TYPE_STAGE_DISPATCH, MSG_TYPE_STAGE_STARTED, MSG_TYPE_WORKER_HEARTBEAT,
+    MSG_TYPE_WORKER_REGISTRATION, MSG_TYPE_WORKER_SHUTDOWN,
 };
 
 use crate::aggregator::{aggregate_metrics, append_logs, format_log_entries};
@@ -202,6 +203,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     }
                                     state.cluster.release_slot(&node_id).await;
                                     state.job_store.notify_event();
+                                }
+                            }
+                            MSG_TYPE_STAGE_STARTED => {
+                                if let Ok(started) = fory.deserialize::<StageStarted>(payload) {
+                                    info!(
+                                        job_id = %started.job_id,
+                                        stage_id = %started.stage_id,
+                                        node_id = %started.node_id,
+                                        pid = started.pid,
+                                        "Worker reported stage process spawned with PID"
+                                    );
+                                    state
+                                        .job_store
+                                        .update_stage_running(
+                                            &started.job_id,
+                                            &started.stage_id,
+                                            &started.node_id,
+                                            started.pid,
+                                        )
+                                        .await;
                                 }
                             }
                             MSG_TYPE_ARROW_LOG => {
