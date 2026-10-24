@@ -14,9 +14,9 @@ use tracing::{error, info, warn};
 
 use action_runner_ipc::{
     create_fory_runtime, decode_log_batch, decode_metric_batch, IpcHeader, StageCompletionReport,
-    WorkerHeartbeat, WorkerRegistration, MSG_TYPE_ARROW_LOG, MSG_TYPE_ARROW_METRIC,
+    WorkerHeartbeat, WorkerRegistration, WorkerShutdown, MSG_TYPE_ARROW_LOG, MSG_TYPE_ARROW_METRIC,
     MSG_TYPE_STAGE_CANCEL, MSG_TYPE_STAGE_COMPLETION, MSG_TYPE_STAGE_DISPATCH,
-    MSG_TYPE_WORKER_HEARTBEAT, MSG_TYPE_WORKER_REGISTRATION,
+    MSG_TYPE_WORKER_HEARTBEAT, MSG_TYPE_WORKER_REGISTRATION, MSG_TYPE_WORKER_SHUTDOWN,
 };
 
 use crate::aggregator::{aggregate_metrics, append_logs};
@@ -167,6 +167,42 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     state.job_store.notify_event();
                                 }
                             }
+                            MSG_TYPE_WORKER_SHUTDOWN => {
+                                if let Ok(shutdown) = fory.deserialize::<WorkerShutdown>(payload) {
+                                    info!(
+                                        node = %node_id,
+                                        reason = %shutdown.reason,
+                                        interrupted = ?shutdown.interrupted_stages,
+                                        "Worker signaled shutdown/restart"
+                                    );
+                                    let recovered = state
+                                        .job_store
+                                        .recover_stages_for_node(&node_id, Some(&shutdown.interrupted_stages))
+                                        .await;
+                                    for (job_id, stage_id) in &recovered {
+                                        if let Some(record) = state.job_store.get_job(job_id).await {
+                                            let full_path = state.config.workspace_dir.join(&record.log_file);
+                                            let note = format!(
+                                                "{} [{}] [{}] [stderr] Worker signaled restart; stage execution interrupted and returned to queue for re-dispatch\n",
+                                                chrono::Utc::now().to_rfc3339(),
+                                                node_id,
+                                                stage_id
+                                            );
+                                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                                                .create(true)
+                                                .append(true)
+                                                .open(&full_path)
+                                                .await
+                                            {
+                                                use tokio::io::AsyncWriteExt;
+                                                let _ = f.write_all(note.as_bytes()).await;
+                                            }
+                                        }
+                                    }
+                                    state.cluster.release_slot(&node_id).await;
+                                    state.job_store.notify_event();
+                                }
+                            }
                             MSG_TYPE_ARROW_LOG => {
                                 if let Ok(entries) = decode_log_batch(payload) {
                                     if let Some(first) = entries.first() {
@@ -194,5 +230,38 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     state.cluster.unregister(&node_id).await;
+    // Auto-recover any remaining stages assigned to this worker node
+    let recovered = state
+        .job_store
+        .recover_stages_for_node(&node_id, None)
+        .await;
+    if !recovered.is_empty() {
+        warn!(
+            node = %node_id,
+            count = recovered.len(),
+            "Worker disconnected; recovered orphan stages back to Pending"
+        );
+        for (job_id, stage_id) in &recovered {
+            if let Some(record) = state.job_store.get_job(job_id).await {
+                let full_path = state.config.workspace_dir.join(&record.log_file);
+                let note = format!(
+                    "{} [controller] [{}] [stderr] Worker '{}' disconnected unexpectedly; stage returned to queue for recovery\n",
+                    chrono::Utc::now().to_rfc3339(),
+                    stage_id,
+                    node_id
+                );
+                if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&full_path)
+                    .await
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = f.write_all(note.as_bytes()).await;
+                }
+            }
+        }
+        state.job_store.notify_event();
+    }
     info!(node = %node_id, "Cluster tunnel session terminated");
 }

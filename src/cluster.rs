@@ -146,6 +146,16 @@ impl ClusterRegistry {
         }
     }
 
+    pub async fn is_node_online(&self, node_id: &str) -> bool {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+        if let Some(worker) = workers.get(node_id) {
+            (now - worker.last_heartbeat).num_seconds().max(0) <= 15
+        } else {
+            false
+        }
+    }
+
     pub async fn list_nodes_view(&self) -> Vec<ClusterNodeView> {
         let workers = self.workers.read().await;
         let now = Utc::now();
