@@ -491,6 +491,7 @@ stages:
     name: "Native Verification"
     tags: ["k3"]
     depends_on: ["fmt-check", "clippy-check"]
+    threads: 6
     run: "cargo test"
 "#;
         WorkflowConfig::load_from_str(

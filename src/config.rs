@@ -73,7 +73,7 @@ impl Config {
         let max_concurrent_jobs = std::env::var("ACTION_RUNNER_MAX_CONCURRENT_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(6);
 
         let github_token = Self::resolve_secret("GITHUB_TOKEN");
 

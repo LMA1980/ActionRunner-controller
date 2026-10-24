@@ -34,7 +34,7 @@ pub struct StageConfig {
 }
 
 fn default_threads() -> u32 {
-    2
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ impl WorkflowConfig {
                     id: stage_id,
                     name: step.name.clone(),
                     tags: vec!["default".to_string()],
-                    threads: 2,
+                    threads: 6,
                     toolchain: None,
                     depends_on,
                     run: step.run.clone(),
