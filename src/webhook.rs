@@ -509,6 +509,8 @@ mod tests {
             cluster_token: "test-token".to_string(),
             job_timeout_seconds: 60,
             log_api_key: None,
+            max_concurrent_jobs: 2,
+            github_token: None,
         };
         let job_store = JobStore::new(10, None);
         let cluster = crate::cluster::ClusterRegistry::new();

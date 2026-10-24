@@ -48,11 +48,7 @@ impl ClusterRegistry {
         }
     }
 
-    pub async fn register(
-        &self,
-        reg: WorkerRegistration,
-        command_tx: mpsc::Sender<WorkerCommand>,
-    ) {
+    pub async fn register(&self, reg: WorkerRegistration, command_tx: mpsc::Sender<WorkerCommand>) {
         let node_id = reg.node_id.clone();
         info!(
             node_id = %node_id,

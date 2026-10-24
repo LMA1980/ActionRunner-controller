@@ -303,14 +303,32 @@ impl JobStore {
         let _ = self.enqueue_job(job, log_file).await;
     }
 
-    /// Atomically claims the oldest `Queued` job in FIFO order and transitions it to `Running`.
-    pub async fn claim_next_queued_job(&self) -> Option<Job> {
+    /// Atomically claims the oldest `Queued` job in FIFO order that respects global concurrency bounds
+    /// and ensures strict single-pipeline serialization per repository.
+    pub async fn claim_next_queued_job(&self, max_concurrent: usize) -> Option<Job> {
         let claimed = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
+
+            let mut running_count = 0;
+            let mut running_repos = std::collections::HashSet::new();
+
+            for r in store.iter() {
+                if matches!(r.status, JobStatus::Running { .. }) {
+                    running_count += 1;
+                    running_repos.insert(r.job.repo_name.clone());
+                }
+            }
+
+            if running_count >= max_concurrent {
+                return None;
+            }
+
             let mut found = None;
             for record in store.iter_mut().rev() {
-                if matches!(record.status, JobStatus::Queued) {
+                if matches!(record.status, JobStatus::Queued)
+                    && !running_repos.contains(&record.job.repo_name)
+                {
                     record.status = JobStatus::Running { started_at: now };
                     record.updated_at = now;
                     found = Some(record.job.clone());
@@ -465,7 +483,9 @@ impl JobStore {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
-                    if let StageStatus::Assigned { ref node_id, .. } | StageStatus::Running { ref node_id, .. } = status {
+                    if let StageStatus::Assigned { ref node_id, .. }
+                    | StageStatus::Running { ref node_id, .. } = status
+                    {
                         stage.assigned_node = Some(node_id.clone());
                     }
                     stage.status = status;
@@ -774,7 +794,7 @@ mod tests {
         assert_eq!(res1.queue_position, 1);
         assert!(res1.superseded_jobs.is_empty());
 
-        let claimed1 = store.claim_next_queued_job().await;
+        let claimed1 = store.claim_next_queued_job(10).await;
         assert!(claimed1.is_some());
         assert_eq!(claimed1.unwrap().id, "job-100-aaaa1111");
 
@@ -840,10 +860,97 @@ mod tests {
         assert_eq!(snap.queued_jobs[1].position, 2);
 
         // Claim remaining jobs in FIFO order
-        let next1 = store.claim_next_queued_job().await.unwrap();
+        let next1 = store.claim_next_queued_job(10).await.unwrap();
         assert_eq!(next1.id, "job-102-cccc3333");
-        let next2 = store.claim_next_queued_job().await.unwrap();
+        let next2 = store.claim_next_queued_job(10).await.unwrap();
         assert_eq!(next2.id, "job-103-dddd4444");
-        assert!(store.claim_next_queued_job().await.is_none());
+        assert!(store.claim_next_queued_job(10).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_next_queued_job_concurrency_and_per_repo_serialization() {
+        let store = JobStore::new(10, None);
+
+        let job_repo_a1 = Job {
+            id: "job-a1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/repo-a".to_string(),
+            clone_url: "https://github.com/LMA1980/repo-a.git".to_string(),
+            commit_sha: "1111".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let job_repo_a2 = Job {
+            id: "job-a2".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/repo-a".to_string(),
+            clone_url: "https://github.com/LMA1980/repo-a.git".to_string(),
+            commit_sha: "2222".to_string(),
+            ref_name: "refs/heads/feat/branch-2".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let job_repo_b1 = Job {
+            id: "job-b1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/repo-b".to_string(),
+            clone_url: "https://github.com/LMA1980/repo-b.git".to_string(),
+            commit_sha: "3333".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+
+        store
+            .enqueue_job(job_repo_a1, PathBuf::from("logs/a1.log"))
+            .await;
+        store
+            .enqueue_job(job_repo_a2, PathBuf::from("logs/a2.log"))
+            .await;
+        store
+            .enqueue_job(job_repo_b1, PathBuf::from("logs/b1.log"))
+            .await;
+
+        // 1. With max_concurrent = 2:
+        // First claim: repo-a1 is claimed (running_count = 1, running_repos = {repo-a})
+        let c1 = store.claim_next_queued_job(2).await;
+        assert_eq!(c1.unwrap().id, "job-a1");
+
+        // Second claim: repo-a2 cannot run because repo-a is already running! So repo-b1 is claimed.
+        let c2 = store.claim_next_queued_job(2).await;
+        assert_eq!(c2.unwrap().id, "job-b1");
+
+        // Third claim: running_count = 2 >= max_concurrent (2), returns None.
+        let c3 = store.claim_next_queued_job(2).await;
+        assert!(c3.is_none());
+
+        // Now repo-b1 finishes:
+        store
+            .update_status(
+                "job-b1",
+                JobStatus::Completed {
+                    duration_secs: 5,
+                    exit_code: 0,
+                },
+            )
+            .await;
+        // running_count is now 1 (repo-a1 is running), but repo-a is still running, so repo-a2 cannot run!
+        let c4 = store.claim_next_queued_job(2).await;
+        assert!(c4.is_none());
+
+        // Now repo-a1 finishes:
+        store
+            .update_status(
+                "job-a1",
+                JobStatus::Completed {
+                    duration_secs: 10,
+                    exit_code: 0,
+                },
+            )
+            .await;
+        // Now repo-a is free: repo-a2 can finally be claimed!
+        let c5 = store.claim_next_queued_job(2).await;
+        assert_eq!(c5.unwrap().id, "job-a2");
     }
 }

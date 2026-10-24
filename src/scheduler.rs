@@ -31,7 +31,11 @@ impl DAGScheduler {
         info!("ActionRunner DAG Scheduler loop active");
 
         loop {
-            while let Some(job) = self.job_store.claim_next_queued_job().await {
+            while let Some(job) = self
+                .job_store
+                .claim_next_queued_job(self.config.max_concurrent_jobs)
+                .await
+            {
                 let this = self.clone();
                 tokio::spawn(async move {
                     this.execute_job(job).await;
@@ -61,6 +65,16 @@ impl DAGScheduler {
             )
             .await;
 
+        let target_url = format!("https://hook.lma1980.duckdns.org/web/#/jobs/{}", job.id);
+        self.report_github_status(
+            &job.repo_name,
+            &job.commit_sha,
+            "pending",
+            "ActionRunner distributed pipeline running...",
+            Some(&target_url),
+        )
+        .await;
+
         let repo_workspace = self.config.workspace_dir.join("repos").join(&job.repo_name);
         let log_file_path = self
             .config
@@ -79,8 +93,16 @@ impl DAGScheduler {
             Err(err) => {
                 warn!(job_id = %job.id, error = %err, "Failed to load workflow; failing job");
                 self.job_store
-                    .update_status(&job.id, JobStatus::Failed { error: err })
+                    .update_status(&job.id, JobStatus::Failed { error: err.clone() })
                     .await;
+                self.report_github_status(
+                    &job.repo_name,
+                    &job.commit_sha,
+                    "failure",
+                    &format!("Failed to load workflow: {}", err),
+                    Some(&target_url),
+                )
+                .await;
                 return;
             }
         };
@@ -120,7 +142,9 @@ impl DAGScheduler {
 
             // Check if job was cancelled or finished
             match &job_record.status {
-                JobStatus::Completed { .. } | JobStatus::Failed { .. } | JobStatus::Skipped { .. } => {
+                JobStatus::Completed { .. }
+                | JobStatus::Failed { .. }
+                | JobStatus::Skipped { .. } => {
                     break;
                 }
                 _ => {}
@@ -135,7 +159,8 @@ impl DAGScheduler {
                     StageStatus::Completed { exit_code, .. } => {
                         if *exit_code != 0 {
                             any_failed = true;
-                            failure_error = format!("Stage '{}' failed with code {}", stage.id, exit_code);
+                            failure_error =
+                                format!("Stage '{}' failed with code {}", stage.id, exit_code);
                         }
                     }
                     StageStatus::Failed { error } => {
@@ -148,7 +173,10 @@ impl DAGScheduler {
                         let deps_satisfied = stage.depends_on.iter().all(|dep_id| {
                             job_record.stages.iter().any(|s| {
                                 s.id == *dep_id
-                                    && matches!(s.status, StageStatus::Completed { exit_code: 0, .. })
+                                    && matches!(
+                                        s.status,
+                                        StageStatus::Completed { exit_code: 0, .. }
+                                    )
                             })
                         });
 
@@ -192,7 +220,9 @@ impl DAGScheduler {
                                     env_vars: stage_cfg
                                         .env
                                         .as_ref()
-                                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                                        .map(|m| {
+                                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                                        })
                                         .unwrap_or_default(),
                                     timeout_seconds: stage_cfg
                                         .timeout_seconds
@@ -219,8 +249,21 @@ impl DAGScheduler {
                 }
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
                 self.job_store
-                    .update_status(&job.id, JobStatus::Failed { error: failure_error })
+                    .update_status(
+                        &job.id,
+                        JobStatus::Failed {
+                            error: failure_error.clone(),
+                        },
+                    )
                     .await;
+                self.report_github_status(
+                    &job.repo_name,
+                    &job.commit_sha,
+                    "failure",
+                    &failure_error,
+                    Some(&target_url),
+                )
+                .await;
                 break;
             }
 
@@ -242,6 +285,14 @@ impl DAGScheduler {
                         },
                     )
                     .await;
+                self.report_github_status(
+                    &job.repo_name,
+                    &job.commit_sha,
+                    "success",
+                    &format!("All stages completed successfully in {}s", duration),
+                    Some(&target_url),
+                )
+                .await;
                 break;
             }
 
@@ -278,7 +329,11 @@ impl DAGScheduler {
                 let content = tokio::fs::read_to_string(&path)
                     .await
                     .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-                return WorkflowConfig::load_from_str(&content, repo_workspace, self.config.job_timeout_seconds);
+                return WorkflowConfig::load_from_str(
+                    &content,
+                    repo_workspace,
+                    self.config.job_timeout_seconds,
+                );
             }
         }
 
@@ -303,6 +358,79 @@ stages:
     depends_on: ["fmt-check", "clippy-check"]
     run: "cargo test"
 "#;
-        WorkflowConfig::load_from_str(default_yaml, repo_workspace, self.config.job_timeout_seconds)
+        WorkflowConfig::load_from_str(
+            default_yaml,
+            repo_workspace,
+            self.config.job_timeout_seconds,
+        )
+    }
+
+    async fn report_github_status(
+        &self,
+        repo: &str,
+        sha: &str,
+        state: &str,
+        description: &str,
+        target_url: Option<&str>,
+    ) {
+        let token = match &self.config.github_token {
+            Some(t) if !t.trim().is_empty() => t.trim(),
+            _ => return,
+        };
+
+        let mut desc = description.to_string();
+        if desc.len() > 140 {
+            desc.truncate(137);
+            desc.push_str("...");
+        }
+
+        let url = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "Failed to create HTTP client for GitHub status reporting");
+                return;
+            }
+        };
+
+        let payload = serde_json::json!({
+            "state": state,
+            "target_url": target_url,
+            "description": desc,
+            "context": "k3-ci",
+        });
+
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "ActionRunner-Controller/0.1.0")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(repo = %repo, sha = %sha, state = %state, "Reported commit status to GitHub");
+                } else {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(
+                        repo = %repo,
+                        sha = %sha,
+                        status = %status,
+                        body = %body,
+                        "GitHub commit status API responded with error"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
+            }
+        }
     }
 }

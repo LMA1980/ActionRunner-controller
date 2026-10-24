@@ -21,7 +21,11 @@ pub fn append_logs(log_file_path: &Path, entries: &[LogEntry]) -> Result<(), std
         let ts_nsec = ((entry.timestamp_us % 1_000_000) * 1000) as u32;
         let dt = DateTime::<Utc>::from_timestamp(ts_sec, ts_nsec).unwrap_or_else(Utc::now);
 
-        let stream_tag = if entry.stream == 2 { "[stderr]" } else { "[stdout]" };
+        let stream_tag = if entry.stream == 2 {
+            "[stderr]"
+        } else {
+            "[stdout]"
+        };
         writeln!(
             file,
             "{} [{}] [{}] {} {}",
