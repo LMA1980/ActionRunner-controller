@@ -1,0 +1,38 @@
+[Unit]
+Description=ActionRunner Distributed CI Controller & Ingress Gateway
+Documentation=https://github.com/LMA1980/ActionRunner-controller
+After=network.target
+
+[Service]
+Type=simple
+User=action-runner
+Group=action-runner
+WorkingDirectory=/var/lib/action-runner
+EnvironmentFile=-/etc/action-runner/controller.env
+Environment=ACTION_RUNNER_BIND=127.0.0.1:8000
+Environment=ACTION_RUNNER_WORKSPACE=/var/lib/action-runner/workspace
+Environment=ACTION_RUNNER_ALLOWED_REPOS=LMA1980/*
+Environment=ACTION_RUNNER_TIMEOUT_SECS=600
+Environment=GITHUB_WEBHOOK_SECRET=/etc/action-runner/github_webhook_secret
+Environment=ACTION_RUNNER_CLUSTER_TOKEN=/etc/action-runner/cluster_token
+ExecStart=/usr/local/bin/action-runner-controller
+Restart=always
+RestartSec=5
+
+# ==============================================================================
+# Security Hardening & Isolation Directives
+# ==============================================================================
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Directory Access Controls
+ReadWritePaths=/var/lib/action-runner
+InaccessiblePaths=/etc/shadow /root
+
+[Install]
+WantedBy=multi-user.target
