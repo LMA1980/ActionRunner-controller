@@ -960,9 +960,12 @@ impl DuckDbStore {
                         continue;
                     }
 
-                    if let Some(rec) =
-                        Self::reconstruct_record_from_log(&repo_full, job_id, &log_path)
-                    {
+                    if let Some(rec) = Self::reconstruct_record_from_log(
+                        &repo_full,
+                        job_id,
+                        &log_path,
+                        workspace_dir,
+                    ) {
                         recovered_records.push(rec);
                     }
                 }
@@ -988,6 +991,7 @@ impl DuckDbStore {
         repo_full: &str,
         job_id: &str,
         log_path: &Path,
+        workspace_dir: &Path,
     ) -> Option<JobRecord> {
         // Parse job-<timestamp>-<sha_short>[-suffix]
         let rest = job_id.strip_prefix("job-")?;
@@ -1002,21 +1006,58 @@ impl DuckDbStore {
             .map(DateTime::<Utc>::from)
             .unwrap_or(queued_at);
 
-        let duration_secs = (mtime_dt - queued_at).num_seconds().max(1) as u64;
         let content = std::fs::read_to_string(log_path).unwrap_or_default();
+        if content.trim().is_empty() {
+            return None;
+        }
 
         // Determine if any stage failed or if all passed
         let has_failure = content.contains("Process exited with code")
             || content.contains("Stage failed")
-            || content.contains("test result: FAILED.");
+            || content.contains("=== Pipeline Status: FAILED")
+            || content.contains("test result: FAILED.")
+            || content.contains("error: test failed")
+            || content.contains("error: could not compile");
 
-        // Count passed/failed unit tests from standard cargo test output lines
+        // Count passed/failed unit tests and extract stage records from streamed log lines
         let mut tests_passed = 0u32;
         let mut tests_total = 0u32;
+        let mut first_log_ts: Option<DateTime<Utc>> = None;
+        let mut last_log_ts: Option<DateTime<Utc>> = None;
+        let mut stage_order: Vec<String> = Vec::new();
+        let mut stage_info: BTreeMap<String, (String, DateTime<Utc>, DateTime<Utc>)> =
+            BTreeMap::new();
+
         for line in content.lines() {
+            // Parse "<rfc3339> [<node_id>] [<stage_id>] [<stream>] <content>"
+            if let Some((ts_tok, rest_line)) = line.split_once(" [") {
+                if let Ok(parsed_dt) = DateTime::parse_from_rfc3339(ts_tok.trim()) {
+                    let dt_utc = parsed_dt.with_timezone(&Utc);
+                    if first_log_ts.is_none() {
+                        first_log_ts = Some(dt_utc);
+                    }
+                    last_log_ts = Some(dt_utc);
+
+                    if let Some((node_id, after_node)) = rest_line.split_once("] [") {
+                        if let Some((stage_id, _after_stage)) = after_node.split_once(']') {
+                            if stage_id != "controller" && !stage_id.is_empty() {
+                                if !stage_info.contains_key(stage_id) {
+                                    stage_order.push(stage_id.to_string());
+                                    stage_info.insert(
+                                        stage_id.to_string(),
+                                        (node_id.to_string(), dt_utc, dt_utc),
+                                    );
+                                } else if let Some(entry) = stage_info.get_mut(stage_id) {
+                                    entry.2 = dt_utc;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(idx) = line.find("test result:") {
                 let after = &line[idx..];
-                // e.g. "test result: ok. 12 passed; 0 failed;"
                 let tokens: Vec<&str> = after.split_whitespace().collect();
                 for window in tokens.windows(2) {
                     if window[1].starts_with("passed") {
@@ -1033,10 +1074,39 @@ impl DuckDbStore {
             }
         }
 
+        let duration_secs = match (first_log_ts, last_log_ts) {
+            (Some(f), Some(l)) => (l - f).num_seconds().max(1) as u64,
+            _ => (mtime_dt - queued_at).num_seconds().max(1) as u64,
+        };
+
+        let stages: Vec<crate::job::StageRecord> = stage_order
+            .into_iter()
+            .filter_map(|sid| {
+                let (node_id, s_first, s_last) = stage_info.remove(&sid)?;
+                let st_dur = (s_last - s_first).num_seconds().max(1) as u64;
+                Some(crate::job::StageRecord {
+                    id: sid.clone(),
+                    name: sid,
+                    tags: Vec::new(),
+                    threads: 1,
+                    toolchain: None,
+                    depends_on: Vec::new(),
+                    status: crate::job::StageStatus::Completed {
+                        duration_secs: st_dur,
+                        exit_code: 0,
+                    },
+                    assigned_node: Some(node_id),
+                })
+            })
+            .collect();
+
+        // Attempt to resolve full 40-char commit SHA and branch from workspace_dir/repos/<repo_full>
+        let (resolved_sha, resolved_ref) =
+            Self::resolve_git_commit_and_ref(workspace_dir, repo_full, &sha_short);
+
         let status = if has_failure {
-            JobStatus::Completed {
-                duration_secs,
-                exit_code: 1,
+            JobStatus::Failed {
+                error: "Stage failed during execution".to_string(),
             }
         } else {
             JobStatus::Completed {
@@ -1074,16 +1144,73 @@ impl DuckDbStore {
                 event_type: "push".to_string(),
                 repo_name: repo_full.to_string(),
                 clone_url: format!("https://github.com/{}.git", repo_full),
-                commit_sha: sha_short,
-                ref_name: "refs/heads/main".to_string(),
+                commit_sha: resolved_sha,
+                ref_name: resolved_ref,
                 sender: "LMA1980".to_string(),
                 queued_at,
             },
             status,
             log_file: rel_log_file,
-            updated_at: mtime_dt,
+            updated_at: last_log_ts.unwrap_or(mtime_dt),
             metrics,
-            stages: Vec::new(),
+            stages,
         })
+    }
+
+    fn resolve_git_commit_and_ref(
+        workspace_dir: &Path,
+        repo_full: &str,
+        sha_short: &str,
+    ) -> (String, String) {
+        let repo_dir = workspace_dir.join("repos").join(repo_full);
+        if !repo_dir.is_dir() || sha_short == "unknown" {
+            return (sha_short.to_string(), "refs/heads/main".to_string());
+        }
+
+        let full_sha = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{commit}}", sha_short),
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| sha_short.to_string());
+
+        let branches_out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["branch", "-a", "--contains", &full_sha])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+
+        let mut candidate_branch: Option<String> = None;
+        for line in branches_out.lines() {
+            let trimmed = line.trim().trim_start_matches('*').trim();
+            if trimmed.is_empty() || trimmed.contains("->") || trimmed.starts_with('(') {
+                continue;
+            }
+            let b = trimmed.strip_prefix("remotes/origin/").unwrap_or(trimmed);
+            if b == "main" || b == "master" {
+                return (full_sha, format!("refs/heads/{}", b));
+            }
+            if !b.starts_with("pr/") && candidate_branch.is_none() {
+                candidate_branch = Some(format!("refs/heads/{}", b));
+            }
+        }
+
+        (
+            full_sha,
+            candidate_branch.unwrap_or_else(|| "refs/heads/main".to_string()),
+        )
     }
 }
