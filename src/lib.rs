@@ -3,6 +3,7 @@ pub mod app;
 pub mod badge;
 pub mod cluster;
 pub mod config;
+pub mod db;
 pub mod job;
 pub mod scheduler;
 pub mod tunnel;

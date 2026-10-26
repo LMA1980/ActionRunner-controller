@@ -6,8 +6,13 @@ description = "WebAPI, Ingress, DAG Stage Scheduler, and SVG Scorecard Controlle
 license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/ActionRunner-controller"
 
+[features]
+default = []
+bundled-duckdb = ["duckdb/bundled"]
+
 [dependencies]
 action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "feat/stage-pid-tracking-and-queue-fairness" }
+duckdb = { version = "=1.2.2", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process"] }
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"

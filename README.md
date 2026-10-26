@@ -10,11 +10,11 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 ## Architecture
 
 - **Ingress & Authentication**: GitHub webhook receiver (`POST /webhook`) with constant-time HMAC-SHA256 payload verification and anti-RCE fork PR validation.
-- **Coalescing FIFO Queue**: Serializes builds, persists queue state to `jobs_index.json`, and automatically supersedes older queued commits when newer pushes arrive for the same `(repository, ref, event)`.
+- **Coalescing FIFO Queue & Persistent DuckDB Store**: Serializes builds, persists full execution history (`jobs_history`) and pinned latest `(repository, branch, submodule)` snapshots (`branch_snapshots`, `submodule_snapshots`) into DuckDB (`logs/jobs.duckdb`), and automatically backfills evicted historical runs from on-disk `job-*.log` artifacts on startup.
 - **DAG Stage Scheduler**: Evaluates stage dependencies (`depends_on`), matches required stage tags against worker node tags, and dispatches parallel tasks to available worker slots.
 - **Zero-Copy IPC Cluster Tunnel**: Coordinates with distributed workers via WebSocket (`/api/cluster/tunnel`) using **`zerocopy`** framing, **`Apache Fory`** control message contracts, and **`Apache Arrow`** columnar log and metric streaming.
 - **Factory Pipeline Quality Scoring**: Computes letter grade (`A+` to `F`), pass ratios, coverage summaries, advisories, and micro-benchmarks across submodules.
-- **Vectorized SVG Badges & Cards**: Serves dynamic SVG badges and multi-metric scorecard cards (`/cards/*`, `/badges/*`).
+- **Vectorized SVG Badges & Cards**: Serves dynamic SVG badges (`/badges/*`, pinned to the last completed `Success`/`Failed` build) and live multi-metric scorecard cards (`/cards/*`, showing live `queued`/`running`/`passing`/`failing` status while retaining and attributing the previous completed execution's score and metrics during active builds).
 
 ## License
 

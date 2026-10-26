@@ -705,13 +705,19 @@ pub async fn get_repo_card(
     Query(query): Query<CardQuery>,
 ) -> Response {
     let repo_full = format!("{}/{}", owner, repo);
-    let record = if let Some(job_id) = query.job_id.as_deref() {
-        state.job_store.get_job(job_id).await
+    let branch_filter = query.branch.as_deref().or(query.ref_name.as_deref());
+    let (record, prev_completed) = if let Some(job_id) = query.job_id.as_deref() {
+        let rec = state.job_store.get_job(job_id).await;
+        let b_hint = branch_filter.or_else(|| {
+            rec.as_ref()
+                .map(|r| r.job.ref_name.trim_start_matches("refs/heads/"))
+        });
+        let (_act, comp) = state.job_store.find_card_context(&repo_full, b_hint).await;
+        (rec, comp)
     } else {
-        let branch_filter = query.branch.as_deref().or(query.ref_name.as_deref());
         state
             .job_store
-            .find_latest_job(&repo_full, branch_filter)
+            .find_card_context(&repo_full, branch_filter)
             .await
     };
     let branch = query
@@ -720,10 +726,16 @@ pub async fn get_repo_card(
         .or_else(|| {
             record
                 .as_ref()
+                .or(prev_completed.as_ref())
                 .map(|r| r.job.ref_name.trim_start_matches("refs/heads/").to_string())
         })
         .unwrap_or_else(|| "main".to_string());
-    let svg = badge::render_card_svg(&repo_full, &branch, record.as_ref());
+    let svg = badge::render_card_svg_with_previous(
+        &repo_full,
+        &branch,
+        record.as_ref(),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
@@ -732,11 +744,16 @@ pub async fn get_branch_card(
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Response {
     let repo_full = format!("{}/{}", owner, repo);
-    let record = state
+    let (record, prev_completed) = state
         .job_store
-        .find_latest_job(&repo_full, Some(&branch))
+        .find_card_context(&repo_full, Some(&branch))
         .await;
-    let svg = badge::render_card_svg(&repo_full, &branch, record.as_ref());
+    let svg = badge::render_card_svg_with_previous(
+        &repo_full,
+        &branch,
+        record.as_ref(),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
@@ -849,16 +866,22 @@ pub async fn get_submodule_card(
     Path((owner, repo, submodule)): Path<(String, String, String)>,
 ) -> Response {
     let parent_full = format!("{}/{}", owner, repo);
-    let record = state
+    let (record, prev_completed) = state
         .job_store
-        .find_submodule_job(&parent_full, &submodule, None)
+        .find_submodule_card_context(&parent_full, &submodule, None)
         .await;
     let sub_name = format!("{}/{}", owner, submodule);
     let branch = record
         .as_ref()
+        .or(prev_completed.as_ref())
         .map(|r| r.job.ref_name.trim_start_matches("refs/heads/").to_string())
         .unwrap_or_else(|| "main".to_string());
-    let svg = badge::render_card_svg(&sub_name, &branch, record.as_ref());
+    let svg = badge::render_card_svg_with_previous(
+        &sub_name,
+        &branch,
+        record.as_ref(),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
@@ -867,12 +890,17 @@ pub async fn get_branch_submodule_card(
     Path((owner, repo, branch, submodule)): Path<(String, String, String, String)>,
 ) -> Response {
     let parent_full = format!("{}/{}", owner, repo);
-    let record = state
+    let (record, prev_completed) = state
         .job_store
-        .find_submodule_job(&parent_full, &submodule, Some(&branch))
+        .find_submodule_card_context(&parent_full, &submodule, Some(&branch))
         .await;
     let sub_name = format!("{}/{}", owner, submodule);
-    let svg = badge::render_card_svg(&sub_name, &branch, record.as_ref());
+    let svg = badge::render_card_svg_with_previous(
+        &sub_name,
+        &branch,
+        record.as_ref(),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
@@ -888,7 +916,16 @@ pub async fn get_job_card(
         .ref_name
         .trim_start_matches("refs/heads/")
         .to_string();
-    let svg = badge::render_card_svg(&record.job.repo_name, &branch, Some(&record));
+    let (_act, prev_completed) = state
+        .job_store
+        .find_card_context(&record.job.repo_name, Some(&branch))
+        .await;
+    let svg = badge::render_card_svg_with_previous(
+        &record.job.repo_name,
+        &branch,
+        Some(&record),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
@@ -912,7 +949,16 @@ pub async fn get_job_submodule_card(
         .ref_name
         .trim_start_matches("refs/heads/")
         .to_string();
-    let svg = badge::render_card_svg(&sub_name, &branch, sub_record.as_ref());
+    let (_act, prev_completed) = state
+        .job_store
+        .find_submodule_card_context(&record.job.repo_name, &submodule, Some(&branch))
+        .await;
+    let svg = badge::render_card_svg_with_previous(
+        &sub_name,
+        &branch,
+        sub_record.as_ref(),
+        prev_completed.as_ref(),
+    );
     svg_response(svg)
 }
 
