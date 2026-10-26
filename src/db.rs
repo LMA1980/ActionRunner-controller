@@ -708,7 +708,7 @@ impl DuckDbStore {
         Self::resolve_submodule_snapshots(&conn, Some(parent_repo), submodule, branch)
     }
 
-    fn resolve_repo_snapshots(
+    fn resolve_direct_repo_snapshots(
         conn: &Connection,
         repo: &str,
         branch: Option<&str>,
@@ -717,7 +717,6 @@ impl DuckDbStore {
         let suffix_pattern = format!("%/{}", repo_lower);
         let branch_norm = branch.map(|b| normalize_ref(b).to_ascii_lowercase());
 
-        // 1. Direct lookup in branch_snapshots
         let row: Option<(Option<String>, Option<String>)> = if let Some(ref b_key) = branch_norm {
             conn.query_row(
                 r#"
@@ -733,7 +732,6 @@ impl DuckDbStore {
             .optional()
             .unwrap_or(None)
         } else {
-            // Prefer 'main' if no branch specified and 'main' exists, else newest branch overall
             conn.query_row(
                 r#"
                 SELECT latest_active_json, latest_completed_json
@@ -751,14 +749,25 @@ impl DuckDbStore {
             .unwrap_or(None)
         };
 
-        let mut direct_active = row
+        let direct_active = row
             .as_ref()
             .and_then(|(a, _)| a.as_deref())
             .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
-        let mut direct_completed = row
+        let direct_completed = row
             .as_ref()
             .and_then(|(_, c)| c.as_deref())
             .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
+
+        (direct_active, direct_completed)
+    }
+
+    fn resolve_repo_snapshots(
+        conn: &Connection,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        let (mut direct_active, mut direct_completed) =
+            Self::resolve_direct_repo_snapshots(conn, repo, branch);
 
         // 2. Also check submodule_snapshots in case repo is a standalone submodule (e.g. LMA1980/k3-core)
         let (sub_active, sub_completed) =
@@ -900,11 +909,35 @@ impl DuckDbStore {
             .as_ref()
             .and_then(|(_, c)| parse_and_fix_owner(c.as_deref()));
 
-        (active, completed)
+        if active.is_some() || completed.is_some() {
+            return (active, completed);
+        }
+
+        // If queried under a parent repo (e.g. /cards/LMA1980/model-runner/submodules/k3-core/card.svg)
+        // and submodule_snapshots had no entry yet, fall back to direct standalone repository snapshots
+        if parent_repo.is_some() {
+            let direct_candidate = format!("{}/{}", owner, clean_target);
+            let (d_act, d_comp) =
+                Self::resolve_direct_repo_snapshots(conn, &direct_candidate, branch);
+            if d_act.is_some() || d_comp.is_some() {
+                return (d_act, d_comp);
+            }
+            if !clean_target.starts_with("k3-") {
+                let k3_candidate = format!("{}/k3-{}", owner, clean_target);
+                let (k_act, k_comp) =
+                    Self::resolve_direct_repo_snapshots(conn, &k3_candidate, branch);
+                if k_act.is_some() || k_comp.is_some() {
+                    return (k_act, k_comp);
+                }
+            }
+        }
+
+        (None, None)
     }
 
     /// Scans `workspace_dir/logs/<owner>/<repo>/job-*.log` and imports any historical log files
-    /// that were previously evicted from `jobs_index.json` into DuckDB.
+    /// that were previously evicted from `jobs_index.json` into DuckDB, as well as enriching
+    /// existing completed/failed records whose `metrics` or `metrics.submodules` were missing.
     pub fn backfill_from_logs_dir(&self, workspace_dir: &Path) -> usize {
         let logs_root = workspace_dir.join("logs");
         if !logs_root.is_dir() {
@@ -939,6 +972,11 @@ impl DuckDbStore {
                     continue;
                 };
                 let repo_full = format!("{}/{}", owner_name, repo_short);
+                let has_gitmodules = workspace_dir
+                    .join("repos")
+                    .join(&repo_full)
+                    .join(".gitmodules")
+                    .is_file();
 
                 let Ok(log_files) = std::fs::read_dir(&repo_path) else {
                     continue;
@@ -956,7 +994,33 @@ impl DuckDbStore {
                         continue;
                     }
 
-                    if self.get_job(job_id).is_some() {
+                    if let Some(mut existing) = self.get_job(job_id) {
+                        let is_terminal = matches!(
+                            existing.status,
+                            JobStatus::Completed { .. } | JobStatus::Failed { .. }
+                        );
+                        let needs_metrics = existing.metrics.is_none()
+                            || (has_gitmodules
+                                && existing
+                                    .metrics
+                                    .as_ref()
+                                    .map(|m| m.submodules.is_empty())
+                                    .unwrap_or(true));
+                        if is_terminal && needs_metrics {
+                            let is_success = matches!(
+                                existing.status,
+                                JobStatus::Completed { exit_code: 0, .. }
+                            );
+                            if let Some(extracted) = Self::extract_metrics_from_log_and_workspace(
+                                workspace_dir,
+                                &repo_full,
+                                &log_path,
+                                is_success,
+                            ) {
+                                existing.metrics = Some(extracted);
+                                recovered_records.push(existing);
+                            }
+                        }
                         continue;
                     }
 
@@ -982,9 +1046,235 @@ impl DuckDbStore {
         self.upsert_records_batch(&recovered_records);
         info!(
             recovered_count = count,
-            "Backfilled historical job records from workspace log files into DuckDB"
+            "Backfilled and enriched historical job records from workspace log files into DuckDB"
         );
         count
+    }
+
+    pub fn extract_metrics_from_log_and_workspace(
+        workspace_dir: &Path,
+        repo_full: &str,
+        log_path: &Path,
+        is_success: bool,
+    ) -> Option<JobMetrics> {
+        let content = std::fs::read_to_string(log_path).ok()?;
+        if content.trim().is_empty() {
+            return None;
+        }
+        Some(Self::extract_metrics_from_content_and_workspace(
+            workspace_dir,
+            repo_full,
+            &content,
+            is_success,
+        ))
+    }
+
+    fn extract_metrics_from_content_and_workspace(
+        workspace_dir: &Path,
+        repo_full: &str,
+        content: &str,
+        is_success: bool,
+    ) -> JobMetrics {
+        let mut tests_passed = 0u32;
+        let mut tests_total = 0u32;
+        let mut overall_coverage: Option<f64> = None;
+        let mut best_bench_ns: Option<f64> = None;
+        let mut per_dir_lines: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+
+        for line in content.lines() {
+            // Strip optional "<rfc3339> [<node>] [<stage>] [<stream>] " prefix
+            let body = if let Some((_, after_stream)) = line.split_once("[stdout] ") {
+                after_stream
+            } else if let Some((_, after_stream)) = line.split_once("[stderr] ") {
+                after_stream
+            } else {
+                line
+            };
+
+            if let Some(idx) = body.find("test result:") {
+                let after = &body[idx..];
+                let tokens: Vec<&str> = after.split_whitespace().collect();
+                for window in tokens.windows(2) {
+                    if window[1].starts_with("passed") {
+                        if let Ok(n) = window[0].parse::<u32>() {
+                            tests_passed += n;
+                            tests_total += n;
+                        }
+                    } else if window[1].starts_with("failed") {
+                        if let Ok(n) = window[0].parse::<u32>() {
+                            tests_total += n;
+                        }
+                    }
+                }
+            }
+
+            // Parse cargo-llvm-cov TOTAL or per-file coverage row
+            let trimmed = body.trim();
+            if trimmed.starts_with("TOTAL ") {
+                // Format: TOTAL <regions> <missed> <reg_cov>% <funcs> <missed> <fn_cov>% <lines> <missed> <line_cov>%
+                let pcts: Vec<f64> = trimmed
+                    .split_whitespace()
+                    .filter_map(|tok| tok.strip_suffix('%'))
+                    .filter_map(|num| num.parse::<f64>().ok())
+                    .collect();
+                if let Some(&cov) = pcts.get(2).or_else(|| pcts.first()) {
+                    overall_coverage = Some(cov);
+                }
+            } else if trimmed.contains(".rs ") && trimmed.contains('%') {
+                let cols: Vec<&str> = trimmed.split_whitespace().collect();
+                // cols: [filename, regions, missed_reg, reg_pct, funcs, missed_fn, fn_pct, lines, missed_lines, line_pct, ...]
+                if cols.len() >= 10 {
+                    if let Some((dir_prefix, _)) = cols[0].split_once('/') {
+                        if let (Ok(total_l), Ok(missed_l)) =
+                            (cols[7].parse::<u64>(), cols[8].parse::<u64>())
+                        {
+                            let entry = per_dir_lines
+                                .entry(dir_prefix.to_ascii_lowercase())
+                                .or_insert((0, 0));
+                            entry.0 += total_l;
+                            entry.1 += missed_l;
+                        }
+                    }
+                }
+            }
+
+            // Parse benchmark summary: "... bench:       53.4 ns/iter"
+            if let Some(b_idx) = body.find("bench:") {
+                let after_b = body[b_idx + "bench:".len()..].trim();
+                if let Some(first_tok) = after_b.split_whitespace().next() {
+                    let clean_num = first_tok.replace(',', "");
+                    if let Ok(ns) = clean_num.parse::<f64>() {
+                        if ns > 0.0 {
+                            best_bench_ns = Some(match best_bench_ns {
+                                Some(curr) => curr.min(ns),
+                                None => ns,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let benchmark_summary = best_bench_ns.map(|ns| format!("{:.1} ns/iter", ns));
+
+        // Build submodule metrics from workspace_dir/repos/<repo_full>/.gitmodules if present
+        let mut submodules = BTreeMap::new();
+        let gitmodules_path = workspace_dir
+            .join("repos")
+            .join(repo_full)
+            .join(".gitmodules");
+        if let Ok(gm_content) = std::fs::read_to_string(&gitmodules_path) {
+            for (sub_name, sub_path) in Self::parse_gitmodules(&gm_content) {
+                let path_short = sub_path
+                    .rsplit_once('/')
+                    .map(|(_, s)| s)
+                    .unwrap_or(&sub_path)
+                    .to_ascii_lowercase();
+                let name_short = sub_name
+                    .strip_prefix("k3-")
+                    .unwrap_or(&sub_name)
+                    .to_ascii_lowercase();
+
+                let sub_cov = per_dir_lines
+                    .get(&path_short)
+                    .or_else(|| per_dir_lines.get(&name_short))
+                    .and_then(|&(tot, missed)| {
+                        if tot > 0 {
+                            Some(
+                                ((tot.saturating_sub(missed) as f64 / tot as f64) * 1000.0).round()
+                                    / 10.0,
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .or(overall_coverage);
+
+                let sub_score = if is_success { 100 } else { 40 };
+                let sub_grade = if is_success {
+                    "A+".to_string()
+                } else {
+                    "F".to_string()
+                };
+
+                submodules.insert(
+                    sub_name.clone(),
+                    crate::job::SubmoduleMetrics {
+                        name: sub_name,
+                        path: sub_path,
+                        quality_score: sub_score,
+                        letter_grade: sub_grade,
+                        tests_passed: 0,
+                        tests_total: 0,
+                        coverage_pct: sub_cov,
+                        benchmark_summary: benchmark_summary.clone(),
+                        clippy_warnings: 0,
+                    },
+                );
+            }
+        }
+
+        let quality_score = if is_success { 100 } else { 40 };
+        let letter_grade = if is_success {
+            "A+".to_string()
+        } else {
+            "F".to_string()
+        };
+
+        JobMetrics {
+            quality_score,
+            letter_grade,
+            coverage_pct: overall_coverage,
+            benchmark_summary,
+            tests_passed,
+            tests_total,
+            advisories_count: 0,
+            clippy_warnings: 0,
+            submodules,
+        }
+    }
+
+    fn parse_gitmodules(gm_content: &str) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        let mut curr_path: Option<String> = None;
+        let mut curr_url: Option<String> = None;
+
+        let flush = |p: Option<String>, u: Option<String>, out: &mut Vec<(String, String)>| {
+            if let Some(path_val) = p {
+                let name = u
+                    .and_then(|url_str| {
+                        let trimmed = url_str.trim().trim_end_matches(".git");
+                        trimmed
+                            .rsplit_once('/')
+                            .or_else(|| trimmed.rsplit_once(':'))
+                            .map(|(_, repo)| repo.to_string())
+                    })
+                    .unwrap_or_else(|| {
+                        path_val
+                            .rsplit_once('/')
+                            .map(|(_, s)| s.to_string())
+                            .unwrap_or_else(|| path_val.clone())
+                    });
+                out.push((name, path_val));
+            }
+        };
+
+        for line in gm_content.lines() {
+            let t = line.trim();
+            if t.starts_with("[submodule ") {
+                flush(curr_path.take(), curr_url.take(), &mut result);
+            } else if let Some((k, v)) = t.split_once('=') {
+                let key = k.trim();
+                let val = v.trim().to_string();
+                if key == "path" {
+                    curr_path = Some(val);
+                } else if key == "url" {
+                    curr_url = Some(val);
+                }
+            }
+        }
+        flush(curr_path.take(), curr_url.take(), &mut result);
+        result
     }
 
     fn reconstruct_record_from_log(
@@ -1019,9 +1309,6 @@ impl DuckDbStore {
             || content.contains("error: test failed")
             || content.contains("error: could not compile");
 
-        // Count passed/failed unit tests and extract stage records from streamed log lines
-        let mut tests_passed = 0u32;
-        let mut tests_total = 0u32;
         let mut first_log_ts: Option<DateTime<Utc>> = None;
         let mut last_log_ts: Option<DateTime<Utc>> = None;
         let mut stage_order: Vec<String> = Vec::new();
@@ -1051,23 +1338,6 @@ impl DuckDbStore {
                                     entry.2 = dt_utc;
                                 }
                             }
-                        }
-                    }
-                }
-            }
-
-            if let Some(idx) = line.find("test result:") {
-                let after = &line[idx..];
-                let tokens: Vec<&str> = after.split_whitespace().collect();
-                for window in tokens.windows(2) {
-                    if window[1].starts_with("passed") {
-                        if let Ok(n) = window[0].parse::<u32>() {
-                            tests_passed += n;
-                            tests_total += n;
-                        }
-                    } else if window[1].starts_with("failed") {
-                        if let Ok(n) = window[0].parse::<u32>() {
-                            tests_total += n;
                         }
                     }
                 }
@@ -1115,24 +1385,12 @@ impl DuckDbStore {
             }
         };
 
-        let quality_score = if has_failure { 40 } else { 100 };
-        let letter_grade = if has_failure {
-            "F".to_string()
-        } else {
-            "A+".to_string()
-        };
-
-        let metrics = Some(JobMetrics {
-            quality_score,
-            letter_grade,
-            coverage_pct: None,
-            benchmark_summary: None,
-            tests_passed,
-            tests_total,
-            advisories_count: 0,
-            clippy_warnings: 0,
-            submodules: BTreeMap::new(),
-        });
+        let metrics = Some(Self::extract_metrics_from_content_and_workspace(
+            workspace_dir,
+            repo_full,
+            &content,
+            !has_failure,
+        ));
 
         let rel_log_file = PathBuf::from("logs")
             .join(repo_full)

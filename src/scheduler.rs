@@ -313,6 +313,16 @@ impl DAGScheduler {
                     self.cluster.release_slot(node_id).await;
                 }
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
+                if job_record.metrics.is_none() {
+                    if let Some(m) = crate::db::DuckDbStore::extract_metrics_from_log_and_workspace(
+                        &self.config.workspace_dir,
+                        &job.repo_name,
+                        &log_file_path,
+                        false,
+                    ) {
+                        self.job_store.update_metrics(&job.id, m).await;
+                    }
+                }
                 self.job_store
                     .update_status(
                         &job.id,
@@ -339,6 +349,23 @@ impl DAGScheduler {
                 // Release any lingering slots
                 for (_s_id, node_id) in leased_slots.drain() {
                     self.cluster.release_slot(&node_id).await;
+                }
+
+                if job_record.metrics.is_none()
+                    || job_record
+                        .metrics
+                        .as_ref()
+                        .map(|m| m.submodules.is_empty())
+                        .unwrap_or(true)
+                {
+                    if let Some(m) = crate::db::DuckDbStore::extract_metrics_from_log_and_workspace(
+                        &self.config.workspace_dir,
+                        &job.repo_name,
+                        &log_file_path,
+                        true,
+                    ) {
+                        self.job_store.update_metrics(&job.id, m).await;
+                    }
                 }
 
                 self.job_store
