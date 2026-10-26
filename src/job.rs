@@ -164,6 +164,7 @@ pub struct QueueSnapshot {
 #[derive(Clone)]
 pub struct JobStore {
     inner: Arc<RwLock<VecDeque<JobRecord>>>,
+    db: Arc<crate::db::DuckDbStore>,
     notify: Arc<Notify>,
     max_history: usize,
     index_file: Option<PathBuf>,
@@ -172,14 +173,24 @@ pub struct JobStore {
 impl JobStore {
     pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
         let index_file = workspace_dir.map(|w| w.join("logs").join("jobs_index.json"));
-        let mut initial_jobs = VecDeque::with_capacity(max_history);
+        let db_file = workspace_dir.map(|w| w.join("logs").join("jobs.duckdb"));
+        let db = Arc::new(
+            crate::db::DuckDbStore::open(db_file.as_deref()).unwrap_or_else(|e| {
+                warn!(
+                    "Failed to open on-disk DuckDB ({}), falling back to in-memory DuckDB",
+                    e
+                );
+                crate::db::DuckDbStore::open(None).expect("in-memory DuckDB")
+            }),
+        );
+
         let notify = Arc::new(Notify::new());
 
+        // 1. If migrating or starting up with a workspace_dir, import jobs_index.json into DuckDB
         if let Some(ref path) = index_file {
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     if let Ok(mut jobs) = serde_json::from_str::<VecDeque<JobRecord>>(&content) {
-                        let mut has_queued = false;
                         for rec in jobs.iter_mut() {
                             if matches!(rec.status, JobStatus::Running { .. }) {
                                 rec.status = JobStatus::Queued;
@@ -194,29 +205,59 @@ impl JobStore {
                                     }
                                 }
                             }
-                            if matches!(rec.status, JobStatus::Queued) {
-                                has_queued = true;
-                            }
                         }
-                        if has_queued {
-                            notify.notify_one();
-                        }
+                        // Upsert oldest-first into DuckDB
+                        let chronological: Vec<JobRecord> = jobs.iter().rev().cloned().collect();
+                        db.upsert_records_batch(&chronological);
                         info!(
-                            "Restored {} job records from {}",
+                            "Synchronized {} job records from {} into DuckDB",
                             jobs.len(),
                             path.display()
                         );
-                        initial_jobs = jobs;
-                        while initial_jobs.len() > max_history {
-                            initial_jobs.pop_back();
-                        }
                     }
                 }
             }
         }
 
+        // 2. Backfill any older log files from workspace_dir/logs/<owner>/<repo>/job-*.log that were evicted before DuckDB
+        if let Some(ws) = workspace_dir {
+            db.backfill_from_logs_dir(ws);
+        }
+
+        // 3. Load recent jobs from DuckDB into the active in-memory queue
+        let mut initial_jobs: VecDeque<JobRecord> =
+            db.load_recent_jobs(max_history).into_iter().collect();
+        let mut has_queued = false;
+        let mut recovered_running = Vec::new();
+        for rec in initial_jobs.iter_mut() {
+            if matches!(rec.status, JobStatus::Running { .. }) {
+                rec.status = JobStatus::Queued;
+                rec.updated_at = Utc::now();
+                for stage in rec.stages.iter_mut() {
+                    if matches!(
+                        stage.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    ) {
+                        stage.status = StageStatus::Pending;
+                        stage.assigned_node = None;
+                    }
+                }
+                recovered_running.push(rec.clone());
+            }
+            if matches!(rec.status, JobStatus::Queued) {
+                has_queued = true;
+            }
+        }
+        if !recovered_running.is_empty() {
+            db.upsert_records_batch(&recovered_running);
+        }
+        if has_queued {
+            notify.notify_one();
+        }
+
         Self {
             inner: Arc::new(RwLock::new(initial_jobs)),
+            db,
             notify,
             max_history,
             index_file,
@@ -363,6 +404,7 @@ impl JobStore {
                                 ),
                             };
                             record.updated_at = now;
+                            self.db.upsert_record(record);
                         }
                     }
                 }
@@ -371,7 +413,7 @@ impl JobStore {
             // Ensure unique job.id even when multiple webhooks arrive within the same second
             let base_id = job.id.clone();
             let mut suffix = 2u32;
-            while store.iter().any(|r| r.job.id == job.id) {
+            while store.iter().any(|r| r.job.id == job.id) || self.db.get_job(&job.id).is_some() {
                 job.id = format!("{}-{}", base_id, suffix);
                 log_file = Path::new("logs")
                     .join(&job.repo_name)
@@ -394,10 +436,12 @@ impl JobStore {
                         ),
                     };
                     record.updated_at = now;
+                    self.db.upsert_record(record);
                 }
             }
 
-            // Evict oldest terminal record if at max_history capacity (never evict Queued/Running)
+            // Evict oldest terminal record from hot in-memory deque if at max_history capacity
+            // (never evict Queued/Running, and DuckDB retains full history permanently)
             if store.len() >= self.max_history {
                 if let Some(pos) = store.iter().rposition(|r| {
                     !matches!(r.status, JobStatus::Queued | JobStatus::Running { .. })
@@ -406,14 +450,16 @@ impl JobStore {
                 }
             }
 
-            store.push_front(JobRecord {
+            let new_record = JobRecord {
                 job: job.clone(),
                 status: JobStatus::Queued,
                 log_file,
                 updated_at: now,
                 metrics: None,
                 stages: Vec::new(),
-            });
+            };
+            self.db.upsert_record(&new_record);
+            store.push_front(new_record);
 
             // Compute 1-based FIFO queue position among all currently Queued jobs
             queue_position = store
@@ -468,6 +514,7 @@ impl JobStore {
                 {
                     record.status = JobStatus::Running { started_at: now };
                     record.updated_at = now;
+                    self.db.upsert_record(record);
                     found = Some(record.job.clone());
                     break;
                 }
@@ -586,6 +633,11 @@ impl JobStore {
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 record.metrics = Some(metrics);
                 record.updated_at = Utc::now();
+                self.db.upsert_record(record);
+            } else if let Some(mut record) = self.db.get_job(job_id) {
+                record.metrics = Some(metrics);
+                record.updated_at = Utc::now();
+                self.db.upsert_record(&record);
             }
         }
         self.persist().await;
@@ -597,6 +649,11 @@ impl JobStore {
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 record.status = status;
                 record.updated_at = Utc::now();
+                self.db.upsert_record(record);
+            } else if let Some(mut record) = self.db.get_job(job_id) {
+                record.status = status;
+                record.updated_at = Utc::now();
+                self.db.upsert_record(&record);
             }
         }
         self.persist().await;
@@ -609,6 +666,7 @@ impl JobStore {
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 record.stages = stages;
                 record.updated_at = Utc::now();
+                self.db.upsert_record(record);
             }
         }
         self.persist().await;
@@ -628,6 +686,7 @@ impl JobStore {
                     stage.status = status;
                     record.updated_at = Utc::now();
                 }
+                self.db.upsert_record(record);
             }
         }
         self.persist().await;
@@ -636,10 +695,12 @@ impl JobStore {
 
     pub async fn get_stages(&self, job_id: &str) -> Vec<StageRecord> {
         let store = self.inner.read().await;
-        store
-            .iter()
-            .find(|r| r.job.id == job_id)
-            .map(|r| r.stages.clone())
+        if let Some(rec) = store.iter().find(|r| r.job.id == job_id) {
+            return rec.stages.clone();
+        }
+        self.db
+            .get_job(job_id)
+            .map(|r| r.stages)
             .unwrap_or_default()
     }
 
@@ -656,6 +717,7 @@ impl JobStore {
             let now = Utc::now();
             for record in store.iter_mut() {
                 if matches!(record.status, JobStatus::Running { .. } | JobStatus::Queued) {
+                    let mut modified = false;
                     for stage in record.stages.iter_mut() {
                         let is_node_match = stage.assigned_node.as_deref() == Some(node_id)
                             || match &stage.status {
@@ -678,8 +740,12 @@ impl JobStore {
                             stage.status = StageStatus::Pending;
                             stage.assigned_node = None;
                             record.updated_at = now;
+                            modified = true;
                             recovered.push((record.job.id.clone(), stage.id.clone()));
                         }
+                    }
+                    if modified {
+                        self.db.upsert_record(record);
                     }
                 }
             }
@@ -702,33 +768,37 @@ impl JobStore {
             let mut store = self.inner.write().await;
             let now = Utc::now();
             let pos = store.iter().position(|r| r.job.id == job_id);
-            if let Some(idx) = pos {
+            let mut record = if let Some(idx) = pos {
                 if matches!(store[idx].status, JobStatus::Running { .. }) {
                     return Err(format!(
                         "Job '{}' is currently running; cannot resume an active job",
                         job_id
                     ));
                 }
-                let mut record = store.remove(idx).unwrap();
-                for stage in record.stages.iter_mut() {
-                    if matches!(
-                        stage.status,
-                        StageStatus::Failed { .. }
-                            | StageStatus::Assigned { .. }
-                            | StageStatus::Running { .. }
-                    ) {
-                        stage.status = StageStatus::Pending;
-                        stage.assigned_node = None;
-                    }
-                }
-                record.status = JobStatus::Queued;
-                record.job.queued_at = now;
-                record.updated_at = now;
-                store.push_front(record.clone());
-                Ok(record)
+                store.remove(idx).unwrap()
+            } else if let Some(rec) = self.db.get_job(job_id) {
+                rec
             } else {
-                Err(format!("Job '{}' not found", job_id))
+                return Err(format!("Job '{}' not found", job_id));
+            };
+
+            for stage in record.stages.iter_mut() {
+                if matches!(
+                    stage.status,
+                    StageStatus::Failed { .. }
+                        | StageStatus::Assigned { .. }
+                        | StageStatus::Running { .. }
+                ) {
+                    stage.status = StageStatus::Pending;
+                    stage.assigned_node = None;
+                }
             }
+            record.status = JobStatus::Queued;
+            record.job.queued_at = now;
+            record.updated_at = now;
+            self.db.upsert_record(&record);
+            store.push_front(record.clone());
+            Ok(record)
         };
 
         if res.is_ok() {
@@ -746,27 +816,31 @@ impl JobStore {
             let mut store = self.inner.write().await;
             let now = Utc::now();
             let pos = store.iter().position(|r| r.job.id == job_id);
-            if let Some(idx) = pos {
+            let mut record = if let Some(idx) = pos {
                 if matches!(store[idx].status, JobStatus::Running { .. }) {
                     return Err(format!(
                         "Job '{}' is currently running; cannot restart an active job",
                         job_id
                     ));
                 }
-                let mut record = store.remove(idx).unwrap();
-                for stage in record.stages.iter_mut() {
-                    stage.status = StageStatus::Pending;
-                    stage.assigned_node = None;
-                }
-                record.status = JobStatus::Queued;
-                record.metrics = None;
-                record.job.queued_at = now;
-                record.updated_at = now;
-                store.push_front(record.clone());
-                Ok(record)
+                store.remove(idx).unwrap()
+            } else if let Some(rec) = self.db.get_job(job_id) {
+                rec
             } else {
-                Err(format!("Job '{}' not found", job_id))
+                return Err(format!("Job '{}' not found", job_id));
+            };
+
+            for stage in record.stages.iter_mut() {
+                stage.status = StageStatus::Pending;
+                stage.assigned_node = None;
             }
+            record.status = JobStatus::Queued;
+            record.metrics = None;
+            record.job.queued_at = now;
+            record.updated_at = now;
+            self.db.upsert_record(&record);
+            store.push_front(record.clone());
+            Ok(record)
         };
 
         if res.is_ok() {
@@ -797,6 +871,7 @@ impl JobStore {
                     break;
                 }
             }
+            self.db.upsert_record(record);
         }
     }
 
@@ -809,8 +884,13 @@ impl JobStore {
     }
 
     pub async fn get_job(&self, job_id: &str) -> Option<JobRecord> {
-        let store = self.inner.read().await;
-        store.iter().find(|r| r.job.id == job_id).cloned()
+        {
+            let store = self.inner.read().await;
+            if let Some(rec) = store.iter().find(|r| r.job.id == job_id) {
+                return Some(rec.clone());
+            }
+        }
+        self.db.get_job(job_id)
     }
 
     pub async fn list_jobs(&self) -> Vec<JobRecord> {
@@ -818,90 +898,22 @@ impl JobStore {
         store.iter().cloned().collect()
     }
 
+    /// Finds the latest completed (`Completed` or `Failed`) build for a repository/branch (or submodule),
+    /// ignoring `Skipped`, `Queued`, and `Running` jobs so standalone status/score/coverage/benchmark
+    /// badge pills only display `passing` or `failing` from completed executions.
     pub async fn find_latest_job(&self, repo: &str, branch: Option<&str>) -> Option<JobRecord> {
-        let store = self.inner.read().await;
+        self.db.find_latest_completed(repo, branch)
+    }
 
-        // 1. Direct match on parent repository name
-        for record in store.iter() {
-            let matches_repo = record.job.repo_name.eq_ignore_ascii_case(repo)
-                || record.job.repo_name.ends_with(&format!("/{}", repo));
-
-            if !matches_repo {
-                continue;
-            }
-
-            if let Some(b) = branch {
-                let matches_branch = record.job.ref_name.eq_ignore_ascii_case(b)
-                    || record.job.ref_name == format!("refs/heads/{}", b)
-                    || record.job.ref_name.ends_with(&format!("/{}", b))
-                    || record.job.ref_name == format!("refs/tags/{}", b);
-
-                if matches_branch {
-                    return Some(record.clone());
-                }
-            } else {
-                return Some(record.clone());
-            }
-        }
-
-        // 2. Submodule fallback: if repo targets a submodule (e.g. "LMA1980/k3-core" or "k3-core")
-        let clean_target = repo.rsplit_once('/').map(|(_, r)| r).unwrap_or(repo);
-        for record in store.iter() {
-            if let Some(ref metrics) = record.metrics {
-                for (sub_name, sub) in &metrics.submodules {
-                    let sub_short = sub_name
-                        .rsplit_once('/')
-                        .map(|(_, r)| r)
-                        .unwrap_or(sub_name);
-                    let path_short = sub
-                        .path
-                        .rsplit_once('/')
-                        .map(|(_, r)| r)
-                        .unwrap_or(&sub.path);
-
-                    let is_match = sub_name.eq_ignore_ascii_case(repo)
-                        || sub_short.eq_ignore_ascii_case(clean_target)
-                        || path_short.eq_ignore_ascii_case(clean_target)
-                        || sub_name
-                            .replace('-', "_")
-                            .eq_ignore_ascii_case(&clean_target.replace('-', "_"));
-
-                    if is_match {
-                        let owner = repo.split_once('/').map(|(o, _)| o).unwrap_or("LMA1980");
-                        let sub_job = Job {
-                            id: format!("{}-{}", record.job.id, sub_short),
-                            event_type: record.job.event_type.clone(),
-                            repo_name: format!("{}/{}", owner, sub_short),
-                            clone_url: String::new(),
-                            commit_sha: record.job.commit_sha.clone(),
-                            ref_name: record.job.ref_name.clone(),
-                            sender: record.job.sender.clone(),
-                            queued_at: record.job.queued_at,
-                        };
-                        return Some(JobRecord {
-                            job: sub_job,
-                            status: record.status.clone(),
-                            log_file: record.log_file.clone(),
-                            updated_at: record.updated_at,
-                            metrics: Some(JobMetrics {
-                                quality_score: sub.quality_score,
-                                letter_grade: sub.letter_grade.clone(),
-                                coverage_pct: sub.coverage_pct,
-                                benchmark_summary: sub.benchmark_summary.clone(),
-                                tests_passed: sub.tests_passed,
-                                tests_total: sub.tests_total,
-                                advisories_count: 0,
-                                clippy_warnings: sub.clippy_warnings,
-                                submodules: BTreeMap::new(),
-                            }),
-                            stages: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        None
+    /// Finds `(latest_active_or_completed, latest_completed)` for a repository/branch Score Card,
+    /// ignoring `Skipped` jobs and retaining the previous completed execution's metrics when a job
+    /// is `Queued` or `Running`.
+    pub async fn find_card_context(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        self.db.find_card_context(repo, branch)
     }
 
     pub async fn find_submodule_job(
@@ -910,8 +922,18 @@ impl JobStore {
         submodule: &str,
         branch: Option<&str>,
     ) -> Option<JobRecord> {
-        let parent_record = self.find_latest_job(parent_repo, branch).await?;
-        extract_submodule_job(&parent_record, submodule)
+        self.db
+            .find_submodule_completed(parent_repo, submodule, branch)
+    }
+
+    pub async fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        self.db
+            .find_submodule_card_context(parent_repo, submodule, branch)
     }
 }
 
@@ -1819,5 +1841,171 @@ mod tests {
             updated_job.stages[1].assigned_node.as_deref(),
             Some("rubicon")
         );
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_persistent_history_survives_ring_buffer_eviction_and_ignores_skipped() {
+        // Tiny max_history = 2 to force immediate eviction from in-memory deque
+        let store = JobStore::new(2, None);
+
+        // 1. Quiet repository completes a passing job with metrics
+        let quiet_job = Job {
+            id: "job-quiet-ipc-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-ipc".to_string(),
+            clone_url: "https://github.com/LMA1980/ActionRunner-ipc.git".to_string(),
+            commit_sha: "1111222233334444".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(500),
+        };
+        store
+            .enqueue_job(quiet_job.clone(), PathBuf::from("logs/ipc.log"))
+            .await;
+        store
+            .update_metrics(
+                &quiet_job.id,
+                JobMetrics {
+                    quality_score: 99,
+                    letter_grade: "A+".to_string(),
+                    coverage_pct: Some(94.2),
+                    benchmark_summary: Some("12.3 ns/iter".to_string()),
+                    tests_passed: 18,
+                    tests_total: 18,
+                    advisories_count: 0,
+                    clippy_warnings: 0,
+                    submodules: BTreeMap::new(),
+                },
+            )
+            .await;
+        store
+            .update_status(
+                &quiet_job.id,
+                JobStatus::Completed {
+                    duration_secs: 12,
+                    exit_code: 0,
+                },
+            )
+            .await;
+
+        // 2. Noisy repository runs 5 jobs, completely evicting quiet_job from the 2-slot in-memory VecDeque
+        for i in 0..5 {
+            let noisy_job = Job {
+                id: format!("job-noisy-{}", i),
+                event_type: "push".to_string(),
+                repo_name: "LMA1980/model-runner".to_string(),
+                clone_url: String::new(),
+                commit_sha: format!("aaaa00000000000{}", i),
+                ref_name: "refs/heads/main".to_string(),
+                sender: "LMA1980".to_string(),
+                queued_at: Utc::now() - chrono::Duration::seconds(400 - i * 10),
+            };
+            store
+                .enqueue_job(noisy_job.clone(), PathBuf::from("logs/noisy.log"))
+                .await;
+            store
+                .update_status(
+                    &noisy_job.id,
+                    JobStatus::Completed {
+                        duration_secs: 5,
+                        exit_code: 0,
+                    },
+                )
+                .await;
+        }
+
+        // Verify in-memory list_jobs only has 2 items, yet DuckDB retains quiet_job for badges & cards!
+        assert_eq!(store.list_jobs().await.len(), 2);
+
+        let recovered_pill = store
+            .find_latest_job("LMA1980/ActionRunner-ipc", None)
+            .await
+            .expect("DuckDB retains evicted repo for badge pills");
+        assert_eq!(recovered_pill.job.id, "job-quiet-ipc-1");
+        assert_eq!(recovered_pill.metrics.unwrap().quality_score, 99);
+
+        let (card_act, card_comp) = store
+            .find_card_context("LMA1980/ActionRunner-ipc", Some("main"))
+            .await;
+        assert_eq!(card_act.unwrap().job.id, "job-quiet-ipc-1");
+        assert_eq!(card_comp.unwrap().job.id, "job-quiet-ipc-1");
+
+        // 3. Now enqueue a new job on ActionRunner-ipc that gets superseded (Skipped) by another Queued job
+        let queued_1 = Job {
+            id: "job-ipc-queued-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-ipc".to_string(),
+            clone_url: String::new(),
+            commit_sha: "bbbb111122223333".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(20),
+        };
+        store
+            .enqueue_job(queued_1.clone(), PathBuf::from("logs/q1.log"))
+            .await;
+
+        let queued_2 = Job {
+            id: "job-ipc-queued-2".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-ipc".to_string(),
+            clone_url: String::new(),
+            commit_sha: "cccc111122223333".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(10),
+        };
+        let enq_res = store
+            .enqueue_job(queued_2.clone(), PathBuf::from("logs/q2.log"))
+            .await;
+        assert_eq!(
+            enq_res.superseded_jobs,
+            vec!["job-ipc-queued-1".to_string()]
+        );
+
+        // Pill lookup (find_latest_job) must STILL return job-quiet-ipc-1 (Completed, 99% A+), ignoring Skipped and Queued!
+        let pill_during_queue = store
+            .find_latest_job("LMA1980/ActionRunner-ipc", Some("main"))
+            .await
+            .unwrap();
+        assert_eq!(pill_during_queue.job.id, "job-quiet-ipc-1");
+
+        // Card context lookup (find_card_context) must return (job-ipc-queued-2 [Queued], job-quiet-ipc-1 [Completed]), ignoring Skipped job-ipc-queued-1!
+        let (active_rec, prev_comp_rec) = store
+            .find_card_context("LMA1980/ActionRunner-ipc", Some("main"))
+            .await;
+        assert_eq!(active_rec.unwrap().job.id, "job-ipc-queued-2");
+        assert_eq!(prev_comp_rec.unwrap().job.id, "job-quiet-ipc-1");
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_backfill_from_historical_logs_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_logs = tmp
+            .path()
+            .join("logs")
+            .join("LMA1980")
+            .join("ActionRunner-ipc");
+        std::fs::create_dir_all(&repo_logs).expect("create repo logs dir");
+
+        let log_file = repo_logs.join("job-1729500000-deadbeef.log");
+        std::fs::write(
+            &log_file,
+            "2026-10-21T10:00:00Z [pey-wail-deu] [test] [stdout] running 7 tests\n2026-10-21T10:00:02Z [pey-wail-deu] [test] [stdout] test result: ok. 7 passed; 0 failed; 0 ignored\n",
+        )
+        .expect("write historical log");
+
+        let store = JobStore::new(10, Some(tmp.path()));
+
+        let rec = store
+            .find_latest_job("LMA1980/ActionRunner-ipc", None)
+            .await
+            .expect("reconstructed from log file");
+        assert_eq!(rec.job.id, "job-1729500000-deadbeef");
+        assert_eq!(rec.job.commit_sha, "deadbeef");
+        let m = rec.metrics.expect("metrics reconstructed");
+        assert_eq!(m.quality_score, 100);
+        assert_eq!(m.tests_passed, 7);
+        assert_eq!(m.tests_total, 7);
     }
 }

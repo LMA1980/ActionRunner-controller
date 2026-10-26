@@ -232,18 +232,56 @@ pub fn render_shield_json(label: &str, record: Option<&JobRecord>) -> serde_json
     })
 }
 
-/// Generates a rich 520x185px Multi-Metric CI Factory Pipeline Score Card
+/// Generates a rich 520px Multi-Metric CI Factory Pipeline Score Card
 pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> String {
-    let info = evaluate_status(record);
+    render_card_svg_with_previous(repo, branch, record, None)
+}
 
-    let metrics_opt = record.and_then(|r| r.metrics.as_ref());
+/// Generates a rich 520px Multi-Metric CI Factory Pipeline Score Card, preserving
+/// metrics and score from `previous_completed` when the current job is `Queued` or `Running`,
+/// and ignoring `Skipped` jobs.
+pub fn render_card_svg_with_previous(
+    repo: &str,
+    branch: &str,
+    record: Option<&JobRecord>,
+    previous_completed: Option<&JobRecord>,
+) -> String {
+    // Ignore Skipped jobs on the Score Card: fall back to previous_completed (or None if no completed job exists)
+    let effective_record = match record {
+        Some(r) if matches!(r.status, JobStatus::Skipped { .. }) => previous_completed,
+        Some(r) => Some(r),
+        None => previous_completed,
+    };
+
+    let info = evaluate_status(effective_record);
+
+    // Determine whether we are displaying a Queued or Running job whose metrics come from the previous completed execution
+    let prev_completed_valid = previous_completed.filter(|p| {
+        matches!(
+            p.status,
+            JobStatus::Completed { .. } | JobStatus::Failed { .. }
+        )
+    });
+
+    let using_previous_execution = effective_record.is_some_and(|r| {
+        matches!(r.status, JobStatus::Queued | JobStatus::Running { .. }) && r.metrics.is_none()
+    }) && prev_completed_valid.is_some();
+
+    let metrics_source_record = if using_previous_execution {
+        prev_completed_valid
+    } else {
+        effective_record
+    };
+
+    let metrics_source_info = evaluate_status(metrics_source_record);
+    let metrics_opt = metrics_source_record.and_then(|r| r.metrics.as_ref());
 
     let (quality_score, letter_grade) = match metrics_opt {
         Some(m) => (m.quality_score, m.letter_grade.clone()),
         None => {
-            if info.status_text == "passing" {
+            if metrics_source_info.status_text == "passing" {
                 (100, "A+".to_string())
-            } else if info.status_text == "failing" {
+            } else if metrics_source_info.status_text == "failing" {
                 (40, "F".to_string())
             } else {
                 (0, "—".to_string())
@@ -271,9 +309,9 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
             (val, sub, pct.round() as u32)
         }
         _ => {
-            if info.status_text == "passing" {
+            if metrics_source_info.status_text == "passing" {
                 ("All Passed".to_string(), "100% Pass Rate".to_string(), 96)
-            } else if info.status_text == "failing" {
+            } else if metrics_source_info.status_text == "failing" {
                 ("Failed".to_string(), "Check Log".to_string(), 0)
             } else {
                 ("—".to_string(), "Pending".to_string(), 0)
@@ -289,7 +327,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
             (val, "Line Coverage".to_string(), bar_w)
         }
         None => {
-            if info.status_text == "passing" {
+            if metrics_source_info.status_text == "passing" {
                 ("Clean".to_string(), "Verified".to_string(), 96)
             } else {
                 ("—".to_string(), "Not Run".to_string(), 0)
@@ -301,7 +339,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
     let (bench_val, bench_sub) = match metrics_opt.and_then(|m| m.benchmark_summary.as_ref()) {
         Some(b) => ("Benchmarked".to_string(), b.clone()),
         None => {
-            if info.status_text == "passing" {
+            if metrics_source_info.status_text == "passing" {
                 ("Passing".to_string(), "0 Regressions".to_string())
             } else {
                 ("—".to_string(), "Not Run".to_string())
@@ -321,7 +359,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
             (val, sub)
         }
         _ => {
-            if info.status_text == "passing" {
+            if metrics_source_info.status_text == "passing" {
                 ("0 Advisories".to_string(), "Clippy & Fmt Clean".to_string())
             } else {
                 ("—".to_string(), "Pending".to_string())
@@ -329,7 +367,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
         }
     };
 
-    let (commit_short, trigger_text, duration_str, timestamp_str) = match record {
+    let (commit_short, trigger_text, duration_str, timestamp_str) = match effective_record {
         Some(r) => {
             let sha = if r.job.commit_sha.len() >= 8 {
                 &r.job.commit_sha[..8]
@@ -366,6 +404,29 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
 
     let status_uppercase = info.status_text.to_uppercase();
 
+    let y_offset: usize = if using_previous_execution { 26 } else { 0 };
+
+    let prev_banner_svg = if using_previous_execution {
+        let prev_rec = prev_completed_valid.unwrap();
+        let prev_sha = if prev_rec.job.commit_sha.len() >= 8 {
+            &prev_rec.job.commit_sha[..8]
+        } else if !prev_rec.job.commit_sha.is_empty() {
+            &prev_rec.job.commit_sha
+        } else {
+            "n/a"
+        };
+        format!(
+            r###"  <!-- Previous Execution Attribution Banner -->
+  <rect x="20" y="48" width="480" height="20" rx="4" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
+  <text x="28" y="61" class="prev-note">⟳ Score &amp; metrics shown are from previous execution ({prev_sha}) while job is {status_lower}</text>
+"###,
+            prev_sha = xml_escape(prev_sha),
+            status_lower = xml_escape(info.status_text),
+        )
+    } else {
+        String::new()
+    };
+
     let sub_count = metrics_opt.map(|m| m.submodules.len()).unwrap_or(0);
     let sub_rows = sub_count.div_ceil(3);
     let has_submodules = sub_rows > 0;
@@ -378,7 +439,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
                 let row_idx = idx / 3;
                 let col_idx = idx % 3;
                 let curr_x = 100 + col_idx * (pill_w + 8);
-                let pill_y = 127 + row_idx * 26;
+                let pill_y = 127 + y_offset + row_idx * 26;
                 let text_y = pill_y + 14;
 
                 let pill_color = match sub.quality_score {
@@ -411,9 +472,11 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
 
             format!(
                 r###"  <!-- Submodules Row -->
-  <line x1="20" y1="120" x2="500" y2="120" stroke="#21262d" stroke-width="1"/>
-  <text x="20" y="141" class="tile-label">SUBMODULES</text>
+  <line x1="20" y1="{sub_div_y}" x2="500" y2="{sub_div_y}" stroke="#21262d" stroke-width="1"/>
+  <text x="20" y="{sub_label_y}" class="tile-label">SUBMODULES</text>
 {items}"###,
+                sub_div_y = 120 + y_offset,
+                sub_label_y = 141 + y_offset,
                 items = items_svg
             )
         } else {
@@ -423,11 +486,11 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
         String::new()
     };
 
-    let div2_y = if has_submodules {
+    let div2_y = (if has_submodules {
         154 + (sub_rows.saturating_sub(1) * 26)
     } else {
         126
-    };
+    }) + y_offset;
     let row3_y = div2_y + 18;
     let row4_y = row3_y + 18;
     let div3_y = row4_y + 12;
@@ -436,14 +499,19 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
 
     // Responsive, collision-free header pill layout:
     // Right margin: 20px. Overall Score Pill ends at x=500.
-    let score_pill_w = 76;
-    let score_pill_x = 520 - 20 - score_pill_w; // 424
-    let score_text_x = score_pill_x + score_pill_w / 2; // 462
+    // When showing previous execution scores while Queued/Running, update the label next to status to "PREV: <score>% <grade>"
+    let (score_pill_label, score_pill_w) = if using_previous_execution {
+        (format!("PREV: {}% {}", quality_score, letter_grade), 112u32)
+    } else {
+        (format!("{}% {}", quality_score, letter_grade), 76u32)
+    };
+    let score_pill_x = 520 - 20 - score_pill_w;
+    let score_text_x = score_pill_x + score_pill_w / 2;
 
     // Status Pill: placed to the left of the score pill with an 8px gap.
     let status_pill_w = 104;
-    let status_pill_x = score_pill_x - 8 - status_pill_w; // 312
-    let status_text_x = status_pill_x + status_pill_w / 2; // 364
+    let status_pill_x = score_pill_x - 8 - status_pill_w;
+    let status_text_x = status_pill_x + status_pill_w / 2;
 
     // Truncate branch name if too long for the pill to prevent SVG text overlap.
     let branch_clean = branch.trim();
@@ -461,12 +529,20 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
     let branch_text_x = branch_pill_x + computed_branch_w / 2;
 
     // Clean repository display title if excessively long to prevent collision with branch pill.
-    let display_repo = if repo.chars().count() > 30 {
-        let prefix: String = repo.chars().take(29).collect();
+    let max_repo_chars = if using_previous_execution { 24 } else { 30 };
+    let display_repo = if repo.chars().count() > max_repo_chars {
+        let prefix: String = repo.chars().take(max_repo_chars - 1).collect();
         format!("{}…", prefix)
     } else {
         repo.to_string()
     };
+
+    let tile_y = 50 + y_offset;
+    let tile_label_y = 65 + y_offset;
+    let tile_val_y = 83 + y_offset;
+    let tile_sub_12_y = 96 + y_offset;
+    let tile_sub_34_y = 98 + y_offset;
+    let tile_bar_y = 103 + y_offset;
 
     format!(
         r###"<svg xmlns="http://www.w3.org/2000/svg" width="520" height="{card_height}" viewBox="0 0 520 {card_height}" fill="none">
@@ -480,6 +556,7 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
     .status-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 700; fill: #ffffff; }}
     .score-pill {{ fill: {score_badge_bg}; rx: 10px; }}
     .score-text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 700; fill: #ffffff; }}
+    .prev-note {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 9.5px; font-weight: 600; fill: #d29922; }}
     .tile-label {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 9px; font-weight: 700; fill: #8b949e; letter-spacing: 0.5px; }}
     .tile-val {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 600; fill: #e6edf3; }}
     .tile-sub {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 9px; fill: #8b949e; }}
@@ -508,39 +585,39 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
 
   <!-- Overall Score Pill -->
   <rect x="{score_pill_x}" y="14" width="{score_pill_w}" height="20" class="score-pill"/>
-  <text x="{score_text_x}" y="28" text-anchor="middle" class="score-text">{quality_score}% {letter_grade}</text>
+  <text x="{score_text_x}" y="28" text-anchor="middle" class="score-text">{score_pill_label}</text>
 
   <!-- Divider -->
   <line x1="20" y1="42" x2="500" y2="42" stroke="#21262d" stroke-width="1"/>
 
-  <!-- Row 2: 4 Factory Pipeline Metric Tiles -->
+{prev_banner_svg}  <!-- Row 2: 4 Factory Pipeline Metric Tiles -->
   <!-- Tile 1: Tests -->
-  <rect x="20" y="50" width="112" height="66" class="tile-bg"/>
-  <text x="28" y="65" class="tile-label">TESTS</text>
-  <text x="28" y="83" class="tile-val">{tests_val}</text>
-  <text x="28" y="96" class="tile-sub">{tests_sub}</text>
-  <rect x="28" y="103" width="96" height="4" rx="2" fill="#21262d"/>
-  <rect x="28" y="103" width="{tests_bar_w}" height="4" rx="2" fill="#2ea44f"/>
+  <rect x="20" y="{tile_y}" width="112" height="66" class="tile-bg"/>
+  <text x="28" y="{tile_label_y}" class="tile-label">TESTS</text>
+  <text x="28" y="{tile_val_y}" class="tile-val">{tests_val}</text>
+  <text x="28" y="{tile_sub_12_y}" class="tile-sub">{tests_sub}</text>
+  <rect x="28" y="{tile_bar_y}" width="96" height="4" rx="2" fill="#21262d"/>
+  <rect x="28" y="{tile_bar_y}" width="{tests_bar_w}" height="4" rx="2" fill="#2ea44f"/>
 
   <!-- Tile 2: Coverage -->
-  <rect x="140" y="50" width="112" height="66" class="tile-bg"/>
-  <text x="148" y="65" class="tile-label">COVERAGE</text>
-  <text x="148" y="83" class="tile-val">{cov_val}</text>
-  <text x="148" y="96" class="tile-sub">{cov_sub}</text>
-  <rect x="148" y="103" width="96" height="4" rx="2" fill="#21262d"/>
-  <rect x="148" y="103" width="{cov_bar_w}" height="4" rx="2" fill="#2ea44f"/>
+  <rect x="140" y="{tile_y}" width="112" height="66" class="tile-bg"/>
+  <text x="148" y="{tile_label_y}" class="tile-label">COVERAGE</text>
+  <text x="148" y="{tile_val_y}" class="tile-val">{cov_val}</text>
+  <text x="148" y="{tile_sub_12_y}" class="tile-sub">{cov_sub}</text>
+  <rect x="148" y="{tile_bar_y}" width="96" height="4" rx="2" fill="#21262d"/>
+  <rect x="148" y="{tile_bar_y}" width="{cov_bar_w}" height="4" rx="2" fill="#2ea44f"/>
 
   <!-- Tile 3: Cargo Bench -->
-  <rect x="260" y="50" width="124" height="66" class="tile-bg"/>
-  <text x="268" y="65" class="tile-label">CARGO BENCH</text>
-  <text x="268" y="83" class="tile-val">{bench_val}</text>
-  <text x="268" y="98" class="tile-sub">{bench_sub}</text>
+  <rect x="260" y="{tile_y}" width="124" height="66" class="tile-bg"/>
+  <text x="268" y="{tile_label_y}" class="tile-label">CARGO BENCH</text>
+  <text x="268" y="{tile_val_y}" class="tile-val">{bench_val}</text>
+  <text x="268" y="{tile_sub_34_y}" class="tile-sub">{bench_sub}</text>
 
   <!-- Tile 4: Hygiene &amp; Security -->
-  <rect x="392" y="50" width="108" height="66" class="tile-bg"/>
-  <text x="400" y="65" class="tile-label">SECURITY &amp; LINTS</text>
-  <text x="400" y="83" class="tile-val">{hygiene_val}</text>
-  <text x="400" y="98" class="tile-sub">{hygiene_sub}</text>
+  <rect x="392" y="{tile_y}" width="108" height="66" class="tile-bg"/>
+  <text x="400" y="{tile_label_y}" class="tile-label">SECURITY &amp; LINTS</text>
+  <text x="400" y="{tile_val_y}" class="tile-val">{hygiene_val}</text>
+  <text x="400" y="{tile_sub_34_y}" class="tile-sub">{hygiene_sub}</text>
 
 {submodules_svg}
   <!-- Divider -->
@@ -582,8 +659,14 @@ pub fn render_card_svg(repo: &str, branch: &str, record: Option<&JobRecord>) -> 
         score_badge_bg = score_badge_bg,
         icon_char = info.icon_char,
         status_uppercase = status_uppercase,
-        quality_score = quality_score,
-        letter_grade = letter_grade,
+        score_pill_label = xml_escape(&score_pill_label),
+        prev_banner_svg = prev_banner_svg,
+        tile_y = tile_y,
+        tile_label_y = tile_label_y,
+        tile_val_y = tile_val_y,
+        tile_sub_12_y = tile_sub_12_y,
+        tile_sub_34_y = tile_sub_34_y,
+        tile_bar_y = tile_bar_y,
         tests_val = xml_escape(&tests_val),
         tests_sub = xml_escape(&tests_sub),
         tests_bar_w = tests_bar_w,
@@ -927,5 +1010,86 @@ mod tests {
         // Passing status
         assert!(svg.contains("✓ PASSING"));
         assert!(svg.contains("100% A+"));
+    }
+
+    #[test]
+    fn test_render_card_svg_with_previous_execution_when_queued_or_running_and_ignore_skipped() {
+        let prev_record = JobRecord {
+            job: sample_job("refs/heads/main"),
+            status: JobStatus::Completed {
+                duration_secs: 38,
+                exit_code: 0,
+            },
+            log_file: PathBuf::from("logs/prev.log"),
+            updated_at: Utc::now(),
+            metrics: Some(JobMetrics {
+                quality_score: 97,
+                letter_grade: "A+".to_string(),
+                coverage_pct: Some(91.4),
+                benchmark_summary: Some("42.0 ns/iter".to_string()),
+                tests_passed: 24,
+                tests_total: 24,
+                advisories_count: 0,
+                clippy_warnings: 0,
+                submodules: Default::default(),
+            }),
+            stages: Vec::new(),
+        };
+
+        let mut running_job = sample_job("refs/heads/main");
+        running_job.id = "job-running-999".to_string();
+        running_job.commit_sha = "feedface88889999".to_string();
+        let running_record = JobRecord {
+            job: running_job,
+            status: JobStatus::Running {
+                started_at: Utc::now(),
+            },
+            log_file: PathBuf::from("logs/running.log"),
+            updated_at: Utc::now(),
+            metrics: None,
+            stages: Vec::new(),
+        };
+
+        let svg = render_card_svg_with_previous(
+            "LMA1980/model-runner",
+            "main",
+            Some(&running_record),
+            Some(&prev_record),
+        );
+
+        // Status pill shows RUNNING, while score pill next to status shows PREV: 97% A+
+        assert!(svg.contains("⏳ RUNNING"));
+        assert!(svg.contains("PREV: 97% A+"));
+        // Explicit previous execution attribution banner is rendered
+        assert!(svg.contains(
+            "Score &amp; metrics shown are from previous execution (22c90697) while job is running"
+        ));
+        // Previous execution metrics are preserved on the tiles
+        assert!(svg.contains("24/24 Passed"));
+        assert!(svg.contains("91.4%"));
+        assert!(svg.contains("42.0 ns/iter"));
+        // Active running job commit SHA is shown in the Commit row
+        assert!(svg.contains("feedface"));
+
+        // Verify Skipped job is ignored when passed to render_card_svg_with_previous
+        let skipped_record = JobRecord {
+            job: sample_job("refs/heads/main"),
+            status: JobStatus::Skipped {
+                reason: "Superseded".to_string(),
+            },
+            log_file: PathBuf::from("logs/skipped.log"),
+            updated_at: Utc::now(),
+            metrics: None,
+            stages: Vec::new(),
+        };
+        let svg_skipped = render_card_svg_with_previous(
+            "LMA1980/model-runner",
+            "main",
+            Some(&skipped_record),
+            Some(&prev_record),
+        );
+        assert!(svg_skipped.contains("✓ PASSING"));
+        assert!(svg_skipped.contains("97% A+"));
+        assert!(!svg_skipped.contains("SKIPPED"));
     }
 }
