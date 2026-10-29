@@ -398,12 +398,25 @@ impl JobStore {
                                 JobStatus::Queued | JobStatus::Running { .. }
                             )
                         {
+                            let skip_reason = format!(
+                                "Superseded by pull_request event for commit {} ({})",
+                                sha_short, job.id
+                            );
                             superseded_jobs.push(record.job.id.clone());
+                            for stage in record.stages.iter_mut() {
+                                if matches!(
+                                    stage.status,
+                                    StageStatus::Pending
+                                        | StageStatus::Assigned { .. }
+                                        | StageStatus::Running { .. }
+                                ) {
+                                    stage.status = StageStatus::Skipped {
+                                        reason: skip_reason.clone(),
+                                    };
+                                }
+                            }
                             record.status = JobStatus::Skipped {
-                                reason: format!(
-                                    "Superseded by pull_request event for commit {} ({})",
-                                    sha_short, job.id
-                                ),
+                                reason: skip_reason,
                             };
                             record.updated_at = now;
                             self.db.upsert_record(record);

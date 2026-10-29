@@ -495,6 +495,13 @@ pub async fn handle_webhook(
     let _ = state.tx.try_send(job);
 
     if !enqueue_res.superseded_jobs.is_empty() {
+        for sup_id in &enqueue_res.superseded_jobs {
+            state
+                .cluster
+                .cancel_and_release_job_slots(sup_id, "Superseded by newer webhook event")
+                .await;
+        }
+        state.job_store.notify_event();
         info!(
             job_id = %final_job_id,
             superseded = ?enqueue_res.superseded_jobs,
