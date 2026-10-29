@@ -185,9 +185,13 @@ impl DAGScheduler {
                 JobStatus::Completed { .. }
                 | JobStatus::Failed { .. }
                 | JobStatus::Skipped { .. } => {
-                    for node_id in leased_slots.values() {
-                        self.cluster.release_slot(node_id).await;
-                    }
+                    self.cluster
+                        .cancel_and_release_job_slots(
+                            &job.id,
+                            "Job finished, cancelled, or superseded",
+                        )
+                        .await;
+                    self.job_store.notify_event();
                     break;
                 }
                 _ => {}
@@ -206,10 +210,12 @@ impl DAGScheduler {
                             node = %node_id,
                             "Watchdog detected assigned worker node is offline; returning stage to Pending"
                         );
+                        self.cluster
+                            .release_stage_slot(node_id, &job.id, &stage.id)
+                            .await;
                         self.job_store
                             .update_stage_status(&job.id, &stage.id, StageStatus::Pending)
                             .await;
-                        self.cluster.release_slot(node_id).await;
                         leased_slots.remove(&stage.id);
                     }
                 }
@@ -222,6 +228,7 @@ impl DAGScheduler {
             for stage in &job_record.stages {
                 match &stage.status {
                     StageStatus::Completed { exit_code, .. } => {
+                        leased_slots.remove(&stage.id);
                         if *exit_code != 0 {
                             any_failed = true;
                             failure_error =
@@ -229,6 +236,7 @@ impl DAGScheduler {
                         }
                     }
                     StageStatus::Failed { error } => {
+                        leased_slots.remove(&stage.id);
                         any_failed = true;
                         failure_error = error.clone();
                     }
@@ -247,10 +255,15 @@ impl DAGScheduler {
 
                         if deps_satisfied {
                             let stage_cfg = stages_by_id.get(&stage.id).unwrap();
-                            // Attempt to lease a slot
+                            // Attempt to lease a slot (strictly 1 stage at a time per worker node)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
-                                .lease_slot(&stage_cfg.tags, stage_cfg.toolchain.as_deref())
+                                .lease_slot(
+                                    &job.id,
+                                    &stage.id,
+                                    &stage_cfg.tags,
+                                    stage_cfg.toolchain.as_deref(),
+                                )
                                 .await
                             {
                                 info!(
@@ -303,15 +316,19 @@ impl DAGScheduler {
                     StageStatus::Assigned { .. } | StageStatus::Running { .. } => {
                         all_completed = false;
                     }
-                    StageStatus::Skipped { .. } => {}
+                    StageStatus::Skipped { .. } => {
+                        leased_slots.remove(&stage.id);
+                    }
                 }
             }
 
             if any_failed {
-                // Cancel running stages
-                for node_id in leased_slots.values() {
-                    self.cluster.release_slot(node_id).await;
-                }
+                // Cancel and release only stages belonging to THIS job that are still leased
+                self.cluster
+                    .cancel_and_release_job_slots(&job.id, &failure_error)
+                    .await;
+                leased_slots.clear();
+                self.job_store.notify_event();
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
                 if job_record.metrics.is_none() {
                     if let Some(m) = crate::db::DuckDbStore::extract_metrics_from_log_and_workspace(
@@ -346,10 +363,12 @@ impl DAGScheduler {
                 let duration = (Utc::now() - start_time).num_seconds().max(0) as u64;
                 info!(job_id = %job.id, duration_secs = duration, "All DAG stages completed successfully");
 
-                // Release any lingering slots
-                for (_s_id, node_id) in leased_slots.drain() {
-                    self.cluster.release_slot(&node_id).await;
-                }
+                // Release any lingering slots belonging strictly to THIS job
+                self.cluster
+                    .cancel_and_release_job_slots(&job.id, "All stages completed")
+                    .await;
+                leased_slots.clear();
+                self.job_store.notify_event();
 
                 if job_record.metrics.is_none()
                     || job_record
