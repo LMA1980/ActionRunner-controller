@@ -255,7 +255,7 @@ impl DAGScheduler {
 
                         if deps_satisfied {
                             let stage_cfg = stages_by_id.get(&stage.id).unwrap();
-                            // Attempt to lease a slot (strictly 1 stage at a time per worker node)
+                            // Attempt to lease a slot (respecting node capacity and exclusive stage locks)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
                                 .lease_slot(
@@ -263,6 +263,7 @@ impl DAGScheduler {
                                     &stage.id,
                                     &stage_cfg.tags,
                                     stage_cfg.toolchain.as_deref(),
+                                    stage_cfg.exclusive,
                                 )
                                 .await
                             {
@@ -307,6 +308,7 @@ impl DAGScheduler {
                                         .unwrap_or(self.config.job_timeout_seconds),
                                     threads: stage_cfg.threads,
                                     toolchain: stage_cfg.toolchain.clone(),
+                                    exclusive: stage_cfg.exclusive,
                                 };
 
                                 let _ = cmd_tx.send(WorkerCommand::Dispatch(task)).await;

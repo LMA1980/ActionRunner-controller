@@ -31,6 +31,8 @@ pub struct StageConfig {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub continue_on_error: bool,
+    #[serde(default, alias = "isolate_node")]
+    pub exclusive: bool,
 }
 
 fn default_threads() -> u32 {
@@ -78,6 +80,7 @@ impl WorkflowConfig {
                     env: step.env.clone(),
                     timeout_seconds: step.timeout_seconds,
                     continue_on_error: false,
+                    exclusive: false,
                 });
             }
         }
@@ -180,5 +183,90 @@ impl WorkflowConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_stage_config_exclusive_field_deserialization() {
+        let yaml = r#"
+version: "2"
+name: "Exclusive Pipeline"
+stages:
+  - id: bench-run
+    name: "Hardware Micro-benchmark"
+    tags: ["k3", "bench"]
+    threads: 8
+    exclusive: true
+    run: "cargo bench"
+"#;
+        let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600)
+            .expect("should parse exclusive: true");
+        assert_eq!(wf.stages.len(), 1);
+        assert_eq!(wf.stages[0].id, "bench-run");
+        assert!(wf.stages[0].exclusive, "exclusive must be true");
+    }
+
+    #[test]
+    fn test_stage_config_isolate_node_alias_deserialization() {
+        let yaml = r#"
+version: "2"
+name: "Isolate Node Pipeline"
+stages:
+  - id: bench-run
+    name: "Hardware Micro-benchmark"
+    tags: ["k3", "bench"]
+    threads: 8
+    isolate_node: true
+    run: "cargo bench"
+"#;
+        let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600)
+            .expect("should parse isolate_node: true as exclusive: true");
+        assert_eq!(wf.stages.len(), 1);
+        assert_eq!(wf.stages[0].id, "bench-run");
+        assert!(
+            wf.stages[0].exclusive,
+            "isolate_node: true must deserialize into exclusive = true"
+        );
+    }
+
+    #[test]
+    fn test_stage_config_default_exclusive_is_false() {
+        let yaml = r#"
+version: "2"
+name: "Default Pipeline"
+stages:
+  - id: normal-test
+    name: "Standard Tests"
+    tags: ["default"]
+    run: "cargo test"
+"#;
+        let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600)
+            .expect("should parse default exclusive");
+        assert_eq!(wf.stages.len(), 1);
+        assert_eq!(wf.stages[0].id, "normal-test");
+        assert!(!wf.stages[0].exclusive, "exclusive must default to false");
+    }
+
+    #[test]
+    fn test_v1_legacy_step_conversion_populates_exclusive_false() {
+        let yaml = r#"
+name: "Legacy Pipeline"
+steps:
+  - name: "Step A"
+    run: "cargo test"
+"#;
+        let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600)
+            .expect("should parse legacy v1");
+        assert_eq!(wf.stages.len(), 1);
+        assert_eq!(wf.stages[0].id, "step-1");
+        assert!(
+            !wf.stages[0].exclusive,
+            "legacy steps must have exclusive: false"
+        );
     }
 }

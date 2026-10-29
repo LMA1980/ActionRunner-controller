@@ -286,3 +286,128 @@ async fn test_sse_dashboard_and_job_events_push() {
         sse_job_text.contains("job-sse-456") || sse_job_text.contains("Initial SSE test log line")
     );
 }
+
+#[test]
+fn test_workflow_exclusive_true_parsing() {
+    let yaml = r#"
+version: "2"
+name: "Exclusive Test Pipeline"
+stages:
+  - id: bench-run
+    name: "Benchmark"
+    tags: ["bench"]
+    exclusive: true
+    run: "cargo bench"
+"#;
+    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid exclusive");
+    assert_eq!(wf.stages.len(), 1);
+    assert!(wf.stages[0].exclusive, "exclusive: true was not parsed");
+}
+
+#[test]
+fn test_workflow_isolate_node_alias_parsing() {
+    let yaml = r#"
+version: "2"
+name: "Isolate Node Pipeline"
+stages:
+  - id: bench-run
+    name: "Benchmark"
+    tags: ["bench"]
+    isolate_node: true
+    run: "cargo bench"
+"#;
+    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid isolate_node");
+    assert_eq!(wf.stages.len(), 1);
+    assert!(
+        wf.stages[0].exclusive,
+        "isolate_node: true was not aliased to exclusive: true"
+    );
+}
+
+#[test]
+fn test_workflow_exclusive_default_false() {
+    let yaml = r#"
+version: "2"
+name: "Standard Pipeline"
+stages:
+  - id: test-stage
+    name: "Test"
+    tags: ["test"]
+    run: "cargo test"
+"#;
+    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid default");
+    assert_eq!(wf.stages.len(), 1);
+    assert!(
+        !wf.stages[0].exclusive,
+        "exclusive did not default to false"
+    );
+}
+
+#[test]
+fn test_stage_config_legacy_v1_defaults_to_non_exclusive() {
+    let yaml = r#"
+name: "Legacy Pipeline"
+steps:
+  - name: "Step 1"
+    run: "cargo check"
+"#;
+    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid v1");
+    assert_eq!(wf.stages.len(), 1);
+    assert!(
+        !wf.stages[0].exclusive,
+        "legacy steps converted to stages must default to exclusive = false"
+    );
+}
+
+#[test]
+fn test_config_resolve_secret_fail_closed_on_missing_path() {
+    use action_runner_controller::config::Config;
+
+    // 1. Nonexistent absolute path must fail closed to None
+    let missing_path = "/tmp/actionrunner_missing_secret_test.key";
+    assert_eq!(
+        Config::resolve_secret_value(missing_path),
+        None,
+        "Must fail closed to None when secret path does not exist"
+    );
+
+    // 2. Nonexistent relative path must fail closed to None
+    assert_eq!(
+        Config::resolve_secret_value("./missing_secret.txt"),
+        None,
+        "Missing relative secret file must fail closed to None"
+    );
+
+    // 3. Existing empty file must fail closed to None
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let empty_file = temp_dir.path().join("empty.key");
+    std::fs::write(&empty_file, "   \n\t  \n").unwrap();
+    assert_eq!(
+        Config::resolve_secret_value(empty_file.to_str().unwrap()),
+        None,
+        "Empty secret file must return None"
+    );
+
+    // 4. Existing valid file with trailing whitespace returns trimmed content
+    let valid_file = temp_dir.path().join("valid.key");
+    std::fs::write(&valid_file, "  super_secret_payload_token_xyz  \n").unwrap();
+    assert_eq!(
+        Config::resolve_secret_value(valid_file.to_str().unwrap()),
+        Some("super_secret_payload_token_xyz".to_string()),
+        "Valid secret file must return trimmed content"
+    );
+
+    // 5. Literal string secret should be preserved
+    let literal_secret = "my-literal-api-key";
+    assert_eq!(
+        Config::resolve_secret_value(literal_secret),
+        Some(literal_secret.to_string()),
+        "Literal string secret should be preserved"
+    );
+
+    // 6. Environment variable pointing to nonexistent file fails closed
+    let env_key = "TEST_SECRET_FAIL_CLOSED_ENV_VAR_M2";
+    std::env::set_var(env_key, "/nonexistent/secret_env_file.key");
+    assert_eq!(Config::resolve_secret(env_key), None);
+    std::env::remove_var(env_key);
+}

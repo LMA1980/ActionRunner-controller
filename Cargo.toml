@@ -39,4 +39,7 @@ tokio-tungstenite = "0.26"
 action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git" }
 tempfile = "3"
 
+[patch."https://github.com/LMA1980/ActionRunner-ipc.git"]
+action-runner-ipc = { path = "../ActionRunner-ipc" }
+
 
