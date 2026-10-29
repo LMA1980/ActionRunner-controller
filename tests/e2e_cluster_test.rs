@@ -401,3 +401,209 @@ stages:
         "Multiple repositories should be in Running state concurrently across the cluster"
     );
 }
+
+#[tokio::test]
+async fn test_e2e_exclusive_stage_isolation_and_drain() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ws_path = temp_dir.path().join("controller_ws_exclusive");
+    tokio::fs::create_dir_all(&ws_path)
+        .await
+        .expect("create controller ws");
+
+    let repo_name = "LMA1980/repo-bench";
+    let actionrunner_dir = ws_path.join("repos").join(repo_name).join(".actionrunner");
+    tokio::fs::create_dir_all(&actionrunner_dir)
+        .await
+        .expect("create actionrunner dir");
+
+    // Pipeline with:
+    // 1. fmt-check (shared)
+    // 2. bench-exclusive (exclusive: true, depends on fmt-check)
+    // 3. audit-check (shared, depends on bench-exclusive)
+    let workflow_yaml = r#"
+version: "2"
+name: "Exclusive Bench Pipeline"
+stages:
+  - id: fmt-check
+    name: "Check Formatting"
+    tags: ["bench-node"]
+    threads: 2
+    run: "sleep 0.2; echo '[FMT-DONE]'"
+  - id: bench-exclusive
+    name: "Hardware Benchmark"
+    tags: ["bench-node"]
+    threads: 6
+    exclusive: true
+    depends_on: ["fmt-check"]
+    run: "sleep 0.3; echo '[BENCH-EXCLUSIVE-DONE]'"
+  - id: audit-check
+    name: "Audit Check"
+    tags: ["bench-node"]
+    threads: 2
+    depends_on: ["bench-exclusive"]
+    run: "sleep 0.2; echo '[AUDIT-DONE]'"
+"#;
+    tokio::fs::write(actionrunner_dir.join("on-push.yml"), workflow_yaml)
+        .await
+        .expect("write workflow");
+
+    let repo2_name = "LMA1980/repo-concurrent";
+    let actionrunner2_dir = ws_path.join("repos").join(repo2_name).join(".actionrunner");
+    tokio::fs::create_dir_all(&actionrunner2_dir)
+        .await
+        .expect("create actionrunner dir 2");
+    let workflow2_yaml = r#"
+version: "2"
+name: "Concurrent Normal Pipeline"
+stages:
+  - id: concurrent-stage
+    name: "Concurrent Stage"
+    tags: ["bench-node"]
+    threads: 2
+    run: "sleep 0.2; echo '[CONCURRENT-DONE]'"
+"#;
+    tokio::fs::write(actionrunner2_dir.join("on-push.yml"), workflow2_yaml)
+        .await
+        .expect("write workflow 2");
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".to_string(),
+        workspace_dir: ws_path.clone(),
+        allowed_repositories: vec!["*".to_string()],
+        allowed_actors: vec![],
+        allow_fork_prs: true,
+        allowed_pr_authors: vec![],
+        log_api_key: None,
+        webhook_secret: None,
+        cluster_token: "test-exclusive-token".to_string(),
+        job_timeout_seconds: 30,
+        allow_insecure_no_secret: true,
+        max_concurrent_jobs: 4,
+        github_token: None,
+    };
+
+    let job_store = JobStore::new(100, Some(&ws_path));
+    let cluster = ClusterRegistry::new();
+    let (tx, _rx) = mpsc::channel(32);
+
+    let scheduler = Arc::new(DAGScheduler::new(
+        config.clone(),
+        job_store.clone(),
+        cluster.clone(),
+    ));
+    tokio::spawn(scheduler.run_loop());
+
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        job_store: job_store.clone(),
+        cluster: cluster.clone(),
+        tx,
+        log_broadcaster,
+    });
+
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind port");
+    let local_addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Start 1 worker with max_slots = 2
+    let worker_ws = temp_dir.path().join("worker_ws_bench");
+    tokio::fs::create_dir_all(&worker_ws).await.unwrap();
+    let worker_config = WorkerConfig {
+        controller_url: format!("ws://{}/api/cluster/tunnel", local_addr),
+        cluster_token: "test-exclusive-token".to_string(),
+        node_id: "bench-node-worker".to_string(),
+        arch: "x86_64".to_string(),
+        tags: vec!["bench-node".to_string()],
+        max_slots: 2,
+        workspace_dir: worker_ws,
+        toolchains: vec!["system".to_string()],
+        use_btrfs: false,
+        isolation_mode: IsolationMode::None,
+    };
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = WorkerAgent::new(worker_config);
+    tokio::spawn(async move {
+        let _ = worker.connect_and_process(&mut shutdown_rx).await;
+    });
+
+    for _ in 0..50 {
+        let nodes = cluster.list_nodes_view().await;
+        if nodes.len() == 1 && nodes[0].is_online {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Submit Job 1 (contains exclusive stage)
+    let repo_path = ws_path.join("repos").join(repo_name);
+    let job1 = Job {
+        id: "job-exclusive-1".to_string(),
+        event_type: "push".to_string(),
+        repo_name: repo_name.to_string(),
+        clone_url: repo_path.to_str().unwrap().to_string(),
+        commit_sha: "beef0001".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now(),
+    };
+    job_store
+        .enqueue_job(job1, PathBuf::from("logs/job1.log"))
+        .await;
+
+    // Concurrently submit Job 2 (non-exclusive pipeline)
+    let repo2_path = ws_path.join("repos").join(repo2_name);
+    let job2 = Job {
+        id: "job-exclusive-2".to_string(),
+        event_type: "push".to_string(),
+        repo_name: repo2_name.to_string(),
+        clone_url: repo2_path.to_str().unwrap().to_string(),
+        commit_sha: "beef0002".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now(),
+    };
+    job_store
+        .enqueue_job(job2, PathBuf::from("logs/job2.log"))
+        .await;
+
+    // Monitor execution and assert that while bench-exclusive is running on bench-node-worker,
+    // active_slots on bench-node-worker is strictly 1 (no concurrent stages on node).
+    let mut verified_exclusive_concurrency = false;
+    for _ in 0..200 {
+        if let Some(record) = job_store.get_job("job-exclusive-1").await {
+            let bench_stage = record.stages.iter().find(|s| s.id == "bench-exclusive");
+            if let Some(s) = bench_stage {
+                if matches!(
+                    s.status,
+                    StageStatus::Running { .. } | StageStatus::Assigned { .. }
+                ) {
+                    let nodes = cluster.list_nodes_view().await;
+                    if let Some(w) = nodes.iter().find(|n| n.node_id == "bench-node-worker") {
+                        assert_eq!(
+                            w.active_slots, 1,
+                            "While exclusive bench is running, active_slots on node must be exactly 1"
+                        );
+                        verified_exclusive_concurrency = true;
+                    }
+                }
+            }
+        }
+
+        let snap = job_store.queue_snapshot().await;
+        if snap.stats.completed_jobs == 2 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        verified_exclusive_concurrency,
+        "Must have observed exclusive stage execution window"
+    );
+    let final_snap = job_store.queue_snapshot().await;
+    assert_eq!(final_snap.stats.completed_jobs, 2);
+}

@@ -52,10 +52,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let log_api_key = std::env::var("ACTION_RUNNER_LOG_API_KEY")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let log_api_key = Self::resolve_secret("ACTION_RUNNER_LOG_API_KEY");
 
         let allow_insecure_no_secret = std::env::var("ACTION_RUNNER_ALLOW_INSECURE_NO_SECRET")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -131,13 +128,24 @@ impl Config {
             .any(|a| a.eq_ignore_ascii_case(association))
     }
 
-    fn resolve_secret(env_var: &str) -> Option<String> {
-        let val = std::env::var(env_var).ok()?.trim().to_string();
+    pub fn resolve_secret(env_var: &str) -> Option<String> {
+        let val = std::env::var(env_var).ok()?;
+        Self::resolve_secret_value(&val)
+    }
+
+    pub fn resolve_secret_value(val: &str) -> Option<String> {
+        let val = val.trim();
         if val.is_empty() {
             return None;
         }
 
-        let path = Path::new(&val);
+        let is_path = val.starts_with('/')
+            || val.starts_with("./")
+            || val.starts_with("../")
+            || val.contains('/')
+            || val.contains('\\');
+
+        let path = Path::new(val);
         if path.is_file() {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
@@ -146,22 +154,23 @@ impl Config {
                         warn!("Secret file at {} is empty", path.display());
                         None
                     } else {
-                        info!("Loaded secret for {} from {}", env_var, path.display());
+                        info!("Loaded secret from {}", path.display());
                         Some(secret)
                     }
                 }
                 Err(err) => {
-                    warn!(
-                        "Failed to read secret file at {} for {}: {}",
-                        path.display(),
-                        env_var,
-                        err
-                    );
+                    warn!("Failed to read secret file at {}: {}", path.display(), err);
                     None
                 }
             }
+        } else if is_path {
+            warn!(
+                "Secret path '{}' does not exist or is not a readable file; failing closed",
+                val
+            );
+            None
         } else {
-            Some(val)
+            Some(val.to_string())
         }
     }
 }
@@ -181,4 +190,72 @@ pub fn is_safe_repo_name(repo: &str) -> bool {
     }
     let is_valid_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.';
     owner.chars().all(is_valid_char) && name.chars().all(is_valid_char)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_secret_value_literal() {
+        let literal = "ghp_super_secret_token_12345";
+        assert_eq!(
+            Config::resolve_secret_value(literal),
+            Some(literal.to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_secret_value_from_valid_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("secret.key");
+        std::fs::write(&file_path, "  my-secret-from-disk \n\t").unwrap();
+
+        assert_eq!(
+            Config::resolve_secret_value(file_path.to_str().unwrap()),
+            Some("my-secret-from-disk".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_secret_value_missing_path_fail_closed() {
+        // Absolute path missing
+        assert_eq!(
+            Config::resolve_secret_value("/nonexistent/secrets/webhook.key"),
+            None,
+            "Missing absolute secret file must fail closed to None, never returning path string"
+        );
+
+        // Relative path missing
+        assert_eq!(
+            Config::resolve_secret_value("./missing_secret.txt"),
+            None,
+            "Missing relative secret file must fail closed to None"
+        );
+    }
+
+    #[test]
+    fn test_resolve_secret_value_empty_file_fail_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("empty.key");
+        std::fs::write(&file_path, "   \n\t").unwrap();
+
+        assert_eq!(
+            Config::resolve_secret_value(file_path.to_str().unwrap()),
+            None,
+            "Empty secret file must fail closed to None"
+        );
+    }
+
+    #[test]
+    fn test_resolve_secret_env_var_fail_closed() {
+        let var_name = "TEST_CONTROLLER_SECRET_FAIL_CLOSED_VAR";
+        std::env::set_var(var_name, "/nonexistent/path/to/token.secret");
+        assert_eq!(
+            Config::resolve_secret(var_name),
+            None,
+            "Environment variable pointing to nonexistent path must fail closed"
+        );
+        std::env::remove_var(var_name);
+    }
 }
