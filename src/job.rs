@@ -156,6 +156,8 @@ pub struct QueueSnapshot {
     pub concurrency: usize,
     pub queue_depth: usize,
     pub active_job: Option<QueueItemView>,
+    #[serde(default)]
+    pub active_jobs: Vec<QueueItemView>,
     pub queued_jobs: Vec<QueueItemView>,
     pub stats: QueueStats,
     pub recent_jobs: Vec<JobRecord>,
@@ -252,7 +254,7 @@ impl JobStore {
             db.upsert_records_batch(&recovered_running);
         }
         if has_queued {
-            notify.notify_one();
+            notify.notify_waiters();
         }
 
         Self {
@@ -396,12 +398,25 @@ impl JobStore {
                                 JobStatus::Queued | JobStatus::Running { .. }
                             )
                         {
+                            let skip_reason = format!(
+                                "Superseded by pull_request event for commit {} ({})",
+                                sha_short, job.id
+                            );
                             superseded_jobs.push(record.job.id.clone());
+                            for stage in record.stages.iter_mut() {
+                                if matches!(
+                                    stage.status,
+                                    StageStatus::Pending
+                                        | StageStatus::Assigned { .. }
+                                        | StageStatus::Running { .. }
+                                ) {
+                                    stage.status = StageStatus::Skipped {
+                                        reason: skip_reason.clone(),
+                                    };
+                                }
+                            }
                             record.status = JobStatus::Skipped {
-                                reason: format!(
-                                    "Superseded by pull_request event for commit {} ({})",
-                                    sha_short, job.id
-                                ),
+                                reason: skip_reason,
                             };
                             record.updated_at = now;
                             self.db.upsert_record(record);
@@ -469,7 +484,7 @@ impl JobStore {
         }
 
         self.persist().await;
-        self.notify.notify_one();
+        self.notify.notify_waiters();
 
         EnqueueResult {
             job_id: job.id,
@@ -542,6 +557,7 @@ impl JobStore {
         };
 
         let mut active_job: Option<QueueItemView> = None;
+        let mut active_jobs: Vec<QueueItemView> = Vec::new();
         let mut queued_records: Vec<JobRecord> = Vec::new();
 
         for record in store.iter() {
@@ -550,14 +566,16 @@ impl JobStore {
                     stats.running_jobs += 1;
                     let elapsed = (now - *started_at).num_seconds().max(0) as u64;
                     let wait = (*started_at - record.job.queued_at).num_seconds().max(0) as u64;
+                    let view = QueueItemView {
+                        position: 0,
+                        wait_secs: wait,
+                        elapsed_secs: Some(elapsed),
+                        record: record.clone(),
+                    };
                     if active_job.is_none() {
-                        active_job = Some(QueueItemView {
-                            position: 0,
-                            wait_secs: wait,
-                            elapsed_secs: Some(elapsed),
-                            record: record.clone(),
-                        });
+                        active_job = Some(view.clone());
                     }
+                    active_jobs.push(view);
                 }
                 JobStatus::Queued => {
                     stats.queued_jobs += 1;
@@ -594,7 +612,7 @@ impl JobStore {
             })
             .collect();
 
-        let status = if active_job.is_some() || !queued_jobs.is_empty() {
+        let status = if !active_jobs.is_empty() || !queued_jobs.is_empty() {
             "busy".to_string()
         } else {
             "idle".to_string()
@@ -604,9 +622,10 @@ impl JobStore {
 
         QueueSnapshot {
             status,
-            concurrency: 1,
+            concurrency: active_jobs.len().max(1),
             queue_depth: queued_jobs.len(),
             active_job,
+            active_jobs,
             queued_jobs,
             stats,
             recent_jobs,

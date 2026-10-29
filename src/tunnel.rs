@@ -163,8 +163,24 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     };
 
-                                    state.job_store.update_stage_status(&report.job_id, &report.stage_id, status).await;
-                                    state.cluster.release_slot(&node_id).await;
+                                    // Release the stage slot BEFORE updating stage status so any job woken by
+                                    // `update_stage_status` (which calls `notify_waiters()`) sees the freed node slot immediately.
+                                    state
+                                        .cluster
+                                        .release_stage_slot(
+                                            &node_id,
+                                            &report.job_id,
+                                            &report.stage_id,
+                                        )
+                                        .await;
+                                    state
+                                        .job_store
+                                        .update_stage_status(
+                                            &report.job_id,
+                                            &report.stage_id,
+                                            status,
+                                        )
+                                        .await;
                                     state.job_store.notify_event();
                                 }
                             }
@@ -176,13 +192,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         interrupted = ?shutdown.interrupted_stages,
                                         "Worker signaled shutdown/restart"
                                     );
+                                    state.cluster.release_slot(&node_id).await;
                                     let recovered = state
                                         .job_store
-                                        .recover_stages_for_node(&node_id, Some(&shutdown.interrupted_stages))
+                                        .recover_stages_for_node(
+                                            &node_id,
+                                            Some(&shutdown.interrupted_stages),
+                                        )
                                         .await;
                                     for (job_id, stage_id) in &recovered {
-                                        if let Some(record) = state.job_store.get_job(job_id).await {
-                                            let full_path = state.config.workspace_dir.join(&record.log_file);
+                                        if let Some(record) = state.job_store.get_job(job_id).await
+                                        {
+                                            let full_path =
+                                                state.config.workspace_dir.join(&record.log_file);
                                             let note = format!(
                                                 "{} [{}] [{}] [stderr] Worker signaled restart; stage execution interrupted and returned to queue for re-dispatch\n",
                                                 chrono::Utc::now().to_rfc3339(),
@@ -201,7 +223,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             state.broadcast_log(job_id, &note);
                                         }
                                     }
-                                    state.cluster.release_slot(&node_id).await;
                                     state.job_store.notify_event();
                                 }
                             }

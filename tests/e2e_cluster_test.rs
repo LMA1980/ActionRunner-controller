@@ -228,3 +228,176 @@ stages:
         log_content
     );
 }
+
+#[tokio::test]
+async fn test_multi_repo_single_action_per_node_scheduling() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let ws_path = temp_dir.path().join("controller_ws_multi");
+    tokio::fs::create_dir_all(&ws_path)
+        .await
+        .expect("create controller ws");
+
+    let repos = [
+        "LMA1980/repo-alpha",
+        "LMA1980/repo-beta",
+        "LMA1980/repo-gamma",
+        "LMA1980/repo-delta",
+    ];
+
+    let workflow_yaml = r#"
+version: "2"
+name: "Multi-Repo Pipeline"
+stages:
+  - id: fmt-check
+    name: "Check Formatting"
+    tags: ["fmt"]
+    threads: 2
+    run: "sleep 0.2; echo '[FMT-OK]'"
+  - id: clippy-check
+    name: "Check Clippy"
+    tags: ["clippy"]
+    threads: 6
+    run: "sleep 0.2; echo '[CLIPPY-OK]'"
+  - id: audit-check
+    name: "Check Audit"
+    tags: ["audit"]
+    threads: 2
+    depends_on: ["fmt-check"]
+    run: "sleep 0.2; echo '[AUDIT-OK]'"
+"#;
+
+    for repo_name in &repos {
+        let actionrunner_dir = ws_path.join("repos").join(repo_name).join(".actionrunner");
+        tokio::fs::create_dir_all(&actionrunner_dir)
+            .await
+            .expect("create actionrunner dir");
+        tokio::fs::write(actionrunner_dir.join("on-push.yml"), workflow_yaml)
+            .await
+            .expect("write workflow");
+    }
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".to_string(),
+        workspace_dir: ws_path.clone(),
+        allowed_repositories: vec!["*".to_string()],
+        allowed_actors: vec![],
+        allow_fork_prs: true,
+        allowed_pr_authors: vec![],
+        log_api_key: None,
+        webhook_secret: None,
+        cluster_token: "test-multi-secret-token".to_string(),
+        job_timeout_seconds: 30,
+        allow_insecure_no_secret: true,
+        max_concurrent_jobs: 6,
+        github_token: None,
+    };
+
+    let job_store = JobStore::new(100, Some(&ws_path));
+    let cluster = ClusterRegistry::new();
+    let (tx, _rx) = mpsc::channel(32);
+
+    let scheduler = Arc::new(DAGScheduler::new(
+        config.clone(),
+        job_store.clone(),
+        cluster.clone(),
+    ));
+    tokio::spawn(scheduler.run_loop());
+
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        job_store: job_store.clone(),
+        cluster: cluster.clone(),
+        tx,
+        log_broadcaster,
+    });
+
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let local_addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Spawn 2 workers (entrance for fmt/audit, rubicon for clippy)
+    for (node_id, tags) in [
+        ("entrance", vec!["fmt".to_string(), "audit".to_string()]),
+        ("rubicon", vec!["clippy".to_string()]),
+    ] {
+        let worker_ws = temp_dir.path().join(format!("worker_{}", node_id));
+        tokio::fs::create_dir_all(&worker_ws).await.unwrap();
+        let worker_config = WorkerConfig {
+            controller_url: format!("ws://{}/api/cluster/tunnel", local_addr),
+            cluster_token: "test-multi-secret-token".to_string(),
+            node_id: node_id.to_string(),
+            arch: "x86_64".to_string(),
+            tags,
+            max_slots: 1,
+            workspace_dir: worker_ws,
+            toolchains: vec!["system".to_string()],
+            use_btrfs: false,
+            isolation_mode: IsolationMode::None,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = WorkerAgent::new(worker_config);
+        tokio::spawn(async move {
+            let _ = worker.connect_and_process(&mut shutdown_rx).await;
+        });
+    }
+
+    for _ in 0..50 {
+        let nodes = cluster.list_nodes_view().await;
+        if nodes.len() == 2 && nodes.iter().all(|n| n.is_online) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Submit 4 repository events simultaneously
+    for (idx, repo_name) in repos.iter().enumerate() {
+        let repo_path = ws_path.join("repos").join(repo_name);
+        let job = Job {
+            id: format!("job-multi-{}", idx + 1),
+            event_type: "push".to_string(),
+            repo_name: repo_name.to_string(),
+            clone_url: repo_path.to_str().unwrap().to_string(),
+            commit_sha: format!("deadbeef0{}", idx + 1),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let log_file = PathBuf::from(format!("logs/{}/{}.log", repo_name, job.id));
+        job_store.enqueue_job(job, log_file).await;
+    }
+
+    let mut max_concurrent_running_jobs = 0usize;
+    for _ in 0..200 {
+        let nodes = cluster.list_nodes_view().await;
+        for n in &nodes {
+            assert_eq!(n.max_slots, 1, "Node {} max_slots must be 1", n.node_id);
+            assert!(
+                n.active_slots <= 1,
+                "Node {} exceeded 1 active stage slot: {}",
+                n.node_id,
+                n.active_slots
+            );
+        }
+
+        let snap = job_store.queue_snapshot().await;
+        max_concurrent_running_jobs = max_concurrent_running_jobs.max(snap.stats.running_jobs);
+
+        if snap.stats.completed_jobs == 4 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let final_snap = job_store.queue_snapshot().await;
+    assert_eq!(final_snap.stats.completed_jobs, 4);
+    assert!(
+        max_concurrent_running_jobs >= 2,
+        "Multiple repositories should be in Running state concurrently across the cluster"
+    );
+}
