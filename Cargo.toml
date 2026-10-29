@@ -11,7 +11,7 @@ default = []
 bundled-duckdb = ["duckdb/bundled"]
 
 [dependencies]
-action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "feat/stage-pid-tracking-and-queue-fairness" }
+action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "feat/issue-82-exclusive-stage-isolation" }
 duckdb = { version = "=1.2.2", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -36,10 +36,7 @@ async-stream = "0.3.6"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
-action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git" }
+action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "feat/issue-82-exclusive-stage-isolation" }
 tempfile = "3"
-
-[patch."https://github.com/LMA1980/ActionRunner-ipc.git"]
-action-runner-ipc = { path = "../ActionRunner-ipc" }
 
 
