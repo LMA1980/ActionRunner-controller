@@ -1,11 +1,10 @@
 //! Pluggable controller persistence abstraction (`ControllerStorage`) supporting
-//! `LocalDuckDbStorage`, `MuObserveRemoteStorage` (Fory RPC over `step-ca` mTLS / TCP),
-//! and `DualWriteStorage` (Phase 1 zero-downtime migration per `AGENTS.md §4`),
+//! `MuObserveRemoteStorage` (Fory RPC over `step-ca` mTLS / TCP) and `InMemoryStorage`
+//! (for unit/integration test harnesses following Phase 3 local DuckDB decommissioning `#45`–`#47`),
 //! plus root W3C `traceparent` generation and `RegressionGateReport` evaluation (`#41`–`#44`).
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,20 +27,17 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
-use crate::db::DuckDbStore;
+use crate::db::CatalogStore;
 use crate::job::{extract_submodule_job, normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
 
-/// Storage backend mode for `ActionRunner-controller` Phase 1–3 migration.
+/// Storage backend mode for `ActionRunner-controller` after Phase 3 local DuckDB decommissioning (`#45`–`#47`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StorageBackendMode {
-    /// Local embedded DuckDB only (`workspace/controller_history.duckdb`).
-    #[default]
-    LocalDuckDb,
-    /// Phase 1 zero-downtime migration: write to both local DuckDB and remote `MuObserve`,
-    /// reading primarily from local DuckDB with fallback to remote `MuObserve`.
-    DualWrite,
     /// Remote `MuObserve` control-plane storage via Apache Fory RPC over `MUOB` framing.
+    #[default]
     MuObserveRemote,
+    /// Pure-Rust in-memory catalog storage for standalone unit tests when `MUOBSERVE_CONTROL_ADDR` is unset.
+    InMemory,
 }
 
 impl StorageBackendMode {
@@ -50,8 +46,7 @@ impl StorageBackendMode {
     pub fn from_env() -> Self {
         if let Ok(raw) = std::env::var("ACTION_RUNNER_STORAGE_MODE") {
             match raw.trim().to_ascii_lowercase().as_str() {
-                "local" | "duckdb" | "local_duckdb" => return Self::LocalDuckDb,
-                "dual" | "dual_write" | "dual-write" | "dualwrite" => return Self::DualWrite,
+                "memory" | "in_memory" | "inmemory" => return Self::InMemory,
                 "remote" | "muobserve" | "muobserve_remote" => return Self::MuObserveRemote,
                 _ => {}
             }
@@ -61,9 +56,9 @@ impl StorageBackendMode {
             .filter(|s| !s.trim().is_empty())
             .is_some()
         {
-            Self::DualWrite
+            Self::MuObserveRemote
         } else {
-            Self::LocalDuckDb
+            Self::InMemory
         }
     }
 }
@@ -139,35 +134,35 @@ pub trait ControllerStorage: Send + Sync {
     }
 }
 
-/// Local embedded DuckDB implementation of [`ControllerStorage`].
-#[derive(Clone)]
-pub struct LocalDuckDbStorage {
-    store: Arc<DuckDbStore>,
+/// Pure-Rust in-memory implementation of [`ControllerStorage`] for unit and integration tests.
+#[derive(Clone, Default)]
+pub struct InMemoryStorage {
+    store: Arc<CatalogStore>,
 }
 
-impl LocalDuckDbStorage {
-    /// Wraps an existing [`DuckDbStore`].
+impl InMemoryStorage {
+    /// Wraps an existing [`CatalogStore`].
     #[must_use]
-    pub fn new(store: Arc<DuckDbStore>) -> Self {
+    pub fn new(store: Arc<CatalogStore>) -> Self {
         Self { store }
     }
 
-    /// Opens a [`LocalDuckDbStorage`] at `db_path` (or in-memory when `None`).
-    pub fn open(db_path: Option<&Path>) -> Result<Self, String> {
-        let store = DuckDbStore::open(db_path)?;
-        Ok(Self {
-            store: Arc::new(store),
-        })
+    /// Creates a new empty [`InMemoryStorage`].
+    #[must_use]
+    pub fn open() -> Self {
+        Self {
+            store: Arc::new(CatalogStore::new()),
+        }
     }
 
-    /// Returns a reference to the underlying [`DuckDbStore`].
+    /// Returns a reference to the underlying [`CatalogStore`].
     #[must_use]
-    pub fn inner(&self) -> &Arc<DuckDbStore> {
+    pub fn inner(&self) -> &Arc<CatalogStore> {
         &self.store
     }
 }
 
-impl ControllerStorage for LocalDuckDbStorage {
+impl ControllerStorage for InMemoryStorage {
     fn upsert_record(&self, record: &JobRecord) {
         self.store.upsert_record(record);
     }
@@ -772,7 +767,7 @@ pub fn compute_next_submodule_snapshots(
     by_sub_key.into_values().collect()
 }
 
-fn resolve_direct_repo_from_snapshots(
+pub(crate) fn resolve_direct_repo_from_snapshots(
     snapshots: &[CentralBranchSnapshot],
     repo: &str,
     branch: Option<&str>,
@@ -827,7 +822,7 @@ fn resolve_direct_repo_from_snapshots(
     (active, completed)
 }
 
-fn resolve_submodule_from_snapshots(
+pub(crate) fn resolve_submodule_from_snapshots(
     sub_snapshots: &[CentralSubmoduleSnapshot],
     branch_snapshots: &[CentralBranchSnapshot],
     parent_repo: Option<&str>,
@@ -930,7 +925,7 @@ fn resolve_submodule_from_snapshots(
 
 impl ControllerStorage for MuObserveRemoteStorage {
     fn upsert_record(&self, record: &JobRecord) {
-        let Some(central_record) = DuckDbStore::to_central_job_record(record) else {
+        let Some(central_record) = CatalogStore::to_central_job_record(record) else {
             return;
         };
         let repo_key = central_record.repo_key.clone();
@@ -994,7 +989,7 @@ impl ControllerStorage for MuObserveRemoteStorage {
             BTreeMap::new();
 
         for rec in records {
-            let Some(central) = DuckDbStore::to_central_job_record(rec) else {
+            let Some(central) = CatalogStore::to_central_job_record(rec) else {
                 continue;
             };
             let key = (central.repo_key.clone(), central.branch_key.clone());
@@ -1184,123 +1179,6 @@ impl ControllerStorage for MuObserveRemoteStorage {
                 None
             }
         }
-    }
-}
-
-/// Phase 1 dual-write storage combining [`LocalDuckDbStorage`] and [`MuObserveRemoteStorage`]
-/// for zero-downtime migration per `AGENTS.md §4`.
-#[derive(Clone)]
-pub struct DualWriteStorage {
-    local: Arc<LocalDuckDbStorage>,
-    remote: Arc<MuObserveRemoteStorage>,
-}
-
-impl DualWriteStorage {
-    /// Creates a new [`DualWriteStorage`] mirroring writes to both `local` and `remote`.
-    #[must_use]
-    pub fn new(local: Arc<LocalDuckDbStorage>, remote: Arc<MuObserveRemoteStorage>) -> Self {
-        Self { local, remote }
-    }
-
-    /// Returns a reference to the primary [`LocalDuckDbStorage`].
-    #[must_use]
-    pub fn local(&self) -> &Arc<LocalDuckDbStorage> {
-        &self.local
-    }
-
-    /// Returns a reference to the secondary [`MuObserveRemoteStorage`].
-    #[must_use]
-    pub fn remote(&self) -> &Arc<MuObserveRemoteStorage> {
-        &self.remote
-    }
-}
-
-impl ControllerStorage for DualWriteStorage {
-    fn upsert_record(&self, record: &JobRecord) {
-        self.local.upsert_record(record);
-        self.remote.upsert_record(record);
-    }
-
-    fn upsert_records_batch(&self, records: &[JobRecord]) {
-        self.local.upsert_records_batch(records);
-        self.remote.upsert_records_batch(records);
-    }
-
-    fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord> {
-        let local_jobs = self.local.load_recent_jobs(limit);
-        if !local_jobs.is_empty() {
-            return local_jobs;
-        }
-        self.remote.load_recent_jobs(limit)
-    }
-
-    fn load_branch_snapshots(
-        &self,
-        repo_key: Option<&str>,
-        branch_key: Option<&str>,
-    ) -> Vec<CentralBranchSnapshot> {
-        let local_snaps = self.local.load_branch_snapshots(repo_key, branch_key);
-        if !local_snaps.is_empty() {
-            return local_snaps;
-        }
-        self.remote.load_branch_snapshots(repo_key, branch_key)
-    }
-
-    fn load_submodule_snapshots(
-        &self,
-        parent_repo_key: Option<&str>,
-        submodule_key: Option<&str>,
-        branch_key: Option<&str>,
-    ) -> Vec<CentralSubmoduleSnapshot> {
-        let local_snaps =
-            self.local
-                .load_submodule_snapshots(parent_repo_key, submodule_key, branch_key);
-        if !local_snaps.is_empty() {
-            return local_snaps;
-        }
-        self.remote
-            .load_submodule_snapshots(parent_repo_key, submodule_key, branch_key)
-    }
-
-    fn get_job(&self, job_id: &str) -> Option<JobRecord> {
-        self.local
-            .get_job(job_id)
-            .or_else(|| self.remote.get_job(job_id))
-    }
-
-    fn find_card_context(
-        &self,
-        repo: &str,
-        branch: Option<&str>,
-    ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let (act, comp) = self.local.find_card_context(repo, branch);
-        if act.is_some() || comp.is_some() {
-            return (act, comp);
-        }
-        self.remote.find_card_context(repo, branch)
-    }
-
-    fn find_submodule_card_context(
-        &self,
-        parent_repo: &str,
-        submodule: &str,
-        branch: Option<&str>,
-    ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let (act, comp) = self
-            .local
-            .find_submodule_card_context(parent_repo, submodule, branch);
-        if act.is_some() || comp.is_some() {
-            return (act, comp);
-        }
-        self.remote
-            .find_submodule_card_context(parent_repo, submodule, branch)
-    }
-
-    fn evaluate_regression_gate(
-        &self,
-        req: &RegressionGateRequest,
-    ) -> Option<RegressionGateReport> {
-        self.remote.evaluate_regression_gate(req)
     }
 }
 

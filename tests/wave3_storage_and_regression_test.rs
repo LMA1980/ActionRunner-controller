@@ -1,7 +1,8 @@
-//! Milestone 3 Wave 3 (`#41`–`#44`, `M3.054`–`M3.057`) integration and parity tests for:
-//! - `ControllerStorage` (`LocalDuckDbStorage`, `MuObserveRemoteStorage`, `DualWriteStorage`)
+//! Milestone 3 Wave 3 & Phase 3 (`#41`–`#47`, `M3.054`–`M3.065`) integration and parity tests for:
+//! - `ControllerStorage` (`InMemoryStorage`, `MuObserveRemoteStorage`)
 //! - Root W3C `traceparent` generation and propagation in `StageDispatchTask`
 //! - `RegressionGateReport` evaluation (`Pass`, `Warn`, `Fail` / `RegressionDetected`)
+//! - Phase 3 local DuckDB decommissioning (`Cargo.toml` zero `duckdb` linkage)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,8 +23,8 @@ use action_runner_controller::job::{Job, JobMetrics, JobRecord, JobStatus, Submo
 use action_runner_controller::scheduler::build_v3_stage_dispatch_task;
 use action_runner_controller::storage_backend::{
     apply_regression_gate_to_job, compute_letter_grade, job_root_trace_context,
-    job_root_traceparent, ControllerStorage, DualWriteStorage, LocalDuckDbStorage,
-    MuObserveRemoteConfig, MuObserveRemoteStorage,
+    job_root_traceparent, ControllerStorage, InMemoryStorage, MuObserveRemoteConfig,
+    MuObserveRemoteStorage,
 };
 use action_runner_controller::workflow::{ActionRunnerWorkflow, StageConfig, TaskConfig};
 
@@ -324,20 +325,12 @@ fn sample_job_record(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_controller_storage_parity_local_remote_and_dual_write_subtask_43() {
+async fn test_controller_storage_parity_in_memory_and_remote_subtask_43_and_46() {
     let (addr_remote, _state_remote) = spawn_mock_muobserve_server().await;
-    let (addr_dual, _state_dual) = spawn_mock_muobserve_server().await;
 
-    let local_only = LocalDuckDbStorage::open(None).expect("open local duckdb");
+    let in_memory = InMemoryStorage::open();
     let remote_only =
         MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(addr_remote)).expect("remote");
-
-    let dual_local = Arc::new(LocalDuckDbStorage::open(None).expect("open dual local"));
-    let dual_remote = Arc::new(
-        MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(addr_dual))
-            .expect("open dual remote"),
-    );
-    let dual_write = DualWriteStorage::new(Arc::clone(&dual_local), Arc::clone(&dual_remote));
 
     let rec1 = sample_job_record(
         "job-1001",
@@ -375,38 +368,28 @@ async fn test_controller_storage_parity_local_remote_and_dual_write_subtask_43()
         false,
     );
 
-    // 1. Test upsert_record on all 3 storage backends
-    local_only.upsert_record(&rec1);
+    // 1. Test upsert_record on both storage backends
+    in_memory.upsert_record(&rec1);
     remote_only.upsert_record(&rec1);
-    dual_write.upsert_record(&rec1);
 
-    // 2. Test upsert_records_batch on all 3 storage backends
+    // 2. Test upsert_records_batch on both storage backends
     let batch = vec![rec2.clone(), rec3.clone()];
-    local_only.upsert_records_batch(&batch);
+    in_memory.upsert_records_batch(&batch);
     remote_only.upsert_records_batch(&batch);
-    dual_write.upsert_records_batch(&batch);
 
-    // 3. Verify load_recent_jobs parity across LocalDuckDbStorage, MuObserveRemoteStorage, DualWriteStorage
-    let jobs_local = local_only.load_recent_jobs(10);
+    // 3. Verify load_recent_jobs parity across InMemoryStorage and MuObserveRemoteStorage
+    let jobs_local = in_memory.load_recent_jobs(10);
     let jobs_remote = remote_only.load_recent_jobs(10);
-    let jobs_dual = dual_write.load_recent_jobs(10);
-    let jobs_dual_mirror = dual_remote.load_recent_jobs(10);
 
     assert_eq!(jobs_local.len(), 3);
     assert_eq!(jobs_local, jobs_remote);
-    assert_eq!(jobs_local, jobs_dual);
-    assert_eq!(jobs_local, jobs_dual_mirror);
 
-    // 4. Verify load_branch_snapshots parity across all 3 storage backends
-    let branches_local = local_only.load_branch_snapshots(None, None);
+    // 4. Verify load_branch_snapshots parity across both storage backends
+    let branches_local = in_memory.load_branch_snapshots(None, None);
     let branches_remote = remote_only.load_branch_snapshots(None, None);
-    let branches_dual = dual_write.load_branch_snapshots(None, None);
-    let branches_dual_mirror = dual_remote.load_branch_snapshots(None, None);
 
     assert_eq!(branches_local.len(), 2);
     assert_eq!(branches_local, branches_remote);
-    assert_eq!(branches_local, branches_dual);
-    assert_eq!(branches_local, branches_dual_mirror);
 
     // Check active vs completed snapshot tracking on main
     let main_snap = branches_remote
@@ -419,24 +402,20 @@ async fn test_controller_storage_parity_local_remote_and_dual_write_subtask_43()
         Some("job-1001")
     );
 
-    // 5. Verify load_submodule_snapshots parity across all 3 storage backends
-    let subs_local = local_only.load_submodule_snapshots(None, None, None);
+    // 5. Verify load_submodule_snapshots parity across both storage backends
+    let subs_local = in_memory.load_submodule_snapshots(None, None, None);
     let subs_remote = remote_only.load_submodule_snapshots(None, None, None);
-    let subs_dual = dual_write.load_submodule_snapshots(None, None, None);
-    let subs_dual_mirror = dual_remote.load_submodule_snapshots(None, None, None);
 
     assert_eq!(subs_local.len(), 1);
     assert_eq!(subs_local, subs_remote);
-    assert_eq!(subs_local, subs_dual);
-    assert_eq!(subs_local, subs_dual_mirror);
 
     // 6. Verify card context and submodule lookups match
     assert_eq!(
-        local_only.find_card_context("LMA1980/ActionRunner-controller", Some("main")),
+        in_memory.find_card_context("LMA1980/ActionRunner-controller", Some("main")),
         remote_only.find_card_context("LMA1980/ActionRunner-controller", Some("main"))
     );
     assert_eq!(
-        local_only.find_submodule_card_context(
+        in_memory.find_submodule_card_context(
             "LMA1980/ActionRunner-controller",
             "k3-core",
             Some("main")

@@ -619,7 +619,7 @@ impl DAGScheduler {
                 self.job_store.notify_event();
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
                 if job_record.metrics.is_none() {
-                    if let Some(m) = crate::db::DuckDbStore::extract_metrics_from_log_and_workspace(
+                    if let Some(m) = crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
                         &self.config.workspace_dir,
                         &job.repo_name,
                         &log_file_path,
@@ -665,7 +665,7 @@ impl DAGScheduler {
                         .map(|m| m.submodules.is_empty())
                         .unwrap_or(true)
                 {
-                    if let Some(m) = crate::db::DuckDbStore::extract_metrics_from_log_and_workspace(
+                    if let Some(m) = crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
                         &self.config.workspace_dir,
                         &job.repo_name,
                         &log_file_path,

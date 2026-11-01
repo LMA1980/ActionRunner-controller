@@ -174,60 +174,31 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
-        let db_file = workspace_dir.map(|w| w.join("logs").join("jobs.duckdb"));
-        let local_duckdb = Arc::new(
-            crate::db::DuckDbStore::open(db_file.as_deref()).unwrap_or_else(|e| {
-                warn!(
-                    "Failed to open disk-backed DuckDB ({}), falling back to in-memory DuckDB",
-                    e
-                );
-                crate::db::DuckDbStore::open(None).expect("in-memory DuckDB")
-            }),
-        );
-
+        let local_catalog = Arc::new(crate::db::CatalogStore::new());
         if let Some(ws) = workspace_dir {
-            local_duckdb.backfill_from_logs_dir(ws);
+            local_catalog.backfill_from_logs_dir(ws);
         }
 
-        let local_storage = Arc::new(crate::storage_backend::LocalDuckDbStorage::new(
-            local_duckdb,
-        ));
+        let in_memory_storage = Arc::new(crate::storage_backend::InMemoryStorage::new(Arc::clone(
+            &local_catalog,
+        )));
         let mode = crate::storage_backend::StorageBackendMode::from_env();
         let storage: Arc<dyn crate::storage_backend::ControllerStorage> = match mode {
-            crate::storage_backend::StorageBackendMode::LocalDuckDb => local_storage,
-            crate::storage_backend::StorageBackendMode::DualWrite => {
-                if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
-                    match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
-                        Ok(remote) => Arc::new(crate::storage_backend::DualWriteStorage::new(
-                            local_storage,
-                            Arc::new(remote),
-                        )),
-                        Err(e) => {
-                            warn!(
-                                "Failed to initialize MuObserveRemoteStorage for DualWrite ({}), using LocalDuckDbStorage",
-                                e
-                            );
-                            local_storage
-                        }
-                    }
-                } else {
-                    local_storage
-                }
-            }
+            crate::storage_backend::StorageBackendMode::InMemory => in_memory_storage,
             crate::storage_backend::StorageBackendMode::MuObserveRemote => {
                 if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
                     match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
                         Ok(remote) => Arc::new(remote),
                         Err(e) => {
                             warn!(
-                                "Failed to initialize MuObserveRemoteStorage ({}), falling back to LocalDuckDbStorage",
+                                "Failed to initialize MuObserveRemoteStorage ({}), falling back to InMemoryStorage",
                                 e
                             );
-                            local_storage
+                            in_memory_storage
                         }
                     }
                 } else {
-                    local_storage
+                    in_memory_storage
                 }
             }
         };
