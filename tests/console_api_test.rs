@@ -42,6 +42,7 @@ fn test_config(log_api_key: Option<&str>) -> Config {
         allow_insecure_no_secret: true,
         max_concurrent_jobs: 2,
         github_token: None,
+        ..Config::default()
     }
 }
 

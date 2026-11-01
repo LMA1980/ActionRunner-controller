@@ -619,12 +619,27 @@ impl DAGScheduler {
                 self.job_store.notify_event();
                 warn!(job_id = %job.id, error = %failure_error, "Pipeline stage failed");
                 if job_record.metrics.is_none() {
-                    if let Some(m) = crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
-                        &self.config.workspace_dir,
-                        &job.repo_name,
-                        &log_file_path,
-                        false,
-                    ) {
+                    let extracted =
+                        crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
+                            &self.config.workspace_dir,
+                            &job.repo_name,
+                            &log_file_path,
+                            false,
+                        )
+                        .or_else(|| {
+                            self.job_store
+                            .get_job_log(&job.id)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|content| {
+                                crate::db::CatalogStore::extract_metrics_from_content_and_workspace(
+                                    &self.config.workspace_dir,
+                                    &job.repo_name,
+                                    &content,
+                                    false,
+                                )
+                            })
+                        });
+                    if let Some(m) = extracted {
                         self.job_store.update_metrics(&job.id, m).await;
                     }
                 }
@@ -665,12 +680,27 @@ impl DAGScheduler {
                         .map(|m| m.submodules.is_empty())
                         .unwrap_or(true)
                 {
-                    if let Some(m) = crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
-                        &self.config.workspace_dir,
-                        &job.repo_name,
-                        &log_file_path,
-                        true,
-                    ) {
+                    let extracted =
+                        crate::db::CatalogStore::extract_metrics_from_log_and_workspace(
+                            &self.config.workspace_dir,
+                            &job.repo_name,
+                            &log_file_path,
+                            true,
+                        )
+                        .or_else(|| {
+                            self.job_store
+                            .get_job_log(&job.id)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|content| {
+                                crate::db::CatalogStore::extract_metrics_from_content_and_workspace(
+                                    &self.config.workspace_dir,
+                                    &job.repo_name,
+                                    &content,
+                                    true,
+                                )
+                            })
+                        });
+                    if let Some(m) = extracted {
                         self.job_store.update_metrics(&job.id, m).await;
                     }
                 }

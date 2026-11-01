@@ -371,6 +371,7 @@ struct Inner {
     refreshing: std::sync::Mutex<HashSet<String>>,
     reconcile: Mutex<ReconcileState>,
     persist_lock: Mutex<()>,
+    storage: std::sync::RwLock<Option<Arc<dyn crate::storage_backend::ControllerStorage>>>,
 }
 
 /// Shared, cheaply clonable console state.
@@ -406,7 +407,18 @@ impl ConsoleState {
             refreshing: std::sync::Mutex::new(HashSet::new()),
             reconcile: Mutex::new(ReconcileState::default()),
             persist_lock: Mutex::new(()),
+            storage: std::sync::RwLock::new(None),
         }))
+    }
+
+    /// Attaches a shared [`crate::storage_backend::ControllerStorage`] backend so console
+    /// registry changes are mirrored for standby/promoted controller instances (`#82`).
+    pub fn attach_storage(&self, storage: Arc<dyn crate::storage_backend::ControllerStorage>) {
+        if let Ok(mut guard) = self.0.storage.write() {
+            if guard.is_none() {
+                *guard = Some(storage);
+            }
+        }
     }
 
     #[must_use]
@@ -442,9 +454,6 @@ impl ConsoleState {
     }
 
     async fn persist(&self) {
-        let Some(path) = self.0.cfg.cache_file.clone() else {
-            return;
-        };
         let _guard = self.0.persist_lock.lock().await;
         let body = {
             let reg = self.0.registry.read().await;
@@ -452,6 +461,14 @@ impl ConsoleState {
                 Ok(s) => s,
                 Err(_) => return,
             }
+        };
+        if let Ok(guard) = self.0.storage.read() {
+            if let Some(ref db) = *guard {
+                db.save_console_registry(&body);
+            }
+        }
+        let Some(path) = self.0.cfg.cache_file.clone() else {
+            return;
         };
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -471,6 +488,7 @@ impl ConsoleState {
     /// Records repository metadata, branch lifecycle and pull-request state from an
     /// accepted (signature-verified, allow-listed) webhook. Never fails the webhook.
     pub async fn observe_webhook(&self, event: &str, payload: &Value, job_store: &JobStore) {
+        self.attach_storage(Arc::clone(job_store.storage()));
         let Some(full) = payload
             .pointer("/repository/full_name")
             .and_then(Value::as_str)
@@ -952,6 +970,7 @@ impl ConsoleState {
     /// Schedules a refresh for every repository known from job history whose cached
     /// metadata is missing or stale.
     pub async fn warm_up(&self, job_store: &JobStore) {
+        self.attach_storage(Arc::clone(job_store.storage()));
         let entries = self.entries().await;
         let ttl = self.metadata_ttl();
         for (owner, repo) in api::known_repo_names(job_store, &entries)
@@ -967,6 +986,131 @@ impl ConsoleState {
             }
         }
     }
+
+    /// Re-hydrates the console repository registry, branch sidings, and `fabric_rev`
+    /// from [`crate::storage_backend::ControllerStorage`] (`#76`, `#82`).
+    ///
+    /// Called periodically while in `standby` mode (`bump_rev = false`) and immediately
+    /// upon promotion to `leader` (`bump_rev = true`).
+    pub async fn sync_from_storage(&self, job_store: &JobStore, bump_rev: bool) {
+        self.attach_storage(Arc::clone(job_store.storage()));
+        let remote_reg = job_store
+            .storage()
+            .load_console_registry()
+            .and_then(|s| serde_json::from_str::<Registry>(&s).ok());
+        let jobs = job_store.list_jobs().await;
+        let branch_snaps = job_store.storage().load_branch_snapshots(None, None);
+
+        {
+            let mut reg = self.0.registry.write().await;
+            if let Some(rem) = remote_reg {
+                if rem.fabric_rev > reg.fabric_rev {
+                    reg.fabric_rev = rem.fabric_rev;
+                }
+                for (k, rem_entry) in rem.repos {
+                    match reg.repos.get_mut(&k) {
+                        Some(existing) => {
+                            if existing.visibility.is_none() && rem_entry.visibility.is_some() {
+                                existing.visibility = rem_entry.visibility;
+                            }
+                            if existing.default_branch.is_none()
+                                && rem_entry.default_branch.is_some()
+                            {
+                                existing.default_branch = rem_entry.default_branch.clone();
+                            }
+                            if existing.submodules.is_empty() && !rem_entry.submodules.is_empty() {
+                                existing.submodules = rem_entry.submodules;
+                                existing.submodules_ref = rem_entry.submodules_ref;
+                            }
+                            if existing.stations.is_none() && rem_entry.stations.is_some() {
+                                existing.stations = rem_entry.stations;
+                            }
+                            for (b_key, b_val) in rem_entry.branches {
+                                existing.branches.insert(b_key, b_val);
+                            }
+                            for (d_key, d_val) in rem_entry.deleted_branches {
+                                existing.deleted_branches.insert(d_key, d_val);
+                            }
+                        }
+                        None => {
+                            reg.repos.insert(k, rem_entry);
+                        }
+                    }
+                }
+            }
+
+            // Also synthesize RepoEntry and feat/** BranchEntry sidings from branch_snapshots & jobs
+            let mut discovered_refs: Vec<(String, String, Option<String>)> = Vec::new();
+            for snap in &branch_snaps {
+                if is_safe_repo_name(&snap.repo_name) {
+                    let sha = snap
+                        .latest_active_json
+                        .as_deref()
+                        .or(snap.latest_completed_json.as_deref())
+                        .and_then(|s| serde_json::from_str::<JobRecord>(s).ok())
+                        .map(|r| r.job.commit_sha);
+                    discovered_refs.push((
+                        snap.repo_name.clone(),
+                        normalize_ref(&snap.ref_name).to_string(),
+                        sha,
+                    ));
+                }
+            }
+            for rec in &jobs {
+                if is_safe_repo_name(&rec.job.repo_name) {
+                    discovered_refs.push((
+                        rec.job.repo_name.clone(),
+                        normalize_ref(&rec.job.ref_name).to_string(),
+                        Some(rec.job.commit_sha.clone()).filter(|s| !s.is_empty()),
+                    ));
+                }
+            }
+
+            let now = Utc::now();
+            for (repo_full, ref_norm, sha_opt) in discovered_refs {
+                let Some((owner, repo)) = repo_full.split_once('/') else {
+                    continue;
+                };
+                let key = repo_key(owner, repo);
+                let entry = reg
+                    .repos
+                    .entry(key)
+                    .or_insert_with(|| RepoEntry::new(owner, repo));
+                let default_branch = entry.default_branch().to_string();
+                if ref_norm != default_branch
+                    && ref_norm.starts_with("feat/")
+                    && !entry.deleted_branches.contains_key(&ref_norm)
+                {
+                    let fork_stage = main_line_station(&jobs, &repo_full, &default_branch);
+                    entry
+                        .branches
+                        .entry(ref_norm.clone())
+                        .and_modify(|b| {
+                            if sha_opt.is_some() {
+                                b.head_sha = sha_opt.clone();
+                            }
+                            b.updated_at = now;
+                        })
+                        .or_insert_with(|| BranchEntry {
+                            ref_name: ref_norm,
+                            base_ref: default_branch,
+                            fork_stage,
+                            pr_state: PrState::None,
+                            pr_number: None,
+                            head_sha: sha_opt,
+                            created_at: now,
+                            updated_at: now,
+                        });
+                }
+            }
+
+            if bump_rev {
+                reg.bump();
+            }
+        }
+
+        self.warm_up(job_store).await;
+    }
 }
 
 /// Spawns the background reconciler that turns job / cluster changes into console
@@ -976,8 +1120,9 @@ pub fn spawn_reconciler(
     job_store: JobStore,
     cluster: ClusterRegistry,
 ) -> tokio::task::JoinHandle<()> {
+    console.attach_storage(Arc::clone(job_store.storage()));
     tokio::spawn(async move {
-        console.warm_up(&job_store).await;
+        console.sync_from_storage(&job_store, false).await;
         loop {
             console.reconcile(&job_store, &cluster).await;
             tokio::select! {

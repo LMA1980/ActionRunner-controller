@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use crate::job::{normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
 use crate::storage_backend::{
     compute_next_branch_snapshot, compute_next_submodule_snapshots,
-    resolve_direct_repo_from_snapshots, resolve_submodule_from_snapshots,
+    resolve_direct_repo_from_snapshots, resolve_submodule_from_snapshots, LeaderLease,
 };
 
 #[derive(Default)]
@@ -16,6 +16,9 @@ struct InMemoryCatalog {
     jobs: BTreeMap<String, CentralJobRecord>,
     branch_snapshots: BTreeMap<(String, String), CentralBranchSnapshot>,
     submodule_snapshots: BTreeMap<(String, String, String), CentralSubmoduleSnapshot>,
+    job_logs: BTreeMap<String, String>,
+    leader_lease: Option<LeaderLease>,
+    console_registry_json: Option<String>,
 }
 
 /// Pure-Rust in-memory state catalog for test harnesses and log metric extraction
@@ -344,6 +347,84 @@ impl CatalogStore {
         )
     }
 
+    /// Appends a log chunk for `job_id` in the in-memory catalog (`#83`).
+    pub fn append_job_log(&self, job_id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard
+            .job_logs
+            .entry(job_id.to_string())
+            .or_default()
+            .push_str(chunk);
+    }
+
+    /// Retrieves the full persisted execution log for `job_id` (`#83`, `#84`).
+    pub fn get_job_log(&self, job_id: &str) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        guard
+            .job_logs
+            .get(job_id)
+            .cloned()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Attempts to acquire or renew the single-leader lease for `holder_id` with `ttl_secs` (`#79`).
+    pub fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        let now_us = Utc::now().timestamp_micros();
+        let ttl_us = (ttl_secs.max(1) as i64).saturating_mul(1_000_000);
+        let epoch = match guard.leader_lease {
+            None => 1,
+            Some(ref lease) if lease.holder_id == holder_id => lease.epoch,
+            Some(ref lease) if force || lease.is_expired(now_us) => lease.epoch.saturating_add(1),
+            Some(_) => return false,
+        };
+        guard.leader_lease = Some(LeaderLease {
+            holder_id: holder_id.to_string(),
+            acquired_at_us: now_us,
+            expires_at_us: now_us.saturating_add(ttl_us),
+            epoch,
+        });
+        true
+    }
+
+    /// Releases the single-leader lease if held by `holder_id` (`#79`).
+    pub fn release_lease(&self, holder_id: &str) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let Some(ref mut lease) = guard.leader_lease {
+            if lease.holder_id == holder_id {
+                lease.expires_at_us = 0;
+            }
+        }
+    }
+
+    /// Returns the current [`LeaderLease`] state, if any (`#79`).
+    pub fn get_leader_lease(&self) -> Option<LeaderLease> {
+        let guard = self.inner.lock().ok()?;
+        guard.leader_lease.clone()
+    }
+
+    /// Saves the serialized `ConsoleState` registry JSON (`#82`).
+    pub fn save_console_registry(&self, registry_json: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.console_registry_json = Some(registry_json.to_string());
+        }
+    }
+
+    /// Loads the serialized `ConsoleState` registry JSON (`#82`).
+    pub fn load_console_registry(&self) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        guard.console_registry_json.clone()
+    }
+
     /// Scans `workspace_dir/logs/<owner>/<repo>/job-*.log` and imports any historical log files
     /// that were previously evicted from `jobs_index.json`, as well as enriching
     /// existing completed/failed records whose `metrics` or `metrics.submodules` were missing.
@@ -477,7 +558,7 @@ impl CatalogStore {
         ))
     }
 
-    fn extract_metrics_from_content_and_workspace(
+    pub fn extract_metrics_from_content_and_workspace(
         workspace_dir: &Path,
         repo_full: &str,
         content: &str,

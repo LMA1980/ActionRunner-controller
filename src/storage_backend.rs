@@ -63,8 +63,33 @@ impl StorageBackendMode {
     }
 }
 
+/// Distributed single-leader lease record persisted in [`ControllerStorage`] (`#79`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderLease {
+    /// Unique node identifier of the controller holding the lease (e.g. `"node-a"`).
+    pub holder_id: String,
+    /// Microseconds since UNIX epoch when the lease was acquired or renewed.
+    pub acquired_at_us: i64,
+    /// Microseconds since UNIX epoch when the lease expires if not renewed.
+    pub expires_at_us: i64,
+    /// Monotonically increasing fencing epoch incremented on each leader change.
+    pub epoch: u64,
+}
+
+impl LeaderLease {
+    /// Returns `true` if the lease has expired at `now_us`.
+    #[must_use]
+    pub const fn is_expired(&self, now_us: i64) -> bool {
+        now_us >= self.expires_at_us
+    }
+}
+
+const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
+const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
+const INTERNAL_CONSOLE_REPO_KEY: &str = "__ar_console_registry__";
+
 /// Abstract persistence interface for `ActionRunner-controller` job records, branch snapshots,
-/// submodule snapshots, and hardware-stratified regression gate queries (`#43`).
+/// submodule snapshots, shared job logs, single-leader leases, and hardware-stratified regression gate queries (`#43`, `#78`–`#84`).
 pub trait ControllerStorage: Send + Sync {
     /// Upserts a single [`JobRecord`] and synchronizes its branch and submodule snapshots.
     fn upsert_record(&self, record: &JobRecord);
@@ -130,6 +155,37 @@ pub trait ControllerStorage: Send + Sync {
         &self,
         _req: &RegressionGateRequest,
     ) -> Option<RegressionGateReport> {
+        None
+    }
+
+    /// Appends a log chunk for `job_id` into shared persistence (`#83`).
+    fn append_job_log(&self, _job_id: &str, _chunk: &str) {}
+
+    /// Retrieves the full persisted execution log for `job_id` from shared persistence (`#83`, `#84`).
+    fn get_job_log(&self, _job_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Attempts to acquire or renew the single-leader lease for `holder_id` with `ttl_secs`.
+    /// When `force` is `true`, takes over the lease even if another holder's lease has not yet expired
+    /// (used for explicit operator promotion). Returns `true` if `holder_id` holds the lease (`#79`).
+    fn try_acquire_or_renew_lease(&self, _holder_id: &str, _ttl_secs: u64, _force: bool) -> bool {
+        true
+    }
+
+    /// Releases the single-leader lease if currently held by `holder_id` (`#79`).
+    fn release_lease(&self, _holder_id: &str) {}
+
+    /// Returns the current [`LeaderLease`] state from shared storage, if any (`#79`).
+    fn get_leader_lease(&self) -> Option<LeaderLease> {
+        None
+    }
+
+    /// Persists the serialized `ConsoleState` registry JSON in shared storage (`#82`).
+    fn save_console_registry(&self, _registry_json: &str) {}
+
+    /// Loads the serialized `ConsoleState` registry JSON from shared storage (`#82`).
+    fn load_console_registry(&self) -> Option<String> {
         None
     }
 }
@@ -227,6 +283,35 @@ impl ControllerStorage for InMemoryStorage {
     ) -> (Option<JobRecord>, Option<JobRecord>) {
         self.store
             .find_submodule_card_context(parent_repo, submodule, branch)
+    }
+
+    fn append_job_log(&self, job_id: &str, chunk: &str) {
+        self.store.append_job_log(job_id, chunk);
+    }
+
+    fn get_job_log(&self, job_id: &str) -> Option<String> {
+        self.store.get_job_log(job_id)
+    }
+
+    fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {
+        self.store
+            .try_acquire_or_renew_lease(holder_id, ttl_secs, force)
+    }
+
+    fn release_lease(&self, holder_id: &str) {
+        self.store.release_lease(holder_id);
+    }
+
+    fn get_leader_lease(&self) -> Option<LeaderLease> {
+        self.store.get_leader_lease()
+    }
+
+    fn save_console_registry(&self, registry_json: &str) {
+        self.store.save_console_registry(registry_json);
+    }
+
+    fn load_console_registry(&self) -> Option<String> {
+        self.store.load_console_registry()
     }
 }
 
@@ -375,6 +460,7 @@ pub struct MuObserveRemoteStorage {
     config: MuObserveRemoteConfig,
     tls_client_config: Option<Arc<ClientConfig>>,
     seq: Arc<AtomicU64>,
+    log_buffer: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
 }
 
 impl MuObserveRemoteStorage {
@@ -399,7 +485,41 @@ impl MuObserveRemoteStorage {
             config,
             tls_client_config,
             seq: Arc::new(AtomicU64::new(1)),
+            log_buffer: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
+    }
+
+    fn query_internal_snapshot(
+        &self,
+        parent_repo_key: &str,
+        branch_key: &str,
+        submodule_key: &str,
+    ) -> Option<CentralSubmoduleSnapshot> {
+        let req = ControlRpcEnvelope::QuerySubmoduleSnapshotsReq(QuerySubmoduleSnapshotsRequest {
+            request_id: self.next_request_id("q-internal"),
+            parent_repo_key: Some(parent_repo_key.to_string()),
+            submodule_key: Some(submodule_key.to_ascii_lowercase()),
+            branch_key: Some(branch_key.to_string()),
+        });
+        match self.send_rpc_blocking(&req) {
+            Ok(ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(resp)) => {
+                resp.snapshots.into_iter().next()
+            }
+            _ => None,
+        }
+    }
+
+    fn upsert_internal_snapshot(&self, snap: CentralSubmoduleSnapshot) -> bool {
+        let req = ControlRpcEnvelope::UpsertJobBatchReq(UpsertJobBatchRequest {
+            request_id: self.next_request_id("u-internal"),
+            records: Vec::new(),
+            branch_snapshots: Vec::new(),
+            submodule_snapshots: vec![snap],
+        });
+        matches!(
+            self.send_rpc_blocking(&req),
+            Ok(ControlRpcEnvelope::UpsertJobRecordResp(ack)) if ack.accepted
+        )
     }
 
     fn next_seq(&self) -> u64 {
@@ -1092,7 +1212,11 @@ impl ControllerStorage for MuObserveRemoteStorage {
             branch_key: branch_key.map(|b| normalize_ref(b).to_ascii_lowercase()),
         });
         match self.send_rpc_blocking(&req) {
-            Ok(ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(resp)) => resp.snapshots,
+            Ok(ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(resp)) => resp
+                .snapshots
+                .into_iter()
+                .filter(|s| parent_repo_key.is_some() || !s.parent_repo_key.starts_with("__ar_"))
+                .collect(),
             Ok(other) => {
                 warn!("Unexpected RPC response for QuerySubmoduleSnapshotsReq: {other:?}");
                 Vec::new()
@@ -1179,6 +1303,159 @@ impl ControllerStorage for MuObserveRemoteStorage {
                 None
             }
         }
+    }
+
+    fn append_job_log(&self, job_id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let existing_remote = {
+            let guard = self.log_buffer.lock().ok();
+            let already_buffered = guard
+                .as_ref()
+                .map(|g| g.contains_key(&key))
+                .unwrap_or(false);
+            drop(guard);
+            if already_buffered {
+                None
+            } else {
+                self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key)
+                    .and_then(|s| s.latest_active_json)
+            }
+        };
+
+        let accumulated = {
+            let Ok(mut guard) = self.log_buffer.lock() else {
+                return;
+            };
+            let entry = guard
+                .entry(key.clone())
+                .or_insert_with(|| existing_remote.unwrap_or_default());
+            entry.push_str(chunk);
+            entry.clone()
+        };
+
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let _ = self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+            parent_repo_key: INTERNAL_LOG_REPO_KEY.to_string(),
+            branch_key: "log".to_string(),
+            submodule_key: key,
+            submodule_path_key: "log".to_string(),
+            latest_active_job_id: Some(job_id.to_string()),
+            latest_active_json: Some(accumulated),
+            latest_active_queued_us: Some(now_us),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        });
+    }
+
+    fn get_job_log(&self, job_id: &str) -> Option<String> {
+        let key = job_id.to_ascii_lowercase();
+        if let Some(snap) = self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key) {
+            if let Some(content) = snap.latest_active_json {
+                if !content.is_empty() {
+                    if let Ok(mut guard) = self.log_buffer.lock() {
+                        guard.insert(key, content.clone());
+                    }
+                    return Some(content);
+                }
+            }
+        }
+        self.log_buffer
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&key).cloned())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let ttl_us = (ttl_secs.max(1) as i64).saturating_mul(1_000_000);
+        let existing = self.get_leader_lease();
+        let epoch = match existing {
+            None => 1,
+            Some(ref lease) if lease.holder_id == holder_id => lease.epoch,
+            Some(ref lease) if force || lease.is_expired(now_us) => lease.epoch.saturating_add(1),
+            Some(_) => return false,
+        };
+
+        let next_lease = LeaderLease {
+            holder_id: holder_id.to_string(),
+            acquired_at_us: now_us,
+            expires_at_us: now_us.saturating_add(ttl_us),
+            epoch,
+        };
+        let Ok(json_str) = serde_json::to_string(&next_lease) else {
+            return false;
+        };
+
+        self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+            parent_repo_key: INTERNAL_LEASE_REPO_KEY.to_string(),
+            branch_key: "lease".to_string(),
+            submodule_key: "active_leader".to_string(),
+            submodule_path_key: "lease".to_string(),
+            latest_active_job_id: Some(holder_id.to_string()),
+            latest_active_json: Some(json_str),
+            latest_active_queued_us: Some(now_us),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        })
+    }
+
+    fn release_lease(&self, holder_id: &str) {
+        let Some(mut existing) = self.get_leader_lease() else {
+            return;
+        };
+        if existing.holder_id != holder_id {
+            return;
+        }
+        existing.expires_at_us = 0;
+        if let Ok(json_str) = serde_json::to_string(&existing) {
+            let _ = self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+                parent_repo_key: INTERNAL_LEASE_REPO_KEY.to_string(),
+                branch_key: "lease".to_string(),
+                submodule_key: "active_leader".to_string(),
+                submodule_path_key: "lease".to_string(),
+                latest_active_job_id: Some(holder_id.to_string()),
+                latest_active_json: Some(json_str),
+                latest_active_queued_us: Some(0),
+                latest_completed_job_id: None,
+                latest_completed_json: None,
+                latest_completed_queued_us: None,
+            });
+        }
+    }
+
+    fn get_leader_lease(&self) -> Option<LeaderLease> {
+        let snap =
+            self.query_internal_snapshot(INTERNAL_LEASE_REPO_KEY, "lease", "active_leader")?;
+        let json_str = snap.latest_active_json?;
+        serde_json::from_str::<LeaderLease>(&json_str).ok()
+    }
+
+    fn save_console_registry(&self, registry_json: &str) {
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let _ = self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+            parent_repo_key: INTERNAL_CONSOLE_REPO_KEY.to_string(),
+            branch_key: "console".to_string(),
+            submodule_key: "registry".to_string(),
+            submodule_path_key: "console".to_string(),
+            latest_active_job_id: Some("registry".to_string()),
+            latest_active_json: Some(registry_json.to_string()),
+            latest_active_queued_us: Some(now_us),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        });
+    }
+
+    fn load_console_registry(&self) -> Option<String> {
+        self.query_internal_snapshot(INTERNAL_CONSOLE_REPO_KEY, "console", "registry")
+            .and_then(|s| s.latest_active_json)
+            .filter(|s| !s.is_empty())
     }
 }
 
