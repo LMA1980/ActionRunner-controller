@@ -170,10 +170,14 @@ pub struct JobStore {
     notify: Arc<Notify>,
     max_history: usize,
     index_file: Option<PathBuf>,
+    ha_role: Arc<std::sync::RwLock<crate::config::HaRole>>,
+    node_id: String,
 }
 
 impl JobStore {
-    pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
+    fn default_storage(
+        workspace_dir: Option<&Path>,
+    ) -> Arc<dyn crate::storage_backend::ControllerStorage> {
         let local_catalog = Arc::new(crate::db::CatalogStore::new());
         if let Some(ws) = workspace_dir {
             local_catalog.backfill_from_logs_dir(ws);
@@ -183,7 +187,7 @@ impl JobStore {
             &local_catalog,
         )));
         let mode = crate::storage_backend::StorageBackendMode::from_env();
-        let storage: Arc<dyn crate::storage_backend::ControllerStorage> = match mode {
+        match mode {
             crate::storage_backend::StorageBackendMode::InMemory => in_memory_storage,
             crate::storage_backend::StorageBackendMode::MuObserveRemote => {
                 if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
@@ -201,9 +205,46 @@ impl JobStore {
                     in_memory_storage
                 }
             }
-        };
+        }
+    }
 
+    pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
+        let storage = Self::default_storage(workspace_dir);
         Self::with_storage(max_history, workspace_dir, storage)
+    }
+
+    pub fn from_config(max_history: usize, config: &crate::config::Config) -> Self {
+        let storage = Self::default_storage(Some(&config.workspace_dir));
+        Self::from_config_with_storage(max_history, config, storage)
+    }
+
+    pub fn from_config_with_storage(
+        max_history: usize,
+        config: &crate::config::Config,
+        db: Arc<dyn crate::storage_backend::ControllerStorage>,
+    ) -> Self {
+        let initial_role = match config.ha_role {
+            crate::config::HaRoleConfig::Leader => {
+                let _ =
+                    db.try_acquire_or_renew_lease(&config.node_id, config.lease_ttl_seconds, true);
+                crate::config::HaRole::Leader
+            }
+            crate::config::HaRoleConfig::Standby => crate::config::HaRole::Standby,
+            crate::config::HaRoleConfig::Auto => {
+                if db.try_acquire_or_renew_lease(&config.node_id, config.lease_ttl_seconds, false) {
+                    crate::config::HaRole::Leader
+                } else {
+                    crate::config::HaRole::Standby
+                }
+            }
+        };
+        Self::with_storage_and_role(
+            max_history,
+            Some(&config.workspace_dir),
+            db,
+            initial_role,
+            config.node_id.clone(),
+        )
     }
 
     pub fn with_storage(
@@ -211,71 +252,96 @@ impl JobStore {
         workspace_dir: Option<&Path>,
         db: Arc<dyn crate::storage_backend::ControllerStorage>,
     ) -> Self {
+        Self::with_storage_and_role(
+            max_history,
+            workspace_dir,
+            db,
+            crate::config::HaRole::Leader,
+            "node-a".to_string(),
+        )
+    }
+
+    pub fn with_storage_and_role(
+        max_history: usize,
+        workspace_dir: Option<&Path>,
+        db: Arc<dyn crate::storage_backend::ControllerStorage>,
+        initial_role: crate::config::HaRole,
+        node_id: String,
+    ) -> Self {
         let index_file = workspace_dir.map(|w| w.join("logs").join("jobs_index.json"));
         let notify = Arc::new(Notify::new());
+        let recover_running = initial_role.is_leader();
 
-        // 1. If migrating or starting up with a workspace_dir, import jobs_index.json into storage
-        if let Some(ref path) = index_file {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(mut jobs) = serde_json::from_str::<VecDeque<JobRecord>>(&content) {
-                        for rec in jobs.iter_mut() {
-                            if matches!(rec.status, JobStatus::Running { .. }) {
-                                rec.status = JobStatus::Queued;
-                                rec.updated_at = Utc::now();
-                                for stage in rec.stages.iter_mut() {
-                                    if matches!(
-                                        stage.status,
-                                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                                    ) {
-                                        stage.status = StageStatus::Pending;
-                                        stage.assigned_node = None;
+        // 1. When starting as Leader with a workspace_dir, import jobs_index.json into storage
+        if recover_running {
+            if let Some(ref path) = index_file {
+                if path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        if let Ok(mut jobs) = serde_json::from_str::<VecDeque<JobRecord>>(&content)
+                        {
+                            for rec in jobs.iter_mut() {
+                                if matches!(rec.status, JobStatus::Running { .. }) {
+                                    rec.status = JobStatus::Queued;
+                                    rec.updated_at = Utc::now();
+                                    for stage in rec.stages.iter_mut() {
+                                        if matches!(
+                                            stage.status,
+                                            StageStatus::Assigned { .. }
+                                                | StageStatus::Running { .. }
+                                        ) {
+                                            stage.status = StageStatus::Pending;
+                                            stage.assigned_node = None;
+                                        }
                                     }
                                 }
                             }
+                            // Upsert oldest-first into storage
+                            let chronological: Vec<JobRecord> =
+                                jobs.iter().rev().cloned().collect();
+                            db.upsert_records_batch(&chronological);
+                            info!(
+                                "Synchronized {} job records from {} into ControllerStorage",
+                                jobs.len(),
+                                path.display()
+                            );
                         }
-                        // Upsert oldest-first into storage
-                        let chronological: Vec<JobRecord> = jobs.iter().rev().cloned().collect();
-                        db.upsert_records_batch(&chronological);
-                        info!(
-                            "Synchronized {} job records from {} into ControllerStorage",
-                            jobs.len(),
-                            path.display()
-                        );
                     }
                 }
             }
         }
 
-        // 2. Load recent jobs from storage into the active in-memory queue
+        // 2. Load recent jobs from storage into the active in-memory queue.
+        // In Standby mode, preserve Running statuses without mutating ControllerStorage.
         let mut initial_jobs: VecDeque<JobRecord> =
             db.load_recent_jobs(max_history).into_iter().collect();
-        let mut has_queued = false;
-        let mut recovered_running = Vec::new();
-        for rec in initial_jobs.iter_mut() {
-            if matches!(rec.status, JobStatus::Running { .. }) {
-                rec.status = JobStatus::Queued;
-                rec.updated_at = Utc::now();
-                for stage in rec.stages.iter_mut() {
-                    if matches!(
-                        stage.status,
-                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                    ) {
-                        stage.status = StageStatus::Pending;
-                        stage.assigned_node = None;
+        if recover_running {
+            let mut has_queued = false;
+            let mut recovered_running = Vec::new();
+            for rec in initial_jobs.iter_mut() {
+                if matches!(rec.status, JobStatus::Running { .. }) {
+                    rec.status = JobStatus::Queued;
+                    rec.updated_at = Utc::now();
+                    for stage in rec.stages.iter_mut() {
+                        if matches!(
+                            stage.status,
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                        ) {
+                            stage.status = StageStatus::Pending;
+                            stage.assigned_node = None;
+                        }
                     }
+                    recovered_running.push(rec.clone());
                 }
-                recovered_running.push(rec.clone());
+                if matches!(rec.status, JobStatus::Queued) {
+                    has_queued = true;
+                }
             }
-            if matches!(rec.status, JobStatus::Queued) {
-                has_queued = true;
+            if !recovered_running.is_empty() {
+                db.upsert_records_batch(&recovered_running);
             }
-        }
-        if !recovered_running.is_empty() {
-            db.upsert_records_batch(&recovered_running);
-        }
-        if has_queued {
-            notify.notify_waiters();
+            if has_queued {
+                notify.notify_waiters();
+            }
         }
 
         Self {
@@ -284,7 +350,117 @@ impl JobStore {
             notify,
             max_history,
             index_file,
+            ha_role: Arc::new(std::sync::RwLock::new(initial_role)),
+            node_id,
         }
+    }
+
+    #[must_use]
+    pub fn ha_role(&self) -> crate::config::HaRole {
+        self.ha_role
+            .read()
+            .map(|g| *g)
+            .unwrap_or(crate::config::HaRole::Leader)
+    }
+
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.ha_role().is_leader()
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn set_ha_role(&self, role: crate::config::HaRole) {
+        if let Ok(mut guard) = self.ha_role.write() {
+            *guard = role;
+        }
+        if role.is_leader() {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn append_job_log(&self, job_id: &str, chunk: &str) {
+        self.db.append_job_log(job_id, chunk);
+    }
+
+    #[must_use]
+    pub fn get_job_log(&self, job_id: &str) -> Option<String> {
+        self.db.get_job_log(job_id)
+    }
+
+    /// Re-hydrates the in-memory job queue from [`ControllerStorage`] (`#81`).
+    ///
+    /// - When `recover_running` is `false` (periodic standby sync), refreshes `self.inner`
+    ///   without altering `JobStatus::Running` jobs in storage.
+    /// - When `recover_running` is `true` (standby promotion to leader), resets any interrupted
+    ///   `JobStatus::Running` jobs (and `Assigned`/`Running` stages) back to `JobStatus::Queued`
+    ///   (`StageStatus::Pending`), persists the recovered records to storage, and wakes the scheduler.
+    pub async fn rehydrate_from_storage(&self, recover_running: bool) -> usize {
+        let remote_jobs = self.db.load_recent_jobs(self.max_history);
+        let mut recovered_for_db = Vec::new();
+        let mut has_queued = false;
+        let count;
+
+        {
+            let mut store = self.inner.write().await;
+            let mut by_id: BTreeMap<String, JobRecord> = BTreeMap::new();
+            for rec in store.iter() {
+                by_id.insert(rec.job.id.clone(), rec.clone());
+            }
+            for rec in remote_jobs {
+                by_id.insert(rec.job.id.clone(), rec);
+            }
+
+            let mut merged: Vec<JobRecord> = by_id.into_values().collect();
+            merged.sort_by(|a, b| {
+                b.job
+                    .queued_at
+                    .cmp(&a.job.queued_at)
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+            merged.truncate(self.max_history);
+
+            if recover_running {
+                let now = Utc::now();
+                for rec in &mut merged {
+                    if matches!(rec.status, JobStatus::Running { .. }) {
+                        rec.status = JobStatus::Queued;
+                        rec.updated_at = now;
+                        for stage in &mut rec.stages {
+                            if matches!(
+                                stage.status,
+                                StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                            ) {
+                                stage.status = StageStatus::Pending;
+                                stage.assigned_node = None;
+                            }
+                        }
+                        recovered_for_db.push(rec.clone());
+                    }
+                    if matches!(rec.status, JobStatus::Queued) {
+                        has_queued = true;
+                    }
+                }
+            }
+
+            count = merged.len();
+            *store = merged.into_iter().collect();
+        }
+
+        if !recovered_for_db.is_empty() {
+            self.db.upsert_records_batch(&recovered_for_db);
+        }
+        if recover_running {
+            self.persist().await;
+            if has_queued || !recovered_for_db.is_empty() {
+                self.notify.notify_waiters();
+            }
+        }
+
+        count
     }
 
     pub fn storage(&self) -> &Arc<dyn crate::storage_backend::ControllerStorage> {
@@ -535,7 +711,11 @@ impl JobStore {
 
     /// Atomically claims the oldest `Queued` job in FIFO order that respects global concurrency bounds
     /// and ensures strict single-pipeline serialization per repository.
+    /// Returns `None` immediately when the controller is in `Standby` mode (`#80`).
     pub async fn claim_next_queued_job(&self, max_concurrent: usize) -> Option<Job> {
+        if !self.is_leader() {
+            return None;
+        }
         let claimed = {
             let mut store = self.inner.write().await;
             let now = Utc::now();

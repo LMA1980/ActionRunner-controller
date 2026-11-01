@@ -135,6 +135,7 @@ on_action:
         allow_insecure_no_secret: true,
         max_concurrent_jobs: 2,
         github_token: None,
+        ..Config::default()
     };
 
     let job_store = JobStore::new(100, Some(&ws_path));
@@ -440,6 +441,7 @@ edition = "2021"
         allow_insecure_no_secret: true,
         max_concurrent_jobs: 6,
         github_token: None,
+        ..Config::default()
     };
 
     let job_store = JobStore::new(100, Some(&ws_path));
@@ -793,6 +795,7 @@ edition = "2021"
         allow_insecure_no_secret: true,
         max_concurrent_jobs: 4,
         github_token: None,
+        ..Config::default()
     };
 
     let job_store = JobStore::new(100, Some(&ws_path));

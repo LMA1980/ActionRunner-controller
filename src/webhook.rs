@@ -35,11 +35,104 @@ pub struct AppState {
 
 impl AppState {
     pub fn broadcast_log(&self, job_id: &str, chunk: &str) {
+        self.job_store.append_job_log(job_id, chunk);
         let _ = self.log_broadcaster.send(LogBroadcast {
             job_id: job_id.to_string(),
             chunk: chunk.to_string(),
         });
     }
+
+    /// Explicitly promotes this controller instance to `Leader`, acquiring the
+    /// single-leader lease in [`crate::storage_backend::ControllerStorage`],
+    /// re-hydrating and recovering any interrupted `Running` jobs into `Queued`
+    /// (`StageStatus::Pending`), and refreshing `ConsoleState` (`#79`–`#82`).
+    pub async fn promote_to_leader(&self) -> usize {
+        let _ = self.job_store.storage().try_acquire_or_renew_lease(
+            &self.config.node_id,
+            self.config.lease_ttl_seconds,
+            true,
+        );
+        self.job_store.set_ha_role(crate::config::HaRole::Leader);
+        let count = self.job_store.rehydrate_from_storage(true).await;
+        self.console.sync_from_storage(&self.job_store, true).await;
+        self.console.reconcile(&self.job_store, &self.cluster).await;
+        info!(
+            node_id = %self.config.node_id,
+            rehydrated_jobs = count,
+            "Controller promoted to Active Leader"
+        );
+        count
+    }
+
+    /// Demotes this controller instance to `Standby`, releasing the single-leader
+    /// lease if held and synchronizing passive read-only state (`#79`–`#82`).
+    pub async fn demote_to_standby(&self) -> usize {
+        self.job_store.set_ha_role(crate::config::HaRole::Standby);
+        self.job_store.storage().release_lease(&self.config.node_id);
+        let count = self.job_store.rehydrate_from_storage(false).await;
+        self.console.sync_from_storage(&self.job_store, false).await;
+        info!(
+            node_id = %self.config.node_id,
+            rehydrated_jobs = count,
+            "Controller demoted to Hot Standby"
+        );
+        count
+    }
+
+    /// Executes a single High-Availability coordinator tick (`#79`–`#82`).
+    ///
+    /// - If `Leader`: renews the single-leader lease; if another node has forcibly
+    ///   taken over the lease in `Auto` mode, yields to `Standby`.
+    /// - If `Standby`: refreshes `JobStore` (`recover_running = false`) and `ConsoleState`
+    ///   from `ControllerStorage`; if `config.ha_role == HaRoleConfig::Auto` and the
+    ///   primary lease has expired, automatically promotes to `Leader`.
+    pub async fn tick_ha_coordinator(&self) {
+        if self.job_store.is_leader() {
+            let renewed = self.job_store.storage().try_acquire_or_renew_lease(
+                &self.config.node_id,
+                self.config.lease_ttl_seconds,
+                false,
+            );
+            if !renewed && self.config.ha_role == crate::config::HaRoleConfig::Auto {
+                if let Some(lease) = self.job_store.storage().get_leader_lease() {
+                    let now_us = Utc::now().timestamp_micros();
+                    if lease.holder_id != self.config.node_id && !lease.is_expired(now_us) {
+                        warn!(
+                            node_id = %self.config.node_id,
+                            new_leader = %lease.holder_id,
+                            epoch = lease.epoch,
+                            "Another controller holds a newer active leader lease; stepping down to Standby"
+                        );
+                        self.job_store.set_ha_role(crate::config::HaRole::Standby);
+                    }
+                }
+            }
+        } else {
+            let _ = self.job_store.rehydrate_from_storage(false).await;
+            self.console.sync_from_storage(&self.job_store, false).await;
+            if self.config.ha_role == crate::config::HaRoleConfig::Auto
+                && self.job_store.storage().try_acquire_or_renew_lease(
+                    &self.config.node_id,
+                    self.config.lease_ttl_seconds,
+                    false,
+                )
+            {
+                let _ = self.promote_to_leader().await;
+            }
+        }
+    }
+}
+
+/// Spawns the background High-Availability coordinator task (`#79`–`#82`).
+pub fn spawn_ha_coordinator(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    let interval_secs = state.config.standby_sync_seconds.max(1);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            ticker.tick().await;
+            state.tick_ha_coordinator().await;
+        }
+    })
 }
 
 pub fn verify_signature(secret: &str, signature_header: &str, body: &[u8]) -> bool {
@@ -571,6 +664,7 @@ mod tests {
             log_api_key: None,
             max_concurrent_jobs: 2,
             github_token: None,
+            ..Config::default()
         };
         let job_store = JobStore::new(10, None);
         let cluster = crate::cluster::ClusterRegistry::new();

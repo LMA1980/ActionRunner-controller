@@ -112,6 +112,7 @@ async fn test_job_card_svg_route_and_headers() {
         allow_insecure_no_secret: true,
         max_concurrent_jobs: 2,
         github_token: None,
+        ..Config::default()
     };
 
     let job_store = JobStore::new(100, None);
@@ -213,6 +214,7 @@ async fn test_sse_dashboard_and_job_events_push() {
         log_api_key: None,
         max_concurrent_jobs: 2,
         github_token: None,
+        ..Config::default()
     };
 
     let job_store = JobStore::new(10, Some(tmp_ws.path()));

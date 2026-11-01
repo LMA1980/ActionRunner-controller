@@ -35,7 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("GitHub Webhook HMAC signature verification: STRICT (incoming webhooks will be rejected until GITHUB_WEBHOOK_SECRET is set)");
     }
 
-    let job_store = JobStore::new(100, Some(&config.workspace_dir));
+    let job_store = JobStore::from_config(100, &config);
+    info!(
+        node_id = %config.node_id,
+        ha_policy = %config.ha_role.as_str(),
+        initial_role = %job_store.ha_role().as_str(),
+        "Initialized JobStore HA role"
+    );
     let cluster = ClusterRegistry::new();
     let (tx, _rx) = mpsc::channel(32);
 
@@ -59,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_broadcaster,
         console,
     });
+    action_runner_controller::webhook::spawn_ha_coordinator(state.clone());
 
     let app = create_router(state);
 

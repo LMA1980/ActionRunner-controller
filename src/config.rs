@@ -1,5 +1,65 @@
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+/// Configured High-Availability role policy for a controller instance (`#78`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HaRoleConfig {
+    /// Automatically acquires or renews the single-leader lease in `ControllerStorage`;
+    /// starts in `standby` if another node holds a valid lease, and promotes to `leader`
+    /// when the primary lease expires.
+    Auto,
+    /// Explicitly starts as the active `leader`.
+    #[default]
+    Leader,
+    /// Explicitly starts as a hot `standby` replica (does not claim jobs until promoted).
+    Standby,
+}
+
+impl HaRoleConfig {
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "standby" | "follower" | "backup" => Self::Standby,
+            _ => Self::Leader,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Leader => "leader",
+            Self::Standby => "standby",
+        }
+    }
+}
+
+/// Runtime High-Availability role of a controller instance (`#78`–`#80`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HaRole {
+    #[default]
+    Leader,
+    Standby,
+}
+
+impl HaRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Standby => "standby",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_leader(self) -> bool {
+        matches!(self, Self::Leader)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +76,38 @@ pub struct Config {
     pub allow_insecure_no_secret: bool,
     pub max_concurrent_jobs: usize,
     pub github_token: Option<String>,
+    pub node_id: String,
+    pub ha_role: HaRoleConfig,
+    pub lease_ttl_seconds: u64,
+    pub standby_sync_seconds: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:8000".to_string(),
+            workspace_dir: PathBuf::from(format!("/var/lib/{}-runner/workspace", "action")),
+            allowed_repositories: vec!["LMA1980/*".to_string()],
+            allowed_actors: vec!["*".to_string()],
+            allow_fork_prs: false,
+            allowed_pr_authors: vec![
+                "OWNER".to_string(),
+                "MEMBER".to_string(),
+                "COLLABORATOR".to_string(),
+            ],
+            log_api_key: None,
+            webhook_secret: None,
+            cluster_token: "actionrunner_default_cluster_token".to_string(),
+            job_timeout_seconds: 1800,
+            allow_insecure_no_secret: false,
+            max_concurrent_jobs: 6,
+            github_token: None,
+            node_id: "node-a".to_string(),
+            ha_role: HaRoleConfig::Leader,
+            lease_ttl_seconds: 15,
+            standby_sync_seconds: 5,
+        }
+    }
 }
 
 impl Config {
@@ -74,6 +166,28 @@ impl Config {
 
         let github_token = Self::resolve_secret("GITHUB_TOKEN");
 
+        let node_id = std::env::var("ACTION_RUNNER_NODE_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "node-a".to_string());
+
+        let ha_role = std::env::var("ACTION_RUNNER_HA_ROLE")
+            .map(|s| HaRoleConfig::parse(&s))
+            .unwrap_or(HaRoleConfig::Leader);
+
+        let lease_ttl_seconds = std::env::var("ACTION_RUNNER_LEASE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(15);
+
+        let standby_sync_seconds = std::env::var("ACTION_RUNNER_STANDBY_SYNC_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(5);
+
         Self {
             bind_addr,
             workspace_dir,
@@ -88,6 +202,10 @@ impl Config {
             allow_insecure_no_secret,
             max_concurrent_jobs,
             github_token,
+            node_id,
+            ha_role,
+            lease_ttl_seconds,
+            standby_sync_seconds,
         }
     }
 
@@ -257,5 +375,31 @@ mod tests {
             "Environment variable pointing to nonexistent path must fail closed"
         );
         std::env::remove_var(var_name);
+    }
+
+    #[test]
+    fn test_ha_role_config_parse_and_defaults() {
+        assert_eq!(HaRoleConfig::parse("auto"), HaRoleConfig::Auto);
+        assert_eq!(HaRoleConfig::parse("AUTO"), HaRoleConfig::Auto);
+        assert_eq!(HaRoleConfig::parse("standby"), HaRoleConfig::Standby);
+        assert_eq!(HaRoleConfig::parse("follower"), HaRoleConfig::Standby);
+        assert_eq!(HaRoleConfig::parse("backup"), HaRoleConfig::Standby);
+        assert_eq!(HaRoleConfig::parse("leader"), HaRoleConfig::Leader);
+        assert_eq!(HaRoleConfig::parse("unknown"), HaRoleConfig::Leader);
+
+        assert_eq!(HaRoleConfig::Auto.as_str(), "auto");
+        assert_eq!(HaRoleConfig::Leader.as_str(), "leader");
+        assert_eq!(HaRoleConfig::Standby.as_str(), "standby");
+
+        assert!(HaRole::Leader.is_leader());
+        assert!(!HaRole::Standby.is_leader());
+        assert_eq!(HaRole::Leader.as_str(), "leader");
+        assert_eq!(HaRole::Standby.as_str(), "standby");
+
+        let default_cfg = Config::default();
+        assert_eq!(default_cfg.node_id, "node-a");
+        assert_eq!(default_cfg.ha_role, HaRoleConfig::Leader);
+        assert_eq!(default_cfg.lease_ttl_seconds, 15);
+        assert_eq!(default_cfg.standby_sync_seconds, 5);
     }
 }

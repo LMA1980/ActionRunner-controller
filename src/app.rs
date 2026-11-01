@@ -34,6 +34,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/jobs/{id}/log", get(get_job_log))
         .route("/api/jobs/{id}/log", get(get_job_log))
+        .route("/jobs/{id}/logs", get(get_job_log))
+        .route("/api/jobs/{id}/logs", get(get_job_log))
         .route("/jobs/{id}/card.svg", get(get_job_card))
         .route("/api/jobs/{id}/card.svg", get(get_job_card))
         .route("/jobs/{id}/resume", post(resume_job_handler))
@@ -60,8 +62,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/repos/{owner}/{repo}/topology",
             get(crate::console::api::repo_topology),
         )
-        // Cluster Fabric Nodes & Tunnel
+        // Cluster Fabric Nodes, Status, HA Failover & Tunnel
         .route("/api/cluster/nodes", get(get_cluster_nodes))
+        .route("/cluster/status", get(get_cluster_status))
+        .route("/api/cluster/status", get(get_cluster_status))
+        .route("/ha/status", get(get_ha_status))
+        .route("/api/ha/status", get(get_ha_status))
+        .route("/ha/promote", post(promote_ha_handler))
+        .route("/api/ha/promote", post(promote_ha_handler))
+        .route("/ha/demote", post(demote_ha_handler))
+        .route("/api/ha/demote", post(demote_ha_handler))
         .route(
             "/api/cluster/tunnel",
             get(crate::tunnel::handle_cluster_tunnel),
@@ -173,6 +183,8 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Response {
             "service": "ActionRunner-rs",
             "arch": "riscv64",
             "version": env!("CARGO_PKG_VERSION"),
+            "controller_id": state.config.node_id,
+            "ha_role": state.job_store.ha_role().as_str(),
             "queue_status": snap.status,
             "queue_depth": snap.queue_depth,
             "concurrency": snap.concurrency
@@ -188,6 +200,73 @@ pub async fn get_queue(State(state): State<Arc<AppState>>) -> Response {
 pub async fn get_cluster_nodes(State(state): State<Arc<AppState>>) -> Response {
     let nodes = state.cluster.list_nodes_view().await;
     json_response(StatusCode::OK, serde_json::to_value(nodes).unwrap())
+}
+
+pub async fn get_cluster_status(State(state): State<Arc<AppState>>) -> Response {
+    let nodes = state.cluster.list_nodes_view().await;
+    let online_nodes = nodes.iter().filter(|n| n.is_online).count();
+    let snap = state.job_store.queue_snapshot().await;
+    let lease = state.job_store.storage().get_leader_lease();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": "ok",
+            "controller_id": state.config.node_id,
+            "ha_role": state.job_store.ha_role().as_str(),
+            "ha_policy": state.config.ha_role.as_str(),
+            "leader_lease": lease,
+            "queue_status": snap.status,
+            "queue_depth": snap.queue_depth,
+            "online_nodes": online_nodes,
+            "nodes": nodes
+        }),
+    )
+}
+
+pub async fn get_ha_status(State(state): State<Arc<AppState>>) -> Response {
+    let lease = state.job_store.storage().get_leader_lease();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": "ok",
+            "controller_id": state.config.node_id,
+            "ha_role": state.job_store.ha_role().as_str(),
+            "ha_policy": state.config.ha_role.as_str(),
+            "lease_ttl_seconds": state.config.lease_ttl_seconds,
+            "standby_sync_seconds": state.config.standby_sync_seconds,
+            "leader_lease": lease,
+        }),
+    )
+}
+
+pub async fn promote_ha_handler(State(state): State<Arc<AppState>>) -> Response {
+    let rehydrated = state.promote_to_leader().await;
+    let lease = state.job_store.storage().get_leader_lease();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": "ok",
+            "controller_id": state.config.node_id,
+            "ha_role": state.job_store.ha_role().as_str(),
+            "rehydrated_jobs": rehydrated,
+            "leader_lease": lease,
+        }),
+    )
+}
+
+pub async fn demote_ha_handler(State(state): State<Arc<AppState>>) -> Response {
+    let rehydrated = state.demote_to_standby().await;
+    let lease = state.job_store.storage().get_leader_lease();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "status": "ok",
+            "controller_id": state.config.node_id,
+            "ha_role": state.job_store.ha_role().as_str(),
+            "rehydrated_jobs": rehydrated,
+            "leader_lease": lease,
+        }),
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -337,7 +416,7 @@ pub async fn get_job_log(
             .into_response();
     }
     match tokio::fs::read_to_string(&full_path).await {
-        Ok(content) => (
+        Ok(content) if !content.is_empty() => (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
@@ -347,14 +426,27 @@ pub async fn get_job_log(
             content,
         )
             .into_response(),
-        Err(_) => match &record.status {
-            JobStatus::Queued => {
-                let pos = state
-                    .job_store
-                    .job_queue_position(&job_id)
-                    .await
-                    .unwrap_or(1);
-                let msg = format!(
+        _ => {
+            if let Some(shared_log) = state.job_store.get_job_log(&job_id) {
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                    ],
+                    shared_log,
+                )
+                    .into_response();
+            }
+            match &record.status {
+                JobStatus::Queued => {
+                    let pos = state
+                        .job_store
+                        .job_queue_position(&job_id)
+                        .await
+                        .unwrap_or(1);
+                    let msg = format!(
                     "[ActionRunner-rs] Job '{}' is currently QUEUED (position #{}) waiting for an available worker.\nRepository: {}\nRef:        {}\nCommit SHA: {}\nQueued At:  {}\n",
                     record.job.id,
                     pos,
@@ -363,19 +455,19 @@ pub async fn get_job_log(
                     record.job.commit_sha,
                     record.job.queued_at.to_rfc3339()
                 );
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
-                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                    ],
-                    msg,
-                )
-                    .into_response()
-            }
-            JobStatus::Skipped { reason } => {
-                let msg = format!(
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                        ],
+                        msg,
+                    )
+                        .into_response()
+                }
+                JobStatus::Skipped { reason } => {
+                    let msg = format!(
                     "[ActionRunner-rs] Job '{}' was SKIPPED before execution.\nReason:     {}\nRepository: {}\nRef:        {}\nCommit SHA: {}\nQueued At:  {}\n",
                     record.job.id,
                     reason,
@@ -384,27 +476,27 @@ pub async fn get_job_log(
                     record.job.commit_sha,
                     record.job.queued_at.to_rfc3339()
                 );
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
-                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                    ],
-                    msg,
-                )
-                    .into_response()
-            }
-            JobStatus::Running { started_at } => {
-                let mut stage_info = String::new();
-                for s in &record.stages {
-                    let node_str = s.assigned_node.as_deref().unwrap_or("unassigned");
-                    stage_info.push_str(&format!(
-                        "  - {} (id: {}): {:?} [node: {}]\n",
-                        s.name, s.id, s.status, node_str
-                    ));
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                        ],
+                        msg,
+                    )
+                        .into_response()
                 }
-                let msg = format!(
+                JobStatus::Running { started_at } => {
+                    let mut stage_info = String::new();
+                    for s in &record.stages {
+                        let node_str = s.assigned_node.as_deref().unwrap_or("unassigned");
+                        stage_info.push_str(&format!(
+                            "  - {} (id: {}): {:?} [node: {}]\n",
+                            s.name, s.id, s.status, node_str
+                        ));
+                    }
+                    let msg = format!(
                     "[ActionRunner-rs] Job '{}' is currently EXECUTING across cluster.\nRepository: {}\nRef:        {}\nCommit SHA: {}\nStarted At: {}\n\nActive Pipeline Stages:\n{}",
                     record.job.id,
                     record.job.repo_name,
@@ -413,52 +505,53 @@ pub async fn get_job_log(
                     started_at.to_rfc3339(),
                     stage_info
                 );
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
-                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                    ],
-                    msg,
-                )
-                    .into_response()
-            }
-            JobStatus::Completed {
-                duration_secs,
-                exit_code,
-            } => {
-                let msg = format!(
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                        ],
+                        msg,
+                    )
+                        .into_response()
+                }
+                JobStatus::Completed {
+                    duration_secs,
+                    exit_code,
+                } => {
+                    let msg = format!(
                     "[ActionRunner-rs] Job '{}' completed in {}s with exit code {}.\nLog file was empty or has finished recording.",
                     record.job.id,
                     duration_secs,
                     exit_code
                 );
-                (
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                        ],
+                        msg,
+                    )
+                        .into_response()
+                }
+                _ => (
                     StatusCode::OK,
                     [
                         (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
                         (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
                         (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
                     ],
-                    msg,
-                )
-                    .into_response()
-            }
-            _ => (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
-                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                ],
-                format!(
+                    format!(
                     "[ActionRunner-rs] Job '{}' log is initializing...\nRepository: {}\nRef: {}\n",
                     record.job.id, record.job.repo_name, record.job.ref_name
                 ),
-            )
-                .into_response(),
-        },
+                )
+                    .into_response(),
+            }
+        }
     }
 }
 
@@ -1176,9 +1269,10 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
     };
 
     let full_path = state.config.workspace_dir.join(&initial_job.log_file);
-    let initial_log = tokio::fs::read_to_string(&full_path)
-        .await
-        .unwrap_or_default();
+    let initial_log = match tokio::fs::read_to_string(&full_path).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => state.job_store.get_job_log(&job_id).unwrap_or_default(),
+    };
 
     let mut log_rx = state.log_broadcaster.subscribe();
     let jid = job_id.clone();
