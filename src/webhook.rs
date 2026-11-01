@@ -29,6 +29,8 @@ pub struct AppState {
     pub cluster: crate::cluster::ClusterRegistry,
     pub tx: mpsc::Sender<Job>,
     pub log_broadcaster: broadcast::Sender<LogBroadcast>,
+    /// Read-only console registry (repos, submodules, topology, console SSE kinds).
+    pub console: crate::console::ConsoleState,
 }
 
 impl AppState {
@@ -185,7 +187,14 @@ pub async fn handle_webhook(
         ));
     }
 
-    // 6. Handle Specific GitHub Events
+    // 6. Record repository / branch / pull-request topology for the console (read-only,
+    //    never affects the webhook outcome).
+    state
+        .console
+        .observe_webhook(&event, &payload, &state.job_store)
+        .await;
+
+    // 7. Handle Specific GitHub Events
     if event == "ping" {
         info!(repo = %repo_name, "GitHub ping event received");
         return Ok((
@@ -573,6 +582,7 @@ mod tests {
                 cluster,
                 tx,
                 log_broadcaster,
+                console: crate::console::ConsoleState::default(),
             }),
             rx,
         )

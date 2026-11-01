@@ -50,6 +50,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/jobs/{id}/submodules/{submodule}/card.svg",
             get(get_job_submodule_card),
         )
+        // Read-only console API (MuConsole)
+        .route("/api/repos", get(crate::console::api::list_repos))
+        .route(
+            "/api/repos/{owner}/{repo}/summary",
+            get(crate::console::api::repo_summary),
+        )
+        .route(
+            "/api/repos/{owner}/{repo}/topology",
+            get(crate::console::api::repo_topology),
+        )
         // Cluster Fabric Nodes & Tunnel
         .route("/api/cluster/nodes", get(get_cluster_nodes))
         .route(
@@ -1028,7 +1038,9 @@ pub async fn handle_events(
         }
     }
 
-    stream_dashboard_events(state)
+    // Reaching this point with a configured key means the caller presented it.
+    let authenticated = state.config.log_api_key.is_some();
+    stream_dashboard_events(state, authenticated)
 }
 
 pub async fn handle_job_events(
@@ -1067,7 +1079,12 @@ pub async fn handle_job_events(
     stream_job_events(state, job_id).await
 }
 
-fn stream_dashboard_events(state: Arc<AppState>) -> Response {
+/// Dashboard SSE stream. Existing kinds (`queue`, `jobs`, `cluster`) are unchanged; the
+/// additive console kinds (`branch_created`, `branch_deleted`, `pr_state_changed`,
+/// `job_stage_changed`, `node_membership_changed`) are interleaved as they occur.
+/// Console events about private repositories are only sent to authenticated streams.
+fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Response {
+    let mut console_rx = state.console.subscribe();
     let stream = async_stream::stream! {
         // 1. Initial snapshot push
         let snap = state.job_store.queue_snapshot().await;
@@ -1086,22 +1103,40 @@ fn stream_dashboard_events(state: Arc<AppState>) -> Response {
         }
 
         // 2. Continuous notification loop
+        let mut console_open = true;
         loop {
-            state.job_store.wait_for_event().await;
+            tokio::select! {
+                _ = state.job_store.wait_for_event() => {
+                    let snap = state.job_store.queue_snapshot().await;
+                    if let Ok(data) = serde_json::to_string(&snap) {
+                        yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
+                    }
 
-            let snap = state.job_store.queue_snapshot().await;
-            if let Ok(data) = serde_json::to_string(&snap) {
-                yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
-            }
+                    let jobs = state.job_store.list_jobs().await;
+                    if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
+                        yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
+                    }
 
-            let jobs = state.job_store.list_jobs().await;
-            if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
-                yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
-            }
-
-            let cluster = state.cluster.list_nodes_view().await;
-            if let Ok(data) = serde_json::to_string(&cluster) {
-                yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
+                    let cluster = state.cluster.list_nodes_view().await;
+                    if let Ok(data) = serde_json::to_string(&cluster) {
+                        yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
+                    }
+                }
+                recv = console_rx.recv(), if console_open => {
+                    match recv {
+                        Ok(ev) => {
+                            if ev.public || authenticated {
+                                yield Ok::<_, Infallible>(
+                                    Event::default().event(ev.kind.as_str()).data(ev.data.to_string()),
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            console_open = false;
+                        }
+                    }
+                }
             }
         }
     };
