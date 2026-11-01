@@ -26,6 +26,8 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 - **Factory Pipeline Quality Scoring**: Computes letter grade (`A+` to `F`), pass ratios, coverage summaries, advisories, and micro-benchmarks across submodules.
 - **Vectorized SVG Badges & Cards**: Serves dynamic SVG badges (`/badges/*`, pinned to the last completed `Success`/`Failed` build) and live multi-metric scorecard cards (`/cards/*`, showing live `queued`/`running`/`passing`/`failing` status while retaining and attributing the previous completed execution's score and metrics during active builds).
 
+- **Read-only Console API**: `GET /api/repos` (with the `.gitmodules` submodule/parent graph), `GET /api/repos/{owner}/{repo}/summary`, `GET /api/repos/{owner}/{repo}/topology` (branches, stations, trains, `fabric_rev`), and additive SSE kinds on `/api/events` for MuConsole. Private repositories are only served to requests that present the API key. See [docs/console-api.md](docs/console-api.md).
+
 ## License
 
 Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See LICENSE for details.
