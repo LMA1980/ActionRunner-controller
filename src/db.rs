@@ -276,7 +276,7 @@ impl DuckDbStore {
 
         if is_skipped {
             // Skipped jobs are ignored by both pills and scorecards.
-            // If this job was previously the active job on this branch, fallback to the newest non-skipped job.
+            // If this job was previously the active job on this branch, fallback to the newest unskipped job.
             if active_id.as_deref() == Some(record.job.id.as_str()) {
                 let fallback: Option<(String, String, i64)> = conn
                     .query_row(
@@ -304,7 +304,7 @@ impl DuckDbStore {
                 }
             }
         } else {
-            // Non-skipped job (Queued, Running, Completed, Failed)
+            // Unskipped job (Queued, Running, Completed, Failed)
             let should_update_active = active_id.is_none()
                 || active_id.as_deref() == Some(record.job.id.as_str())
                 || queued_at_us >= active_q_us.unwrap_or(i64::MIN);

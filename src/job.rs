@@ -179,7 +179,7 @@ impl JobStore {
         let db = Arc::new(
             crate::db::DuckDbStore::open(db_file.as_deref()).unwrap_or_else(|e| {
                 warn!(
-                    "Failed to open on-disk DuckDB ({}), falling back to in-memory DuckDB",
+                    "Failed to open disk-backed DuckDB ({}), falling back to in-memory DuckDB",
                     e
                 );
                 crate::db::DuckDbStore::open(None).expect("in-memory DuckDB")

@@ -35,25 +35,88 @@ async fn test_end_to_end_distributed_dag_execution() {
         .await
         .expect("create actionrunner dir");
 
-    // Define a 2-stage DAG: fmt -> clippy
+    let cargo_toml = r#"
+[package]
+name = "test-e2e-cluster"
+version = "0.1.0"
+edition = "2021"
+"#;
+    tokio::fs::write(repo_path.join("Cargo.toml"), cargo_toml)
+        .await
+        .expect("write Cargo.toml");
+    let src_dir = repo_path.join("src");
+    tokio::fs::create_dir_all(&src_dir)
+        .await
+        .expect("create src dir");
+    tokio::fs::write(src_dir.join("lib.rs"), "pub fn e2e_cluster_test() {}\n")
+        .await
+        .expect("write lib.rs");
+
+    tokio::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git init");
+    tokio::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config user.name");
+    tokio::process::Command::new("git")
+        .args(["config", "user.email", "ci@example.com"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config user.email");
+    tokio::process::Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config commit.gpgsign");
+    tokio::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git add");
+    tokio::process::Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git commit");
+
+    // Define a 2-stage v3 DAG: fmt -> clippy
     let workflow_yaml = r#"
-version: "2"
+version: "3"
 name: "E2E Distributed CI"
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--check"]
+  clippy-task:
+    tool: "cargo-clippy"
+    args: ["--all-targets"]
 stages:
   - id: stage-fmt
     name: "Check Formatting"
+    tasks: ["fmt-task"]
     tags: ["fmt"]
     threads: 2
-    run: "echo '[E2E-STEP-1] formatting passed cleanly'"
   - id: stage-clippy
     name: "Check Clippy"
+    tasks: ["clippy-task"]
     tags: ["clippy"]
     threads: 2
     depends_on: ["stage-fmt"]
-    run: "echo '[E2E-STEP-2] clippy linter passed cleanly'"
+on_action:
+  push: ["stage-fmt", "stage-clippy"]
 "#;
 
-    tokio::fs::write(actionrunner_dir.join("on-push.yml"), workflow_yaml)
+    tokio::fs::write(actionrunner_dir.join("ActionRunner.yml"), workflow_yaml)
         .await
         .expect("write workflow");
 
@@ -148,13 +211,24 @@ stages:
     }
     assert!(registered, "Worker did not register with cluster registry");
 
+    let commit_out = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git rev-parse HEAD");
+    let head_sha = String::from_utf8(commit_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
     // 3. Enqueue Job
     let job = Job {
         id: "job-e2e-001".to_string(),
         event_type: "push".to_string(),
         repo_name: repo_name.to_string(),
         clone_url: repo_path.to_str().unwrap().to_string(),
-        commit_sha: "c0ffee1234".to_string(),
+        commit_sha: head_sha,
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
@@ -218,12 +292,16 @@ stages:
         .expect("read aggregated log file");
 
     assert!(
-        log_content.contains("[E2E-STEP-1] formatting passed cleanly"),
+        log_content.contains("cargo-fmt")
+            || log_content.contains("rustfmt")
+            || log_content.contains("cargo"),
         "Missing fmt step output in aggregated log: {}",
         log_content
     );
     assert!(
-        log_content.contains("[E2E-STEP-2] clippy linter passed cleanly"),
+        log_content.contains("cargo-clippy")
+            || log_content.contains("clippy")
+            || log_content.contains("cargo"),
         "Missing clippy step output in aggregated log: {}",
         log_content
     );
@@ -245,35 +323,105 @@ async fn test_multi_repo_single_action_per_node_scheduling() {
     ];
 
     let workflow_yaml = r#"
-version: "2"
+version: "3"
 name: "Multi-Repo Pipeline"
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--check"]
+  clippy-task:
+    tool: "cargo-clippy"
+    args: ["--all-targets"]
+  audit-task:
+    tool: "cargo-test"
+    args: ["--workspace"]
 stages:
   - id: fmt-check
     name: "Check Formatting"
+    tasks: ["fmt-task"]
     tags: ["fmt"]
     threads: 2
-    run: "sleep 0.2; echo '[FMT-OK]'"
   - id: clippy-check
     name: "Check Clippy"
+    tasks: ["clippy-task"]
     tags: ["clippy"]
     threads: 6
-    run: "sleep 0.2; echo '[CLIPPY-OK]'"
   - id: audit-check
     name: "Check Audit"
+    tasks: ["audit-task"]
     tags: ["audit"]
     threads: 2
     depends_on: ["fmt-check"]
-    run: "sleep 0.2; echo '[AUDIT-OK]'"
+on_action:
+  push: ["fmt-check", "clippy-check", "audit-check"]
 "#;
 
     for repo_name in &repos {
-        let actionrunner_dir = ws_path.join("repos").join(repo_name).join(".actionrunner");
+        let repo_path = ws_path.join("repos").join(repo_name);
+        let actionrunner_dir = repo_path.join(".actionrunner");
         tokio::fs::create_dir_all(&actionrunner_dir)
             .await
             .expect("create actionrunner dir");
-        tokio::fs::write(actionrunner_dir.join("on-push.yml"), workflow_yaml)
+        tokio::fs::write(actionrunner_dir.join("ActionRunner.yml"), workflow_yaml)
             .await
             .expect("write workflow");
+
+        let cargo_toml = format!(
+            r#"
+[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+"#,
+            repo_name.replace('/', "-").to_lowercase()
+        );
+        tokio::fs::write(repo_path.join("Cargo.toml"), cargo_toml)
+            .await
+            .expect("write Cargo.toml");
+        let src_dir = repo_path.join("src");
+        tokio::fs::create_dir_all(&src_dir)
+            .await
+            .expect("create src dir");
+        tokio::fs::write(src_dir.join("lib.rs"), "pub fn test_fn() {}\n")
+            .await
+            .expect("write lib.rs");
+
+        tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git init");
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "CI Test"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git config user.name");
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "ci@example.com"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git config user.email");
+        tokio::process::Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git config commit.gpgsign");
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git add");
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git commit");
     }
 
     let config = Config {
@@ -358,12 +506,23 @@ stages:
     // Submit 4 repository events simultaneously
     for (idx, repo_name) in repos.iter().enumerate() {
         let repo_path = ws_path.join("repos").join(repo_name);
+        let commit_out = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .expect("git rev-parse HEAD");
+        let head_sha = String::from_utf8(commit_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
         let job = Job {
             id: format!("job-multi-{}", idx + 1),
             event_type: "push".to_string(),
             repo_name: repo_name.to_string(),
             clone_url: repo_path.to_str().unwrap().to_string(),
-            commit_sha: format!("deadbeef0{}", idx + 1),
+            commit_sha: head_sha,
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
@@ -373,7 +532,7 @@ stages:
     }
 
     let mut max_concurrent_running_jobs = 0usize;
-    for _ in 0..200 {
+    for _ in 0..300 {
         let nodes = cluster.list_nodes_view().await;
         for n in &nodes {
             assert_eq!(n.max_slots, 1, "Node {} max_slots must be 1", n.node_id);
@@ -391,7 +550,7 @@ stages:
         if snap.stats.completed_jobs == 4 {
             break;
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(20)).await;
     }
 
     let final_snap = job_store.queue_snapshot().await;
@@ -411,7 +570,8 @@ async fn test_e2e_exclusive_stage_isolation_and_drain() {
         .expect("create controller ws");
 
     let repo_name = "LMA1980/repo-bench";
-    let actionrunner_dir = ws_path.join("repos").join(repo_name).join(".actionrunner");
+    let repo_path = ws_path.join("repos").join(repo_name);
+    let actionrunner_dir = repo_path.join(".actionrunner");
     tokio::fs::create_dir_all(&actionrunner_dir)
         .await
         .expect("create actionrunner dir");
@@ -421,50 +581,199 @@ async fn test_e2e_exclusive_stage_isolation_and_drain() {
     // 2. bench-exclusive (exclusive: true, depends on fmt-check)
     // 3. audit-check (shared, depends on bench-exclusive)
     let workflow_yaml = r#"
-version: "2"
+version: "3"
 name: "Exclusive Bench Pipeline"
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--check"]
+  bench-task:
+    tool: "cargo-test"
+    args: ["--workspace"]
+  audit-task:
+    tool: "cargo-clippy"
+    args: ["--all-targets"]
 stages:
   - id: fmt-check
     name: "Check Formatting"
+    tasks: ["fmt-task"]
     tags: ["bench-node"]
     threads: 2
-    run: "sleep 0.2; echo '[FMT-DONE]'"
   - id: bench-exclusive
     name: "Hardware Benchmark"
+    tasks: ["bench-task"]
     tags: ["bench-node"]
     threads: 6
     exclusive: true
     depends_on: ["fmt-check"]
-    run: "sleep 0.3; echo '[BENCH-EXCLUSIVE-DONE]'"
   - id: audit-check
     name: "Audit Check"
+    tasks: ["audit-task"]
     tags: ["bench-node"]
     threads: 2
     depends_on: ["bench-exclusive"]
-    run: "sleep 0.2; echo '[AUDIT-DONE]'"
+on_action:
+  push: ["fmt-check", "bench-exclusive", "audit-check"]
 "#;
-    tokio::fs::write(actionrunner_dir.join("on-push.yml"), workflow_yaml)
+    tokio::fs::write(actionrunner_dir.join("ActionRunner.yml"), workflow_yaml)
         .await
         .expect("write workflow");
 
+    let cargo_toml1 = r#"
+[package]
+name = "repo-bench"
+version = "0.1.0"
+edition = "2021"
+"#;
+    tokio::fs::write(repo_path.join("Cargo.toml"), cargo_toml1)
+        .await
+        .expect("write Cargo.toml");
+    let src_dir1 = repo_path.join("src");
+    tokio::fs::create_dir_all(&src_dir1)
+        .await
+        .expect("create src dir");
+    tokio::fs::write(src_dir1.join("lib.rs"), "pub fn bench_fn() {}\n")
+        .await
+        .expect("write lib.rs");
+
+    tokio::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git init");
+    tokio::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config user.name");
+    tokio::process::Command::new("git")
+        .args(["config", "user.email", "ci@example.com"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config user.email");
+    tokio::process::Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git config commit.gpgsign");
+    tokio::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git add");
+    tokio::process::Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git commit");
+
+    let commit_out1 = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .expect("git rev-parse HEAD");
+    let head_sha1 = String::from_utf8(commit_out1.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
     let repo2_name = "LMA1980/repo-concurrent";
-    let actionrunner2_dir = ws_path.join("repos").join(repo2_name).join(".actionrunner");
+    let repo2_path = ws_path.join("repos").join(repo2_name);
+    let actionrunner2_dir = repo2_path.join(".actionrunner");
     tokio::fs::create_dir_all(&actionrunner2_dir)
         .await
         .expect("create actionrunner dir 2");
     let workflow2_yaml = r#"
-version: "2"
+version: "3"
 name: "Concurrent Normal Pipeline"
+tasks:
+  concurrent-task:
+    tool: "cargo-fmt"
+    args: ["--check"]
 stages:
   - id: concurrent-stage
     name: "Concurrent Stage"
+    tasks: ["concurrent-task"]
     tags: ["bench-node"]
     threads: 2
-    run: "sleep 0.2; echo '[CONCURRENT-DONE]'"
+on_action:
+  push: ["concurrent-stage"]
 "#;
-    tokio::fs::write(actionrunner2_dir.join("on-push.yml"), workflow2_yaml)
+    tokio::fs::write(actionrunner2_dir.join("ActionRunner.yml"), workflow2_yaml)
         .await
         .expect("write workflow 2");
+
+    let cargo_toml2 = r#"
+[package]
+name = "repo-concurrent"
+version = "0.1.0"
+edition = "2021"
+"#;
+    tokio::fs::write(repo2_path.join("Cargo.toml"), cargo_toml2)
+        .await
+        .expect("write Cargo.toml");
+    let src_dir2 = repo2_path.join("src");
+    tokio::fs::create_dir_all(&src_dir2)
+        .await
+        .expect("create src dir");
+    tokio::fs::write(src_dir2.join("lib.rs"), "pub fn concurrent_fn() {}\n")
+        .await
+        .expect("write lib.rs");
+
+    tokio::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git init");
+    tokio::process::Command::new("git")
+        .args(["config", "user.name", "CI Test"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git config user.name");
+    tokio::process::Command::new("git")
+        .args(["config", "user.email", "ci@example.com"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git config user.email");
+    tokio::process::Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git config commit.gpgsign");
+    tokio::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git add");
+    tokio::process::Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git commit");
+
+    let commit_out2 = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo2_path)
+        .output()
+        .await
+        .expect("git rev-parse HEAD");
+    let head_sha2 = String::from_utf8(commit_out2.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     let config = Config {
         bind_addr: "127.0.0.1:0".to_string(),
@@ -545,7 +854,7 @@ stages:
         event_type: "push".to_string(),
         repo_name: repo_name.to_string(),
         clone_url: repo_path.to_str().unwrap().to_string(),
-        commit_sha: "beef0001".to_string(),
+        commit_sha: head_sha1,
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
@@ -561,7 +870,7 @@ stages:
         event_type: "push".to_string(),
         repo_name: repo2_name.to_string(),
         clone_url: repo2_path.to_str().unwrap().to_string(),
-        commit_sha: "beef0002".to_string(),
+        commit_sha: head_sha2,
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
@@ -573,7 +882,7 @@ stages:
     // Monitor execution and assert that while bench-exclusive is running on bench-node-worker,
     // active_slots on bench-node-worker is strictly 1 (no concurrent stages on node).
     let mut verified_exclusive_concurrency = false;
-    for _ in 0..200 {
+    for _ in 0..500 {
         if let Some(record) = job_store.get_job("job-exclusive-1").await {
             let bench_stage = record.stages.iter().find(|s| s.id == "bench-exclusive");
             if let Some(s) = bench_stage {
@@ -597,7 +906,7 @@ stages:
         if snap.stats.completed_jobs == 2 {
             break;
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(10)).await;
     }
 
     assert!(

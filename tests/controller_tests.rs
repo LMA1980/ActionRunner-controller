@@ -1,29 +1,37 @@
-use action_runner_controller::workflow::WorkflowConfig;
-use std::path::Path;
+use action_runner_controller::workflow::ActionRunnerWorkflow;
 
 #[test]
 fn test_workflow_dag_validation_valid() {
     let yaml = r#"
-version: "2"
+version: "3"
 name: "Test Pipeline"
+tasks:
+  t-fmt:
+    tool: "cargo-fmt"
+  t-clippy:
+    tool: "cargo-clippy"
+  t-test:
+    tool: "cargo-test"
 stages:
   - id: fmt
     name: "Format"
+    tasks: ["t-fmt"]
     tags: ["fmt"]
     threads: 2
-    run: "cargo fmt --check"
   - id: clippy
     name: "Clippy"
+    tasks: ["t-clippy"]
     tags: ["clippy"]
     threads: 4
-    run: "cargo clippy"
   - id: test-native
     name: "Native Test"
+    tasks: ["t-test"]
     tags: ["k3"]
     depends_on: ["fmt", "clippy"]
-    run: "cargo test"
+on_action:
+  push: ["test-native"]
 "#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid workflow");
+    let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid workflow");
     assert_eq!(wf.stages.len(), 3);
     assert_eq!(wf.stages[2].depends_on, vec!["fmt", "clippy"]);
 }
@@ -31,39 +39,46 @@ stages:
 #[test]
 fn test_workflow_dag_cycle_detection() {
     let yaml = r#"
-version: "2"
+version: "3"
 name: "Cyclic Pipeline"
+tasks:
+  t1:
+    tool: "cargo-build"
 stages:
   - id: stage-a
     name: "A"
-    tags: ["test"]
+    tasks: ["t1"]
     depends_on: ["stage-b"]
-    run: "echo a"
   - id: stage-b
     name: "B"
-    tags: ["test"]
+    tasks: ["t1"]
     depends_on: ["stage-a"]
-    run: "echo b"
+on_action:
+  push: ["stage-a"]
 "#;
-    let err = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).unwrap_err();
+    let err = ActionRunnerWorkflow::from_yaml(yaml).unwrap_err();
     assert!(err.contains("Cyclic dependency detected"));
 }
 
 #[test]
-fn test_workflow_v1_backwards_compatibility() {
+fn test_workflow_v3_subgraph_event_filtering() {
     let yaml = r#"
-name: "V1 Pipeline"
-steps:
-  - name: "Step 1"
-    run: "cargo fmt"
-  - name: "Step 2"
-    run: "cargo test"
+version: "3"
+name: "Event Filtering Pipeline"
+tasks:
+  t1:
+    tool: "cargo-fmt"
+stages:
+  - id: stage-1
+    name: "Step 1"
+    tasks: ["t1"]
+on_action:
+  push: ["stage-1"]
 "#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid v1");
-    assert_eq!(wf.stages.len(), 2);
-    assert_eq!(wf.stages[0].id, "step-1");
-    assert_eq!(wf.stages[1].id, "step-2");
-    assert_eq!(wf.stages[1].depends_on, vec!["step-1"]);
+    let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid v3");
+    let push_sub = wf.subgraph_for_event("push").expect("push subgraph");
+    assert_eq!(push_sub.stages.len(), 1);
+    assert_eq!(push_sub.stages[0].id, "stage-1");
 }
 
 #[tokio::test]
@@ -290,16 +305,21 @@ async fn test_sse_dashboard_and_job_events_push() {
 #[test]
 fn test_workflow_exclusive_true_parsing() {
     let yaml = r#"
-version: "2"
+version: "3"
 name: "Exclusive Test Pipeline"
+tasks:
+  bench-task:
+    tool: "cargo-bench"
 stages:
   - id: bench-run
     name: "Benchmark"
+    tasks: ["bench-task"]
     tags: ["bench"]
     exclusive: true
-    run: "cargo bench"
+on_action:
+  push: ["bench-run"]
 "#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid exclusive");
+    let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid exclusive");
     assert_eq!(wf.stages.len(), 1);
     assert!(wf.stages[0].exclusive, "exclusive: true was not parsed");
 }
@@ -307,16 +327,21 @@ stages:
 #[test]
 fn test_workflow_isolate_node_alias_parsing() {
     let yaml = r#"
-version: "2"
+version: "3"
 name: "Isolate Node Pipeline"
+tasks:
+  bench-task:
+    tool: "cargo-bench"
 stages:
   - id: bench-run
     name: "Benchmark"
+    tasks: ["bench-task"]
     tags: ["bench"]
     isolate_node: true
-    run: "cargo bench"
+on_action:
+  push: ["bench-run"]
 "#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid isolate_node");
+    let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid isolate_node");
     assert_eq!(wf.stages.len(), 1);
     assert!(
         wf.stages[0].exclusive,
@@ -327,35 +352,24 @@ stages:
 #[test]
 fn test_workflow_exclusive_default_false() {
     let yaml = r#"
-version: "2"
+version: "3"
 name: "Standard Pipeline"
+tasks:
+  test-task:
+    tool: "cargo-test"
 stages:
   - id: test-stage
     name: "Test"
+    tasks: ["test-task"]
     tags: ["test"]
-    run: "cargo test"
+on_action:
+  push: ["test-stage"]
 "#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid default");
+    let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid default");
     assert_eq!(wf.stages.len(), 1);
     assert!(
         !wf.stages[0].exclusive,
         "exclusive did not default to false"
-    );
-}
-
-#[test]
-fn test_stage_config_legacy_v1_defaults_to_non_exclusive() {
-    let yaml = r#"
-name: "Legacy Pipeline"
-steps:
-  - name: "Step 1"
-    run: "cargo check"
-"#;
-    let wf = WorkflowConfig::load_from_str(yaml, Path::new("."), 600).expect("valid v1");
-    assert_eq!(wf.stages.len(), 1);
-    assert!(
-        !wf.stages[0].exclusive,
-        "legacy steps converted to stages must default to exclusive = false"
     );
 }
 

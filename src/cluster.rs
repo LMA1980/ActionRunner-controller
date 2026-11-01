@@ -158,7 +158,7 @@ impl ClusterRegistry {
                     continue;
                 }
             } else {
-                // Non-exclusive stage: limit by max_concurrent_per_node.min(node.max_slots)
+                // Shared stage: limit by max_concurrent_per_node.min(node.max_slots)
                 let limit = match max_concurrent_per_node {
                     Some(lim) if lim > 0 => lim.min(worker.registration.max_slots),
                     _ => worker.registration.max_slots,
@@ -409,7 +409,7 @@ mod tests {
 
         let req_tags = vec!["bench".to_string()];
 
-        // Step 1: Lease Stage A (non-exclusive) -> succeeds
+        // Step 1: Lease Stage A (shared) -> succeeds
         let lease_a = cluster
             .lease_slot("job-1", "stage-a", &req_tags, None, false)
             .await;
@@ -511,7 +511,7 @@ mod tests {
 
     /// Scenario 3a: Deterministic Lock Release via release_stage_slot
     /// Release Stage B via release_stage_slot -> node immediately unblocks and accepts
-    /// new non-exclusive leases up to max_slots (3).
+    /// new shared leases up to max_slots (3).
     #[tokio::test]
     async fn test_scenario_3a_deterministic_release_via_release_stage_slot() {
         let cluster = ClusterRegistry::new();
@@ -542,7 +542,7 @@ mod tests {
             .release_stage_slot(node_id, "job-2", "stage-b")
             .await;
 
-        // Node is immediately unblocked: accepts up to max_slots (3) concurrent non-exclusive leases
+        // Node is immediately unblocked: accepts up to max_slots (3) concurrent shared leases
         let l1 = cluster
             .lease_slot("job-3", "stage-c1", &req_tags, None, false)
             .await;
@@ -665,7 +665,7 @@ mod tests {
         let stor_tag = vec!["storage".to_string()];
         let comp_tag = vec!["compute".to_string()];
 
-        // 1. Lease non-exclusive stage on control-node with max_concurrent_per_node = 1
+        // 1. Lease shared stage on control-node with max_concurrent_per_node = 1
         let lease_ctrl_1 = cluster
             .lease_slot_with_limit("job-1", "stage-ctrl-1", &ctrl_tag, None, false, Some(1))
             .await;
@@ -683,7 +683,7 @@ mod tests {
             "control-node should reject second stage when max_concurrent_per_node: 1 is reached"
         );
 
-        // 3. Concurrently lease non-exclusive stage on storage-node (cross-node parallelism)
+        // 3. Concurrently lease shared stage on storage-node (cross-node parallelism)
         let lease_stor_1 = cluster
             .lease_slot_with_limit("job-1", "stage-stor-1", &stor_tag, None, false, Some(1))
             .await;
@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(worker_view.active_slots, 1);
         assert!(worker_view.exclusive_locked);
 
-        // 5. While worker-node holds exclusive lease, subsequent exclusive AND non-exclusive stages are blocked
+        // 5. While worker-node holds exclusive lease, subsequent exclusive AND shared stages are blocked
         let lease_comp_blocked = cluster
             .lease_slot_with_limit("job-1", "stage-comp-exc2", &comp_tag, None, true, None)
             .await;
@@ -732,7 +732,7 @@ mod tests {
             .await;
         assert!(
             lease_comp_nonexc_blocked.is_none(),
-            "worker-node should block non-exclusive stage while exclusive lock is held"
+            "worker-node should block shared stage while exclusive lock is held"
         );
 
         // 6. Release first exclusive stage on worker-node
