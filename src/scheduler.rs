@@ -1,6 +1,7 @@
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -9,8 +10,318 @@ use tracing::{info, warn};
 use crate::cluster::{ClusterRegistry, WorkerCommand};
 use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
-use crate::workflow::{StageConfig, WorkflowConfig};
-use action_runner_ipc::StageDispatchTask;
+use crate::workflow::{ActionRunnerWorkflow, LegacyStageConfig, StageConfig, WorkflowConfig};
+use action_runner_ipc::{
+    NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, StageDispatchTask,
+    TypedTaskInvocation,
+};
+use action_runner_tools::{SandboxProfileRequirement, ToolInvocation, ToolRegistry};
+
+// ============================================================================
+// Sub-task #28: Migration Warning Logs and Deprecation Telemetry Hook
+// ============================================================================
+
+pub static LEGACY_WORKFLOW_LOADS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn emit_legacy_workflow_warning(repo_name: &str, legacy_file: &str) {
+    LEGACY_WORKFLOW_LOADS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    warn!(
+        event = "legacy_workflow_loaded",
+        repo = %repo_name,
+        file = %legacy_file,
+        "Loaded deprecated .actionrunner/on-*.yml; migrate to .actionrunner/ActionRunner.yml v3"
+    );
+}
+
+pub fn legacy_workflow_loads_total() -> u64 {
+    LEGACY_WORKFLOW_LOADS_TOTAL.load(Ordering::Relaxed)
+}
+
+pub fn legacy_workflow_loads_prometheus_metric() -> String {
+    format!(
+        "# TYPE actionrunner_legacy_workflow_loads_total counter\nactionrunner_legacy_workflow_loads_total {}\n",
+        legacy_workflow_loads_total()
+    )
+}
+
+// ============================================================================
+// Sub-tasks #37 & #38: ToolAdapter Dispatch & Security Validation
+// ============================================================================
+
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error("Unapproved or prohibited tool: {0}")]
+    UnapprovedTool(String),
+    #[error("Task '{0}' not found in workflow tasks")]
+    TaskNotFound(String),
+    #[error("Stage '{0}' not found in workflow")]
+    StageNotFound(String),
+}
+
+pub fn sandbox_req_to_ipc_spec(
+    profile_name: &str,
+    req: &SandboxProfileRequirement,
+) -> SandboxConstraintSpec {
+    let network_mode = if req.allow_network {
+        if req.allowed_egress_hosts.is_empty() {
+            NetworkEgressMode::RestrictedCidrs(vec!["0.0.0.0/0".to_string()])
+        } else {
+            NetworkEgressMode::RestrictedCidrs(req.allowed_egress_hosts.clone())
+        }
+    } else {
+        NetworkEgressMode::Offline
+    };
+
+    SandboxConstraintSpec {
+        profile_name: profile_name.to_string(),
+        backend: SandboxBackendKind::Kernel,
+        read_paths: req.readable_dirs.clone(),
+        write_paths: req.writable_dirs.clone(),
+        exec_paths: req.exec_binaries.clone(),
+        network_mode,
+        memlock_limit_kb: req.required_memlock_kb,
+        max_pids: 256,
+        require_set_ai_thread: false,
+    }
+}
+
+pub fn build_v3_stage_dispatch_task(
+    job_id: &str,
+    repo_name: &str,
+    clone_url: &str,
+    commit_sha: &str,
+    stage: &StageConfig,
+    workflow: &ActionRunnerWorkflow,
+    default_timeout: u64,
+) -> Result<StageDispatchTask, DispatchError> {
+    let registry = ToolRegistry::with_builtin_adapters();
+    let mut typed_tasks = Vec::new();
+    let mut stage_timeout = default_timeout;
+
+    for task_id in &stage.tasks {
+        let task_cfg = workflow
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| DispatchError::TaskNotFound(task_id.clone()))?;
+
+        // Immediately reject prohibited shell wrappers
+        if action_runner_tools::sanitize::is_prohibited_shell_wrapper(&task_cfg.tool) {
+            return Err(DispatchError::UnapprovedTool(format!(
+                "Tool '{}' in task '{}' is a prohibited shell wrapper",
+                task_cfg.tool, task_id
+            )));
+        }
+
+        let adapter = registry.get(&task_cfg.tool).map_err(|e| {
+            DispatchError::UnapprovedTool(format!(
+                "Tool '{}' in task '{}' is not registered: {}",
+                task_cfg.tool, task_id, e
+            ))
+        })?;
+
+        let mut inv = ToolInvocation::new(&task_cfg.tool, task_cfg.args.clone());
+        if let Some(ref wd) = task_cfg.working_dir {
+            inv = inv.with_working_dir(wd);
+        }
+        for (k, v) in &task_cfg.env {
+            inv = inv.with_env(k, v);
+        }
+
+        // Validate invocation arguments via adapter
+        adapter.validate(&inv).map_err(|e| {
+            DispatchError::UnapprovedTool(format!(
+                "Task '{}' validation failed for tool '{}': {}",
+                task_id, task_cfg.tool, e
+            ))
+        })?;
+
+        let sandbox_req = adapter.sandbox_profile(&inv);
+        let profile_name = task_cfg
+            .sandbox_profile
+            .as_deref()
+            .unwrap_or_else(|| adapter.name());
+        let sandbox_spec = sandbox_req_to_ipc_spec(profile_name, &sandbox_req);
+
+        let env_pairs: Vec<(String, String)> = task_cfg
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if let Some(to) = task_cfg.timeout_seconds {
+            stage_timeout = stage_timeout.min(to);
+        }
+
+        typed_tasks.push(TypedTaskInvocation {
+            task_id: task_id.clone(),
+            tool_name: task_cfg.tool.clone(),
+            args: task_cfg.args.clone(),
+            working_dir: task_cfg.working_dir.clone(),
+            env_vars: env_pairs,
+            sandbox: sandbox_spec,
+        });
+    }
+
+    let command_summary = if typed_tasks.is_empty() {
+        stage.name.clone()
+    } else {
+        typed_tasks
+            .iter()
+            .map(|t| format!("{} {}", t.tool_name, t.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join(" && ")
+    };
+
+    let sandbox_constraints = typed_tasks
+        .first()
+        .map(|t| t.sandbox.clone())
+        .unwrap_or_default();
+
+    let stage_env_pairs: Vec<(String, String)> = workflow
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    Ok(StageDispatchTask {
+        job_id: job_id.to_string(),
+        stage_id: stage.id.clone(),
+        stage_name: stage.name.clone(),
+        repo_name: repo_name.to_string(),
+        clone_url: clone_url.to_string(),
+        commit_sha: commit_sha.to_string(),
+        command: command_summary,
+        working_dir: None,
+        env_vars: stage_env_pairs,
+        timeout_seconds: stage_timeout,
+        threads: stage.threads,
+        toolchain: stage.toolchain.clone(),
+        exclusive: stage.exclusive,
+        max_concurrent_per_node: stage.max_concurrent_per_node,
+        tasks: typed_tasks,
+        sandbox_constraints,
+    })
+}
+
+// ============================================================================
+// Sub-task #27: Fallback Discovery & Precedence Resolver
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedWorkflow {
+    V3(ActionRunnerWorkflow),
+    Legacy(WorkflowConfig),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkflowResolveError {
+    #[error("Legacy workflows are disabled via ACTIONRUNNER_DISABLE_LEGACY=1")]
+    LegacyDisabled,
+    #[error("No workflow found for event '{event}' in '{path}'")]
+    NotFound { path: String, event: String },
+    #[error("Failed to parse or validate workflow: {0}")]
+    Validation(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+}
+
+pub fn resolve_workflow_for_event(
+    repo_path: &Path,
+    event: &str,
+    max_timeout: u64,
+) -> Result<ResolvedWorkflow, WorkflowResolveError> {
+    let actionrunner_dir = repo_path.join(".actionrunner");
+
+    // 1. Check for ActionRunner.yml / ActionRunner.yaml first
+    for name in ["ActionRunner.yml", "ActionRunner.yaml"] {
+        let v3_path = actionrunner_dir.join(name);
+        if v3_path.exists() {
+            let content = std::fs::read_to_string(&v3_path)
+                .map_err(|e| WorkflowResolveError::Io(e.to_string()))?;
+            let wf = ActionRunnerWorkflow::from_yaml(&content)
+                .map_err(WorkflowResolveError::Validation)?;
+            let subgraph = wf
+                .subgraph_for_event(event)
+                .map_err(|e| WorkflowResolveError::Validation(e.to_string()))?;
+            return Ok(ResolvedWorkflow::V3(subgraph));
+        }
+    }
+
+    // 2. If ActionRunner.yml is absent, check if legacy workflows are disabled
+    if std::env::var("ACTIONRUNNER_DISABLE_LEGACY").as_deref() == Ok("1") {
+        return Err(WorkflowResolveError::LegacyDisabled);
+    }
+
+    // 3. Fallback to on-<event>.yml (with on-pullrequest.yml for pull_request)
+    let event_lower = event.to_ascii_lowercase();
+    let mut candidates = vec![
+        format!("on-{}.yml", event_lower),
+        format!("on-{}.yaml", event_lower),
+    ];
+    if event_lower == "pull_request" || event_lower == "pullrequest" {
+        candidates.push("on-pullrequest.yml".to_string());
+        candidates.push("on-pullrequest.yaml".to_string());
+    }
+
+    let repo_name = repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    for cand in &candidates {
+        let path = actionrunner_dir.join(cand);
+        if path.exists() {
+            emit_legacy_workflow_warning(repo_name, cand);
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| WorkflowResolveError::Io(e.to_string()))?;
+            let legacy_wf = WorkflowConfig::load_from_str(&content, repo_path, max_timeout)
+                .map_err(WorkflowResolveError::Validation)?;
+            return Ok(ResolvedWorkflow::Legacy(legacy_wf));
+        }
+    }
+
+    Err(WorkflowResolveError::NotFound {
+        path: repo_path.display().to_string(),
+        event: event.to_string(),
+    })
+}
+
+pub fn v3_to_legacy_workflow(v3: &ActionRunnerWorkflow) -> WorkflowConfig {
+    let mut stages = Vec::new();
+    for s in &v3.stages {
+        let run_cmd = if s.tasks.is_empty() {
+            s.name.clone()
+        } else {
+            s.tasks
+                .iter()
+                .filter_map(|t_id| v3.tasks.get(t_id))
+                .map(|t| format!("{} {}", t.tool, t.args.join(" ")))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        stages.push(LegacyStageConfig {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            tags: s.tags.clone(),
+            threads: s.threads,
+            toolchain: s.toolchain.clone(),
+            depends_on: s.depends_on.clone(),
+            run: run_cmd,
+            working_dir: None,
+            env: Some(v3.env.clone()),
+            timeout_seconds: None,
+            continue_on_error: false,
+            exclusive: s.exclusive,
+        });
+    }
+    WorkflowConfig {
+        version: Some(v3.version.clone()),
+        name: v3.name.clone(),
+        env: Some(v3.env.clone()),
+        stages,
+        steps: Vec::new(),
+    }
+}
 
 pub struct DAGScheduler {
     config: Config,
@@ -166,7 +477,7 @@ impl DAGScheduler {
         self.job_store.set_stages(&job.id, stage_records).await;
 
         // 3. Orchestration loop: evaluate DAG progression
-        let stages_by_id: HashMap<String, StageConfig> = workflow
+        let stages_by_id: HashMap<String, LegacyStageConfig> = workflow
             .stages
             .into_iter()
             .map(|s| (s.id.clone(), s))
@@ -309,6 +620,9 @@ impl DAGScheduler {
                                     threads: stage_cfg.threads,
                                     toolchain: stage_cfg.toolchain.clone(),
                                     exclusive: stage_cfg.exclusive,
+                                    max_concurrent_per_node: 1,
+                                    tasks: Vec::new(),
+                                    sandbox_constraints: SandboxConstraintSpec::default(),
                                 };
 
                                 let _ = cmd_tx.send(WorkerCommand::Dispatch(task)).await;
@@ -422,7 +736,6 @@ impl DAGScheduler {
         job: &Job,
         repo_workspace: &Path,
     ) -> Result<WorkflowConfig, String> {
-        let actionrunner_dir = repo_workspace.join(".actionrunner");
         let event_lower = job.event_type.to_ascii_lowercase();
 
         let mut candidates = vec![
@@ -474,6 +787,37 @@ impl DAGScheduler {
                     .output()
                     .await;
 
+                // Check ActionRunner.yml / ActionRunner.yaml in git tree first
+                let v3_candidates = ["ActionRunner.yml", "ActionRunner.yaml"];
+                for cand in &v3_candidates {
+                    let git_spec = format!("{}:.actionrunner/{}", job.commit_sha, cand);
+                    let show_res = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo_workspace)
+                        .arg("show")
+                        .arg(&git_spec)
+                        .output()
+                        .await;
+
+                    if let Ok(out) = show_res {
+                        if out.status.success() {
+                            if let Ok(content) = String::from_utf8(out.stdout) {
+                                if let Ok(wf) = ActionRunnerWorkflow::from_yaml(&content) {
+                                    if let Ok(sub) = wf.subgraph_for_event(&job.event_type) {
+                                        info!(
+                                            job_id = %job.id,
+                                            commit = %job.commit_sha,
+                                            candidate = %cand,
+                                            "Resolved declarative ActionRunner.yml workflow from commit tree via git show"
+                                        );
+                                        return Ok(v3_to_legacy_workflow(&sub));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 for cand in &candidates {
                     let git_spec = format!("{}:.actionrunner/{}", job.commit_sha, cand);
                     let show_res = tokio::process::Command::new("git")
@@ -505,19 +849,15 @@ impl DAGScheduler {
             }
         }
 
-        // 2. Fallback to existing disk file if git show didn't resolve
-        for cand in &candidates {
-            let path = actionrunner_dir.join(cand);
-            if path.exists() {
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-                return WorkflowConfig::load_from_str(
-                    &content,
-                    repo_workspace,
-                    self.config.job_timeout_seconds,
-                );
-            }
+        // 2. Resolve from local disk workspace (.actionrunner/ActionRunner.yml or on-*.yml)
+        match resolve_workflow_for_event(
+            repo_workspace,
+            &job.event_type,
+            self.config.job_timeout_seconds,
+        ) {
+            Ok(ResolvedWorkflow::V3(wf)) => return Ok(v3_to_legacy_workflow(&wf)),
+            Ok(ResolvedWorkflow::Legacy(wf)) => return Ok(wf),
+            Err(_) => {}
         }
 
         // If not found locally, create a default 3-stage distributed workflow (fmt on x86, clippy on x86, verify on k3)
@@ -616,5 +956,429 @@ stages:
                 warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::{ActionRunnerWorkflow, StageConfig, TaskConfig};
+    use action_runner_ipc::SandboxBackendKind;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    // --- Sub-task #37: ToolAdapter Dispatch Builder Tests ---
+
+    #[test]
+    fn test_build_v3_stage_dispatch_task_cargo_build_and_test() {
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "task-build".to_string(),
+            TaskConfig {
+                tool: "cargo-build".to_string(),
+                args: vec!["--workspace".to_string(), "--release".to_string()],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: Some(600),
+                sandbox_profile: None,
+            },
+        );
+        tasks.insert(
+            "task-test".to_string(),
+            TaskConfig {
+                tool: "cargo-test".to_string(),
+                args: vec!["--workspace".to_string()],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: Some(900),
+                sandbox_profile: None,
+            },
+        );
+
+        let stage = StageConfig {
+            id: "stage-ci".to_string(),
+            name: "Build and Test".to_string(),
+            tasks: vec!["task-build".to_string(), "task-test".to_string()],
+            depends_on: vec![],
+            tags: vec!["compute".to_string()],
+            threads: 4,
+            toolchain: Some("stable".to_string()),
+            exclusive: true,
+            max_concurrent_per_node: 1,
+        };
+
+        let wf = ActionRunnerWorkflow {
+            version: "3".to_string(),
+            name: "Test Pipeline".to_string(),
+            env: HashMap::from([("CI".to_string(), "true".to_string())]),
+            tasks,
+            stages: vec![stage.clone()],
+            on_action: HashMap::from([("push".to_string(), vec!["stage-ci".to_string()])]),
+        };
+
+        let dispatch = build_v3_stage_dispatch_task(
+            "job-42",
+            "test-repo",
+            "https://github.com/example/test-repo.git",
+            "abcd1234ef",
+            &stage,
+            &wf,
+            1200,
+        )
+        .expect("Dispatch task should build successfully");
+
+        assert_eq!(dispatch.job_id, "job-42");
+        assert_eq!(dispatch.stage_id, "stage-ci");
+        assert!(dispatch.exclusive);
+        assert_eq!(dispatch.max_concurrent_per_node, 1);
+        assert_eq!(dispatch.tasks.len(), 2);
+        assert_eq!(dispatch.tasks[0].tool_name, "cargo-build");
+        assert_eq!(dispatch.tasks[0].args, vec!["--workspace", "--release"]);
+        assert_eq!(dispatch.tasks[1].tool_name, "cargo-test");
+        assert_eq!(dispatch.tasks[1].args, vec!["--workspace"]);
+        assert_eq!(
+            dispatch.sandbox_constraints.backend,
+            SandboxBackendKind::Kernel
+        );
+    }
+
+    // --- Sub-task #38: Reject Unregistered Tool Commands or Shell Scripts ---
+
+    #[test]
+    fn test_reject_unapproved_tool_and_shell_injection() {
+        // Prohibited shell wrapper: bash
+        let mut tasks_bash = HashMap::new();
+        tasks_bash.insert(
+            "task-bash".to_string(),
+            TaskConfig {
+                tool: "bash".to_string(),
+                args: vec!["-c".to_string(), "echo pwned".to_string()],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: None,
+                sandbox_profile: None,
+            },
+        );
+
+        let stage_bash = StageConfig {
+            id: "stage-bash".to_string(),
+            name: "Bash Stage".to_string(),
+            tasks: vec!["task-bash".to_string()],
+            depends_on: vec![],
+            tags: vec![],
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+        };
+
+        let wf_bash = ActionRunnerWorkflow {
+            version: "3".to_string(),
+            name: "Malicious Pipeline".to_string(),
+            env: HashMap::new(),
+            tasks: tasks_bash,
+            stages: vec![stage_bash.clone()],
+            on_action: HashMap::new(),
+        };
+
+        let err_bash = build_v3_stage_dispatch_task(
+            "job-bad",
+            "malicious-repo",
+            "https://example.com",
+            "deadbeef",
+            &stage_bash,
+            &wf_bash,
+            600,
+        )
+        .unwrap_err();
+
+        match err_bash {
+            DispatchError::UnapprovedTool(msg) => {
+                assert!(msg.contains("prohibited shell wrapper") || msg.contains("bash"));
+            }
+            other => panic!("Expected UnapprovedTool error, got {:?}", other),
+        }
+
+        // Prohibited shell wrapper: sh
+        let mut tasks_sh = HashMap::new();
+        tasks_sh.insert(
+            "task-sh".to_string(),
+            TaskConfig {
+                tool: "sh".to_string(),
+                args: vec!["-c".to_string(), "ls".to_string()],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: None,
+                sandbox_profile: None,
+            },
+        );
+        let stage_sh = StageConfig {
+            id: "stage-sh".to_string(),
+            name: "Sh Stage".to_string(),
+            tasks: vec!["task-sh".to_string()],
+            depends_on: vec![],
+            tags: vec![],
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+        };
+        let wf_sh = ActionRunnerWorkflow {
+            version: "3".to_string(),
+            name: "Sh Pipeline".to_string(),
+            env: HashMap::new(),
+            tasks: tasks_sh,
+            stages: vec![stage_sh.clone()],
+            on_action: HashMap::new(),
+        };
+        assert!(matches!(
+            build_v3_stage_dispatch_task("job-sh", "r", "c", "s", &stage_sh, &wf_sh, 600),
+            Err(DispatchError::UnapprovedTool(_))
+        ));
+
+        // Shell metacharacter injection: semicolon
+        let mut tasks_semi = HashMap::new();
+        tasks_semi.insert(
+            "task-semi".to_string(),
+            TaskConfig {
+                tool: "cargo-test".to_string(),
+                args: vec![
+                    "--".to_string(),
+                    ";".to_string(),
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                ],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: None,
+                sandbox_profile: None,
+            },
+        );
+        let stage_semi = StageConfig {
+            id: "stage-semi".to_string(),
+            name: "Semi Stage".to_string(),
+            tasks: vec!["task-semi".to_string()],
+            depends_on: vec![],
+            tags: vec![],
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+        };
+        let wf_semi = ActionRunnerWorkflow {
+            version: "3".to_string(),
+            name: "Semi Pipeline".to_string(),
+            env: HashMap::new(),
+            tasks: tasks_semi,
+            stages: vec![stage_semi.clone()],
+            on_action: HashMap::new(),
+        };
+        assert!(matches!(
+            build_v3_stage_dispatch_task("job-semi", "r", "c", "s", &stage_semi, &wf_semi, 600),
+            Err(DispatchError::UnapprovedTool(_))
+        ));
+
+        // Shell metacharacter injection: subshell $(whoami)
+        let mut tasks_sub = HashMap::new();
+        tasks_sub.insert(
+            "task-sub".to_string(),
+            TaskConfig {
+                tool: "cargo-test".to_string(),
+                args: vec!["$(whoami)".to_string()],
+                working_dir: None,
+                env: HashMap::new(),
+                timeout_seconds: None,
+                sandbox_profile: None,
+            },
+        );
+        let stage_sub = StageConfig {
+            id: "stage-sub".to_string(),
+            name: "Subshell Stage".to_string(),
+            tasks: vec!["task-sub".to_string()],
+            depends_on: vec![],
+            tags: vec![],
+            threads: 2,
+            toolchain: None,
+            exclusive: false,
+            max_concurrent_per_node: 1,
+        };
+        let wf_sub = ActionRunnerWorkflow {
+            version: "3".to_string(),
+            name: "Subshell Pipeline".to_string(),
+            env: HashMap::new(),
+            tasks: tasks_sub,
+            stages: vec![stage_sub.clone()],
+            on_action: HashMap::new(),
+        };
+        assert!(matches!(
+            build_v3_stage_dispatch_task("job-sub", "r", "c", "s", &stage_sub, &wf_sub, 600),
+            Err(DispatchError::UnapprovedTool(_))
+        ));
+    }
+
+    // --- Sub-task #27: Fallback Discovery & Precedence Tests ---
+
+    #[test]
+    fn test_resolve_workflow_precedence_and_fallback() {
+        let dir = tempdir().unwrap();
+        let ar_dir = dir.path().join(".actionrunner");
+        std::fs::create_dir_all(&ar_dir).unwrap();
+
+        let v3_content = r#"
+version: "3"
+name: "Modern Declarative Pipeline"
+tasks:
+  build-task:
+    tool: "cargo-build"
+stages:
+  - id: build-stage
+    name: "Build"
+    tasks: ["build-task"]
+on_action:
+  push: ["build-stage"]
+"#;
+
+        let legacy_content = r#"
+version: "2"
+name: "Legacy Pipeline"
+stages:
+  - id: legacy-stage
+    name: "Legacy Stage"
+    run: "cargo test"
+"#;
+
+        let v3_path = ar_dir.join("ActionRunner.yml");
+        let legacy_path = ar_dir.join("on-push.yml");
+
+        // 1. Precedence: Write both v3 and legacy
+        std::fs::write(&v3_path, v3_content).unwrap();
+        std::fs::write(&legacy_path, legacy_content).unwrap();
+
+        let res = resolve_workflow_for_event(dir.path(), "push", 600)
+            .expect("should resolve successfully");
+        match res {
+            ResolvedWorkflow::V3(wf) => {
+                assert_eq!(wf.name, "Modern Declarative Pipeline");
+                assert_eq!(wf.stages.len(), 1);
+                assert_eq!(wf.stages[0].id, "build-stage");
+            }
+            ResolvedWorkflow::Legacy(_) => panic!("Expected V3 to take precedence over legacy"),
+        }
+
+        // 2. Fallback: Remove ActionRunner.yml, leaving only on-push.yml
+        std::fs::remove_file(&v3_path).unwrap();
+        let count_before = LEGACY_WORKFLOW_LOADS_TOTAL.load(Ordering::Relaxed);
+
+        let res_legacy = resolve_workflow_for_event(dir.path(), "push", 600)
+            .expect("should fallback to legacy on-push.yml");
+        match res_legacy {
+            ResolvedWorkflow::Legacy(wf) => {
+                assert_eq!(wf.name, "Legacy Pipeline");
+                assert_eq!(wf.stages.len(), 1);
+                assert_eq!(wf.stages[0].id, "legacy-stage");
+            }
+            ResolvedWorkflow::V3(_) => panic!("Expected Legacy workflow"),
+        }
+
+        let count_after = LEGACY_WORKFLOW_LOADS_TOTAL.load(Ordering::Relaxed);
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "Legacy load counter must be incremented"
+        );
+
+        // 3. Fallback when legacy is disabled
+        std::env::set_var("ACTIONRUNNER_DISABLE_LEGACY", "1");
+        let res_disabled = resolve_workflow_for_event(dir.path(), "push", 600);
+        std::env::remove_var("ACTIONRUNNER_DISABLE_LEGACY");
+
+        match res_disabled {
+            Err(WorkflowResolveError::LegacyDisabled) => {}
+            other => panic!("Expected LegacyDisabled error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_legacy_workflow_loaded_tracing_and_telemetry_counter() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for SharedLogBuffer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log_buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer_buf = log_buffer.clone();
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedLogBuffer(writer_buf.clone()))
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempdir().unwrap();
+        let repo_dir = dir.path().join("telemetry-test-repo");
+        let ar_dir = repo_dir.join(".actionrunner");
+        std::fs::create_dir_all(&ar_dir).unwrap();
+
+        let legacy_content = r#"
+version: "2"
+name: "Legacy Pipeline"
+stages:
+  - id: legacy-stage
+    name: "Legacy Stage"
+    run: "cargo test"
+"#;
+        let legacy_path = ar_dir.join("on-push.yml");
+        std::fs::write(&legacy_path, legacy_content).unwrap();
+
+        let count_before = legacy_workflow_loads_total();
+
+        let res = tracing::subscriber::with_default(subscriber, || {
+            resolve_workflow_for_event(&repo_dir, "push", 600)
+        });
+
+        assert!(res.is_ok(), "resolve_workflow_for_event should succeed");
+        assert!(matches!(res.unwrap(), ResolvedWorkflow::Legacy(_)));
+
+        let count_after = legacy_workflow_loads_total();
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "legacy_workflow_loads_total must be incremented"
+        );
+
+        let prometheus_metric = legacy_workflow_loads_prometheus_metric();
+        let expected_metric = format!(
+            "# TYPE actionrunner_legacy_workflow_loads_total counter\nactionrunner_legacy_workflow_loads_total {}\n",
+            count_after
+        );
+        assert_eq!(prometheus_metric, expected_metric);
+
+        let captured_logs = String::from_utf8(log_buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured_logs.contains("legacy_workflow_loaded"),
+            "Logs must contain 'legacy_workflow_loaded', got: {}",
+            captured_logs
+        );
+        assert!(
+            captured_logs.contains("telemetry-test-repo"),
+            "Logs must contain repo name 'telemetry-test-repo', got: {}",
+            captured_logs
+        );
+        assert!(
+            captured_logs.contains("on-push.yml"),
+            "Logs must contain legacy file 'on-push.yml', got: {}",
+            captured_logs
+        );
     }
 }

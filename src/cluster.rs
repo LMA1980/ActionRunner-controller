@@ -13,6 +13,7 @@ pub struct ClusterNodeView {
     pub tags: Vec<String>,
     pub max_slots: u32,
     pub active_slots: u32,
+    pub exclusive_locked: bool,
     pub ram_total_mb: u64,
     pub ram_used_mb: u64,
     pub cpu_load_pct: f32,
@@ -22,6 +23,9 @@ pub struct ClusterNodeView {
     pub is_online: bool,
 }
 
+pub type NodeView = ClusterNodeView;
+
+#[allow(clippy::large_enum_variant)]
 pub enum WorkerCommand {
     Dispatch(StageDispatchTask),
     Cancel(StageCancelTask),
@@ -108,6 +112,26 @@ impl ClusterRegistry {
         required_toolchain: Option<&str>,
         exclusive: bool,
     ) -> Option<(String, mpsc::Sender<WorkerCommand>)> {
+        self.lease_slot_with_limit(
+            job_id,
+            stage_id,
+            required_tags,
+            required_toolchain,
+            exclusive,
+            None,
+        )
+        .await
+    }
+
+    pub async fn lease_slot_with_limit(
+        &self,
+        job_id: &str,
+        stage_id: &str,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+        exclusive: bool,
+        max_concurrent_per_node: Option<u32>,
+    ) -> Option<(String, mpsc::Sender<WorkerCommand>)> {
         let mut workers = self.workers.write().await;
         let now = Utc::now();
 
@@ -134,8 +158,12 @@ impl ClusterRegistry {
                     continue;
                 }
             } else {
-                // Non-exclusive stage: require available slot capacity under max_slots.
-                if worker.leased_stages.len() >= worker.registration.max_slots as usize {
+                // Non-exclusive stage: limit by max_concurrent_per_node.min(node.max_slots)
+                let limit = match max_concurrent_per_node {
+                    Some(lim) if lim > 0 => lim.min(worker.registration.max_slots),
+                    _ => worker.registration.max_slots,
+                };
+                if (worker.leased_stages.len() as u32) >= limit {
                     continue;
                 }
             }
@@ -278,6 +306,7 @@ impl ClusterRegistry {
                     tags: w.registration.tags.clone(),
                     max_slots: w.registration.max_slots,
                     active_slots: w.leased_stages.len() as u32,
+                    exclusive_locked: w.exclusive_lease.is_some(),
                     ram_total_mb: w.registration.ram_total_mb,
                     ram_used_mb: w.ram_used_mb,
                     cpu_load_pct: w.cpu_load_pct,
@@ -314,7 +343,7 @@ mod tests {
 
         // When node registers with max_slots = 1, controller enforces 1 stage at a time
         cluster
-            .register(make_reg("entrance", &["fmt", "audit"], 1), tx)
+            .register(make_reg("node-a", &["fmt", "audit"], 1), tx)
             .await;
 
         let req_fmt = vec!["fmt".to_string()];
@@ -325,12 +354,12 @@ mod tests {
             .lease_slot("job-repo-1", "fmt-check", &req_fmt, None, false)
             .await;
         assert!(lease1.is_some());
-        assert_eq!(lease1.unwrap().0, "entrance");
+        assert_eq!(lease1.unwrap().0, "node-a");
 
         // In-flight worker heartbeat reporting active_slots = 0 must NOT clobber the controller lease
         cluster
             .heartbeat(WorkerHeartbeat {
-                node_id: "entrance".to_string(),
+                node_id: "node-a".to_string(),
                 active_slots: 0,
                 cpu_load_pct: 12.0,
                 ram_used_mb: 1024,
@@ -338,7 +367,7 @@ mod tests {
             })
             .await;
 
-        // Second lease on entrance while job-repo-1 is still running must return None
+        // Second lease on node-a while job-repo-1 is still running must return None
         let lease2 = cluster
             .lease_slot("job-repo-2", "audit-check", &req_audit, None, false)
             .await;
@@ -346,22 +375,22 @@ mod tests {
 
         // Releasing a different job/stage cannot free job-repo-1's slot
         cluster
-            .release_stage_slot("entrance", "job-repo-2", "audit-check")
+            .release_stage_slot("node-a", "job-repo-2", "audit-check")
             .await;
         assert!(cluster
             .lease_slot("job-repo-2", "audit-check", &req_audit, None, false)
             .await
             .is_none());
 
-        // Releasing job-repo-1's stage frees entrance for job-repo-2
+        // Releasing job-repo-1's stage frees node-a for job-repo-2
         cluster
-            .release_stage_slot("entrance", "job-repo-1", "fmt-check")
+            .release_stage_slot("node-a", "job-repo-1", "fmt-check")
             .await;
         let lease3 = cluster
             .lease_slot("job-repo-2", "audit-check", &req_audit, None, false)
             .await;
         assert!(lease3.is_some());
-        assert_eq!(lease3.unwrap().0, "entrance");
+        assert_eq!(lease3.unwrap().0, "node-a");
     }
 
     /// Scenario 1: Drain Before Dispatch
@@ -611,5 +640,147 @@ mod tests {
             lease_fresh.is_some(),
             "Reconnected worker node should accept leases cleanly without stale locks"
         );
+    }
+
+    /// Sub-task #24: Cross-node parallel execution with per-node exclusive serialization
+    #[tokio::test]
+    async fn cross_node_parallel_per_node_exclusive() {
+        let cluster = ClusterRegistry::new();
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (tx2, _rx2) = mpsc::channel(8);
+        let (tx3, _rx3) = mpsc::channel(8);
+
+        // 3-node cluster: control-node, storage-node, worker-node
+        cluster
+            .register(make_reg("control-node", &["control"], 4), tx1)
+            .await;
+        cluster
+            .register(make_reg("storage-node", &["storage"], 4), tx2)
+            .await;
+        cluster
+            .register(make_reg("worker-node", &["compute"], 4), tx3)
+            .await;
+
+        let ctrl_tag = vec!["control".to_string()];
+        let stor_tag = vec!["storage".to_string()];
+        let comp_tag = vec!["compute".to_string()];
+
+        // 1. Lease non-exclusive stage on control-node with max_concurrent_per_node = 1
+        let lease_ctrl_1 = cluster
+            .lease_slot_with_limit("job-1", "stage-ctrl-1", &ctrl_tag, None, false, Some(1))
+            .await;
+        assert_eq!(
+            lease_ctrl_1.as_ref().map(|(n, _)| n.as_str()),
+            Some("control-node")
+        );
+
+        // 2. Second stage on control-node with limit 1 MUST be rejected (per-node serialization)
+        let lease_ctrl_2 = cluster
+            .lease_slot_with_limit("job-1", "stage-ctrl-2", &ctrl_tag, None, false, Some(1))
+            .await;
+        assert!(
+            lease_ctrl_2.is_none(),
+            "control-node should reject second stage when max_concurrent_per_node: 1 is reached"
+        );
+
+        // 3. Concurrently lease non-exclusive stage on storage-node (cross-node parallelism)
+        let lease_stor_1 = cluster
+            .lease_slot_with_limit("job-1", "stage-stor-1", &stor_tag, None, false, Some(1))
+            .await;
+        assert_eq!(
+            lease_stor_1.as_ref().map(|(n, _)| n.as_str()),
+            Some("storage-node"),
+            "storage-node should execute stage in parallel with control-node"
+        );
+
+        // 4. Lease first exclusive stage on worker-node
+        let lease_comp_exc1 = cluster
+            .lease_slot_with_limit("job-1", "stage-comp-exc1", &comp_tag, None, true, None)
+            .await;
+        assert_eq!(
+            lease_comp_exc1.as_ref().map(|(n, _)| n.as_str()),
+            Some("worker-node")
+        );
+
+        // Check node views: worker-node has exclusive_locked = true and active_slots = 1
+        let views = cluster.list_nodes_view().await;
+        let worker_view = views
+            .iter()
+            .find(|v| v.node_id == "worker-node")
+            .expect("worker-node present");
+        assert_eq!(worker_view.active_slots, 1);
+        assert!(worker_view.exclusive_locked);
+
+        // 5. While worker-node holds exclusive lease, subsequent exclusive AND non-exclusive stages are blocked
+        let lease_comp_blocked = cluster
+            .lease_slot_with_limit("job-1", "stage-comp-exc2", &comp_tag, None, true, None)
+            .await;
+        assert!(
+            lease_comp_blocked.is_none(),
+            "worker-node should block second exclusive stage while first is active"
+        );
+
+        let lease_comp_nonexc_blocked = cluster
+            .lease_slot_with_limit(
+                "job-1",
+                "stage-comp-shared",
+                &comp_tag,
+                None,
+                false,
+                Some(1),
+            )
+            .await;
+        assert!(
+            lease_comp_nonexc_blocked.is_none(),
+            "worker-node should block non-exclusive stage while exclusive lock is held"
+        );
+
+        // 6. Release first exclusive stage on worker-node
+        cluster
+            .release_stage_slot("worker-node", "job-1", "stage-comp-exc1")
+            .await;
+
+        let views_post_release = cluster.list_nodes_view().await;
+        let worker_view_post = views_post_release
+            .iter()
+            .find(|v| v.node_id == "worker-node")
+            .expect("worker-node present");
+        assert_eq!(worker_view_post.active_slots, 0);
+        assert!(!worker_view_post.exclusive_locked);
+
+        // 7. Now second exclusive stage can be leased (FIFO serialization)
+        let lease_comp_exc2 = cluster
+            .lease_slot_with_limit("job-1", "stage-comp-exc2", &comp_tag, None, true, None)
+            .await;
+        assert_eq!(
+            lease_comp_exc2.as_ref().map(|(n, _)| n.as_str()),
+            Some("worker-node"),
+            "worker-node should now acquire exclusive lease for stage-comp-exc2"
+        );
+
+        // Release all remaining stages
+        cluster
+            .release_stage_slot("control-node", "job-1", "stage-ctrl-1")
+            .await;
+        cluster
+            .release_stage_slot("storage-node", "job-1", "stage-stor-1")
+            .await;
+        cluster
+            .release_stage_slot("worker-node", "job-1", "stage-comp-exc2")
+            .await;
+
+        let final_views = cluster.list_nodes_view().await;
+        for view in final_views {
+            assert_eq!(
+                view.active_slots, 0,
+                "Node {} should have zero active slots",
+                view.node_id
+            );
+            assert!(
+                !view.exclusive_locked,
+                "Node {} should not have exclusive lock",
+                view.node_id
+            );
+        }
     }
 }

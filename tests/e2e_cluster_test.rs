@@ -321,10 +321,10 @@ stages:
         axum::serve(listener, app).await.unwrap();
     });
 
-    // Spawn 2 workers (entrance for fmt/audit, rubicon for clippy)
+    // Spawn 2 workers (node-a for fmt/audit, storage-node for clippy)
     for (node_id, tags) in [
-        ("entrance", vec!["fmt".to_string(), "audit".to_string()]),
-        ("rubicon", vec!["clippy".to_string()]),
+        ("node-a", vec!["fmt".to_string(), "audit".to_string()]),
+        ("storage-node", vec!["clippy".to_string()]),
     ] {
         let worker_ws = temp_dir.path().join(format!("worker_{}", node_id));
         tokio::fs::create_dir_all(&worker_ws).await.unwrap();
