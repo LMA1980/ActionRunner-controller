@@ -1,650 +1,128 @@
 use chrono::{DateTime, Utc};
-use duckdb::{params, Connection, OptionalExt};
+use muobserve_ipc::{CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::job::{extract_submodule_job, normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
+use crate::job::{normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
+use crate::storage_backend::{
+    compute_next_branch_snapshot, compute_next_submodule_snapshots,
+    resolve_direct_repo_from_snapshots, resolve_submodule_from_snapshots,
+};
 
-pub struct DuckDbStore {
-    conn: Mutex<Connection>,
+#[derive(Default)]
+struct InMemoryCatalog {
+    jobs: BTreeMap<String, CentralJobRecord>,
+    branch_snapshots: BTreeMap<(String, String), CentralBranchSnapshot>,
+    submodule_snapshots: BTreeMap<(String, String, String), CentralSubmoduleSnapshot>,
 }
 
-impl DuckDbStore {
-    pub fn open(db_path: Option<&Path>) -> Result<Self, String> {
-        let conn = match db_path {
-            Some(path) => {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                Connection::open(path)
-                    .map_err(|e| format!("Failed to open DuckDB at {}: {}", path.display(), e))?
-            }
-            None => Connection::open_in_memory()
-                .map_err(|e| format!("Failed to open in-memory DuckDB: {}", e))?,
-        };
+/// Pure-Rust in-memory state catalog for test harnesses and log metric extraction
+/// following Phase 3 local DuckDB decommissioning (`#45`–`#47`).
+#[derive(Default)]
+pub struct CatalogStore {
+    inner: Mutex<InMemoryCatalog>,
+}
 
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
-        store.init_schema()?;
-        Ok(store)
-    }
-
-    fn init_schema(&self) -> Result<(), String> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| "DuckDB mutex poisoned".to_string())?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS jobs_history (
-                job_id VARCHAR PRIMARY KEY,
-                event_type VARCHAR NOT NULL,
-                repo_name VARCHAR NOT NULL,
-                repo_key VARCHAR NOT NULL,
-                clone_url VARCHAR NOT NULL,
-                commit_sha VARCHAR NOT NULL,
-                ref_name VARCHAR NOT NULL,
-                branch_key VARCHAR NOT NULL,
-                sender VARCHAR NOT NULL,
-                queued_at_us BIGINT NOT NULL,
-                updated_at_us BIGINT NOT NULL,
-                status_state VARCHAR NOT NULL,
-                exit_code INTEGER,
-                duration_secs BIGINT,
-                quality_score INTEGER,
-                letter_grade VARCHAR,
-                coverage_pct DOUBLE,
-                benchmark_summary VARCHAR,
-                tests_passed INTEGER,
-                tests_total INTEGER,
-                advisories_count INTEGER,
-                clippy_warnings INTEGER,
-                record_json VARCHAR NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS branch_snapshots (
-                repo_key VARCHAR NOT NULL,
-                branch_key VARCHAR NOT NULL,
-                repo_name VARCHAR NOT NULL,
-                ref_name VARCHAR NOT NULL,
-                latest_active_job_id VARCHAR,
-                latest_active_json VARCHAR,
-                latest_active_queued_us BIGINT,
-                latest_completed_job_id VARCHAR,
-                latest_completed_json VARCHAR,
-                latest_completed_queued_us BIGINT,
-                PRIMARY KEY (repo_key, branch_key)
-            );
-
-            CREATE TABLE IF NOT EXISTS submodule_snapshots (
-                parent_repo_key VARCHAR NOT NULL,
-                branch_key VARCHAR NOT NULL,
-                submodule_key VARCHAR NOT NULL,
-                submodule_path_key VARCHAR NOT NULL,
-                latest_active_job_id VARCHAR,
-                latest_active_json VARCHAR,
-                latest_active_queued_us BIGINT,
-                latest_completed_job_id VARCHAR,
-                latest_completed_json VARCHAR,
-                latest_completed_queued_us BIGINT,
-                PRIMARY KEY (parent_repo_key, branch_key, submodule_key)
-            );
-            "#,
-        )
-        .map_err(|e| format!("Failed to initialize DuckDB schema: {}", e))?;
-
-        Ok(())
+impl CatalogStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(InMemoryCatalog::default()),
+        }
     }
 
     pub fn upsert_record(&self, record: &JobRecord) {
-        let Ok(conn) = self.conn.lock() else {
-            warn!("DuckDB mutex poisoned during upsert_record");
+        let Ok(mut guard) = self.inner.lock() else {
+            warn!("CatalogStore mutex poisoned during upsert_record");
             return;
         };
-        Self::upsert_record_on_conn(&conn, record);
+        Self::upsert_record_inner(&mut guard, record);
     }
 
     pub fn upsert_records_batch(&self, records: &[JobRecord]) {
-        let Ok(conn) = self.conn.lock() else {
-            warn!("DuckDB mutex poisoned during upsert_records_batch");
+        let Ok(mut guard) = self.inner.lock() else {
+            warn!("CatalogStore mutex poisoned during upsert_records_batch");
             return;
         };
-        let _ = conn.execute_batch("BEGIN TRANSACTION;");
         for rec in records {
-            Self::upsert_record_on_conn(&conn, rec);
+            Self::upsert_record_inner(&mut guard, rec);
         }
-        let _ = conn.execute_batch("COMMIT;");
     }
 
-    fn upsert_record_on_conn(conn: &Connection, record: &JobRecord) {
-        let Ok(record_json) = serde_json::to_string(record) else {
+    fn upsert_record_inner(catalog: &mut InMemoryCatalog, record: &JobRecord) {
+        let Some(central) = Self::to_central_job_record(record) else {
             return;
         };
+        let repo_key = central.repo_key.clone();
+        let branch_key = central.branch_key.clone();
 
-        let repo_key = record.job.repo_name.to_ascii_lowercase();
-        let branch_key = normalize_ref(&record.job.ref_name).to_ascii_lowercase();
-        let queued_at_us = record.job.queued_at.timestamp_micros();
-        let updated_at_us = record.updated_at.timestamp_micros();
+        let existing_branch = catalog
+            .branch_snapshots
+            .get(&(repo_key.clone(), branch_key.clone()))
+            .cloned();
 
-        let (status_state, exit_code, duration_secs) = match &record.status {
-            JobStatus::Queued => ("Queued", None, None),
-            JobStatus::Running { .. } => ("Running", None, None),
-            JobStatus::Completed {
-                duration_secs,
-                exit_code,
-            } => ("Completed", Some(*exit_code), Some(*duration_secs as i64)),
-            JobStatus::Failed { .. } => ("Failed", None, None),
-            JobStatus::Skipped { .. } => ("Skipped", None, None),
-        };
+        let next_branch =
+            compute_next_branch_snapshot(existing_branch.as_ref(), record, |rk, bk| {
+                catalog
+                    .jobs
+                    .values()
+                    .filter(|j| {
+                        j.repo_key == rk
+                            && j.branch_key == bk
+                            && j.status_state != "Skipped"
+                            && j.job_id != record.job.id
+                    })
+                    .max_by_key(|j| (j.queued_at_us, j.updated_at_us))
+                    .map(|j| (j.job_id.clone(), j.record_json.clone(), j.queued_at_us))
+            });
 
-        let (
-            quality_score,
-            letter_grade,
-            coverage_pct,
-            benchmark_summary,
-            tests_passed,
-            tests_total,
-            advisories_count,
-            clippy_warnings,
-        ) = match &record.metrics {
-            Some(m) => (
-                Some(m.quality_score as i32),
-                Some(m.letter_grade.clone()),
-                m.coverage_pct,
-                m.benchmark_summary.clone(),
-                Some(m.tests_passed as i32),
-                Some(m.tests_total as i32),
-                Some(m.advisories_count as i32),
-                Some(m.clippy_warnings as i32),
-            ),
-            None => (None, None, None, None, None, None, None, None),
-        };
-
-        if let Err(e) = conn.execute(
-            r#"
-            INSERT OR REPLACE INTO jobs_history (
-                job_id, event_type, repo_name, repo_key, clone_url, commit_sha,
-                ref_name, branch_key, sender, queued_at_us, updated_at_us,
-                status_state, exit_code, duration_secs, quality_score, letter_grade,
-                coverage_pct, benchmark_summary, tests_passed, tests_total,
-                advisories_count, clippy_warnings, record_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                record.job.id,
-                record.job.event_type,
-                record.job.repo_name,
-                repo_key,
-                record.job.clone_url,
-                record.job.commit_sha,
-                record.job.ref_name,
-                branch_key,
-                record.job.sender,
-                queued_at_us,
-                updated_at_us,
-                status_state,
-                exit_code,
-                duration_secs,
-                quality_score,
-                letter_grade,
-                coverage_pct,
-                benchmark_summary,
-                tests_passed,
-                tests_total,
-                advisories_count,
-                clippy_warnings,
-                record_json,
-            ],
-        ) {
-            warn!(job_id = %record.job.id, error = %e, "Failed to upsert into jobs_history");
+        if let Some(nb) = next_branch {
+            catalog
+                .branch_snapshots
+                .insert((repo_key.clone(), branch_key.clone()), nb);
         }
 
-        Self::sync_branch_snapshot(
-            conn,
-            record,
-            &repo_key,
-            &branch_key,
-            queued_at_us,
-            &record_json,
-        );
-        Self::sync_submodule_snapshots(conn, record, &repo_key, &branch_key, queued_at_us);
-    }
+        let existing_subs: Vec<CentralSubmoduleSnapshot> = catalog
+            .submodule_snapshots
+            .iter()
+            .filter(|((prk, bk, _), _)| prk == &repo_key && bk == &branch_key)
+            .map(|(_, v)| v.clone())
+            .collect();
 
-    fn sync_branch_snapshot(
-        conn: &Connection,
-        record: &JobRecord,
-        repo_key: &str,
-        branch_key: &str,
-        queued_at_us: i64,
-        record_json: &str,
-    ) {
-        type SnapshotRow = (
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        );
-
-        let existing: Option<SnapshotRow> = conn
-            .query_row(
-                r#"
-                SELECT
-                    latest_active_job_id,
-                    latest_active_json,
-                    latest_active_queued_us,
-                    latest_completed_job_id,
-                    latest_completed_json,
-                    latest_completed_queued_us
-                FROM branch_snapshots
-                WHERE repo_key = ? AND branch_key = ?
-                "#,
-                params![repo_key, branch_key],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .unwrap_or(None);
-
-        let (
-            mut active_id,
-            mut active_json,
-            mut active_q_us,
-            mut comp_id,
-            mut comp_json,
-            mut comp_q_us,
-        ) = existing.unwrap_or((None, None, None, None, None, None));
-
-        let is_skipped = matches!(record.status, JobStatus::Skipped { .. });
-        let is_completed = matches!(
-            record.status,
-            JobStatus::Completed { .. } | JobStatus::Failed { .. }
-        );
-
-        if is_skipped {
-            // Skipped jobs are ignored by both pills and scorecards.
-            // If this job was previously the active job on this branch, fallback to the newest unskipped job.
-            if active_id.as_deref() == Some(record.job.id.as_str()) {
-                let fallback: Option<(String, String, i64)> = conn
-                    .query_row(
-                        r#"
-                        SELECT job_id, record_json, queued_at_us
-                        FROM jobs_history
-                        WHERE repo_key = ? AND branch_key = ? AND status_state != 'Skipped'
-                        ORDER BY queued_at_us DESC, updated_at_us DESC
-                        LIMIT 1
-                        "#,
-                        params![repo_key, branch_key],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()
-                    .unwrap_or(None);
-
-                if let Some((fb_id, fb_json, fb_q)) = fallback {
-                    active_id = Some(fb_id);
-                    active_json = Some(fb_json);
-                    active_q_us = Some(fb_q);
-                } else {
-                    active_id = comp_id.clone();
-                    active_json = comp_json.clone();
-                    active_q_us = comp_q_us;
-                }
-            }
-        } else {
-            // Unskipped job (Queued, Running, Completed, Failed)
-            let should_update_active = active_id.is_none()
-                || active_id.as_deref() == Some(record.job.id.as_str())
-                || queued_at_us >= active_q_us.unwrap_or(i64::MIN);
-
-            if should_update_active {
-                active_id = Some(record.job.id.clone());
-                active_json = Some(record_json.to_string());
-                active_q_us = Some(queued_at_us);
-            }
-
-            if is_completed {
-                let should_update_comp = comp_id.is_none()
-                    || comp_id.as_deref() == Some(record.job.id.as_str())
-                    || queued_at_us >= comp_q_us.unwrap_or(i64::MIN);
-
-                if should_update_comp {
-                    comp_id = Some(record.job.id.clone());
-                    comp_json = Some(record_json.to_string());
-                    comp_q_us = Some(queued_at_us);
-                }
-            }
-        }
-
-        // Only persist snapshot row if we have at least an active or completed job
-        if active_id.is_some() || comp_id.is_some() {
-            let _ = conn.execute(
-                r#"
-                INSERT OR REPLACE INTO branch_snapshots (
-                    repo_key, branch_key, repo_name, ref_name,
-                    latest_active_job_id, latest_active_json, latest_active_queued_us,
-                    latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                params![
-                    repo_key,
-                    branch_key,
-                    record.job.repo_name,
-                    record.job.ref_name,
-                    active_id,
-                    active_json,
-                    active_q_us,
-                    comp_id,
-                    comp_json,
-                    comp_q_us,
-                ],
+        for next_sub in compute_next_submodule_snapshots(&existing_subs, record) {
+            catalog.submodule_snapshots.insert(
+                (
+                    next_sub.parent_repo_key.clone(),
+                    next_sub.branch_key.clone(),
+                    next_sub.submodule_key.clone(),
+                ),
+                next_sub,
             );
         }
+
+        catalog.jobs.insert(central.job_id.clone(), central);
     }
 
-    fn sync_submodule_snapshots(
-        conn: &Connection,
-        record: &JobRecord,
-        parent_repo_key: &str,
-        branch_key: &str,
-        queued_at_us: i64,
-    ) {
-        let is_skipped = matches!(record.status, JobStatus::Skipped { .. });
-        let is_completed = matches!(
-            record.status,
-            JobStatus::Completed { .. } | JobStatus::Failed { .. }
-        );
-
-        if let Some(ref metrics) = record.metrics {
-            for (sub_name, sub) in &metrics.submodules {
-                let Some(sub_record) = extract_submodule_job(record, sub_name) else {
-                    continue;
-                };
-                let Ok(sub_json) = serde_json::to_string(&sub_record) else {
-                    continue;
-                };
-
-                let sub_short = sub_name
-                    .rsplit_once('/')
-                    .map(|(_, r)| r)
-                    .unwrap_or(sub_name)
-                    .to_ascii_lowercase();
-                let path_short = sub
-                    .path
-                    .rsplit_once('/')
-                    .map(|(_, r)| r)
-                    .unwrap_or(&sub.path)
-                    .to_ascii_lowercase();
-
-                Self::upsert_single_submodule_snapshot(
-                    conn,
-                    parent_repo_key,
-                    branch_key,
-                    &sub_short,
-                    &path_short,
-                    &record.job.id,
-                    &sub_json,
-                    queued_at_us,
-                    is_skipped,
-                    is_completed,
-                );
-            }
-        } else {
-            // Parent job has no metrics yet (e.g., Queued or Running, or Skipped).
-            // Propagate active status to any already-known submodules of (parent_repo_key, branch_key)
-            // while preserving their latest_completed_json.
-            let mut existing_subs = Vec::new();
-            if let Ok(mut stmt) = conn.prepare(
-                r#"
-                SELECT
-                    submodule_key,
-                    submodule_path_key,
-                    latest_active_job_id,
-                    latest_active_json,
-                    latest_active_queued_us,
-                    latest_completed_job_id,
-                    latest_completed_json,
-                    latest_completed_queued_us
-                FROM submodule_snapshots
-                WHERE parent_repo_key = ? AND branch_key = ?
-                "#,
-            ) {
-                if let Ok(rows) = stmt.query_map(params![parent_repo_key, branch_key], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                    ))
-                }) {
-                    for r in rows.flatten() {
-                        existing_subs.push(r);
-                    }
-                }
-            }
-
-            let owner = record
-                .job
-                .repo_name
-                .split_once('/')
-                .map(|(o, _)| o)
-                .unwrap_or("LMA1980");
-
-            for (
-                sub_key,
-                path_key,
-                mut act_id,
-                mut act_json,
-                mut act_q_us,
-                comp_id,
-                comp_json,
-                comp_q_us,
-            ) in existing_subs
-            {
-                if is_skipped {
-                    if act_id.as_deref() == Some(record.job.id.as_str()) {
-                        act_id = comp_id.clone();
-                        act_json = comp_json.clone();
-                        act_q_us = comp_q_us;
-                    }
-                } else if matches!(record.status, JobStatus::Queued | JobStatus::Running { .. }) {
-                    let should_update = act_id.is_none()
-                        || act_id.as_deref() == Some(record.job.id.as_str())
-                        || queued_at_us >= act_q_us.unwrap_or(i64::MIN);
-
-                    if should_update {
-                        let sub_job = Job {
-                            id: format!("{}-{}", record.job.id, sub_key),
-                            event_type: record.job.event_type.clone(),
-                            repo_name: format!("{}/{}", owner, sub_key),
-                            clone_url: String::new(),
-                            commit_sha: record.job.commit_sha.clone(),
-                            ref_name: record.job.ref_name.clone(),
-                            sender: record.job.sender.clone(),
-                            queued_at: record.job.queued_at,
-                        };
-                        let synth_rec = JobRecord {
-                            job: sub_job,
-                            status: record.status.clone(),
-                            log_file: record.log_file.clone(),
-                            updated_at: record.updated_at,
-                            metrics: None,
-                            stages: Vec::new(),
-                        };
-                        if let Ok(s_json) = serde_json::to_string(&synth_rec) {
-                            act_id = Some(record.job.id.clone());
-                            act_json = Some(s_json);
-                            act_q_us = Some(queued_at_us);
-                        }
-                    }
-                }
-
-                let _ = conn.execute(
-                    r#"
-                    INSERT OR REPLACE INTO submodule_snapshots (
-                        parent_repo_key, branch_key, submodule_key, submodule_path_key,
-                        latest_active_job_id, latest_active_json, latest_active_queued_us,
-                        latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    "#,
-                    params![
-                        parent_repo_key,
-                        branch_key,
-                        sub_key,
-                        path_key,
-                        act_id,
-                        act_json,
-                        act_q_us,
-                        comp_id,
-                        comp_json,
-                        comp_q_us,
-                    ],
-                );
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn upsert_single_submodule_snapshot(
-        conn: &Connection,
-        parent_repo_key: &str,
-        branch_key: &str,
-        sub_key: &str,
-        path_key: &str,
-        parent_job_id: &str,
-        sub_json: &str,
-        queued_at_us: i64,
-        is_skipped: bool,
-        is_completed: bool,
-    ) {
-        type SubRow = (
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        );
-
-        let existing: Option<SubRow> = conn
-            .query_row(
-                r#"
-                SELECT
-                    latest_active_job_id,
-                    latest_active_json,
-                    latest_active_queued_us,
-                    latest_completed_job_id,
-                    latest_completed_json,
-                    latest_completed_queued_us
-                FROM submodule_snapshots
-                WHERE parent_repo_key = ? AND branch_key = ? AND submodule_key = ?
-                "#,
-                params![parent_repo_key, branch_key, sub_key],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .unwrap_or(None);
-
-        let (mut act_id, mut act_json, mut act_q_us, mut comp_id, mut comp_json, mut comp_q_us) =
-            existing.unwrap_or((None, None, None, None, None, None));
-
-        if !is_skipped {
-            let should_update_act = act_id.is_none()
-                || act_id.as_deref() == Some(parent_job_id)
-                || queued_at_us >= act_q_us.unwrap_or(i64::MIN);
-
-            if should_update_act {
-                act_id = Some(parent_job_id.to_string());
-                act_json = Some(sub_json.to_string());
-                act_q_us = Some(queued_at_us);
-            }
-
-            // Update completed snapshot if parent job is completed, or if no completed snapshot exists yet
-            if is_completed || comp_id.is_none() {
-                let should_update_comp = comp_id.is_none()
-                    || comp_id.as_deref() == Some(parent_job_id)
-                    || queued_at_us >= comp_q_us.unwrap_or(i64::MIN);
-
-                if should_update_comp {
-                    comp_id = Some(parent_job_id.to_string());
-                    comp_json = Some(sub_json.to_string());
-                    comp_q_us = Some(queued_at_us);
-                }
-            }
-        }
-
-        let _ = conn.execute(
-            r#"
-            INSERT OR REPLACE INTO submodule_snapshots (
-                parent_repo_key, branch_key, submodule_key, submodule_path_key,
-                latest_active_job_id, latest_active_json, latest_active_queued_us,
-                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-            params![
-                parent_repo_key,
-                branch_key,
-                sub_key,
-                path_key,
-                act_id,
-                act_json,
-                act_q_us,
-                comp_id,
-                comp_json,
-                comp_q_us,
-            ],
-        );
-    }
-
-    /// Loads recent jobs from DuckDB `jobs_history` ordered newest-first.
+    /// Loads recent jobs ordered newest-first.
     pub fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord> {
-        let Ok(conn) = self.conn.lock() else {
+        let Ok(guard) = self.inner.lock() else {
             return Vec::new();
         };
 
-        let mut records = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(
-            r#"
-            SELECT record_json
-            FROM jobs_history
-            ORDER BY queued_at_us DESC, updated_at_us DESC
-            LIMIT ?
-            "#,
-        ) {
-            if let Ok(rows) = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0)) {
-                for r in rows.flatten() {
-                    if let Ok(rec) = serde_json::from_str::<JobRecord>(&r) {
-                        records.push(rec);
-                    }
-                }
-            }
-        }
+        let mut records: Vec<&CentralJobRecord> = guard.jobs.values().collect();
+        records.sort_by(|a, b| {
+            b.queued_at_us
+                .cmp(&a.queued_at_us)
+                .then_with(|| b.updated_at_us.cmp(&a.updated_at_us))
+        });
+
         records
+            .into_iter()
+            .take(limit)
+            .filter_map(|r| serde_json::from_str::<JobRecord>(&r.record_json).ok())
+            .collect()
     }
 
     /// Loads `branch_snapshots` rows filtered by optional `repo_key` and `branch_key`.
@@ -652,50 +130,26 @@ impl DuckDbStore {
         &self,
         repo_key: Option<&str>,
         branch_key: Option<&str>,
-    ) -> Vec<muobserve_ipc::CentralBranchSnapshot> {
-        let Ok(conn) = self.conn.lock() else {
+    ) -> Vec<CentralBranchSnapshot> {
+        let Ok(guard) = self.inner.lock() else {
             return Vec::new();
         };
 
         let repo_norm = repo_key.map(|r| r.to_ascii_lowercase());
         let branch_norm = branch_key.map(|b| normalize_ref(b).to_ascii_lowercase());
 
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(
-            r#"
-            SELECT
-                repo_key, branch_key, repo_name, ref_name,
-                latest_active_job_id, latest_active_json, latest_active_queued_us,
-                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-            FROM branch_snapshots
-            WHERE (? IS NULL OR repo_key = ?)
-              AND (? IS NULL OR branch_key = ?)
-            ORDER BY repo_key ASC, branch_key ASC
-            "#,
-        ) {
-            if let Ok(rows) = stmt.query_map(
-                params![repo_norm, repo_norm, branch_norm, branch_norm],
-                |row| {
-                    Ok(muobserve_ipc::CentralBranchSnapshot {
-                        repo_key: row.get(0)?,
-                        branch_key: row.get(1)?,
-                        repo_name: row.get(2)?,
-                        ref_name: row.get(3)?,
-                        latest_active_job_id: row.get(4)?,
-                        latest_active_json: row.get(5)?,
-                        latest_active_queued_us: row.get(6)?,
-                        latest_completed_job_id: row.get(7)?,
-                        latest_completed_json: row.get(8)?,
-                        latest_completed_queued_us: row.get(9)?,
-                    })
-                },
-            ) {
-                for r in rows.flatten() {
-                    out.push(r);
-                }
-            }
-        }
-        out
+        guard
+            .branch_snapshots
+            .values()
+            .filter(|s| {
+                repo_norm.as_ref().map(|r| &s.repo_key == r).unwrap_or(true)
+                    && branch_norm
+                        .as_ref()
+                        .map(|b| &s.branch_key == b)
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Loads `submodule_snapshots` rows filtered by optional `parent_repo_key`, `submodule_key`, and `branch_key`.
@@ -704,8 +158,8 @@ impl DuckDbStore {
         parent_repo_key: Option<&str>,
         submodule_key: Option<&str>,
         branch_key: Option<&str>,
-    ) -> Vec<muobserve_ipc::CentralSubmoduleSnapshot> {
-        let Ok(conn) = self.conn.lock() else {
+    ) -> Vec<CentralSubmoduleSnapshot> {
+        let Ok(guard) = self.inner.lock() else {
             return Vec::new();
         };
 
@@ -718,54 +172,29 @@ impl DuckDbStore {
         });
         let branch_norm = branch_key.map(|b| normalize_ref(b).to_ascii_lowercase());
 
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(
-            r#"
-            SELECT
-                parent_repo_key, branch_key, submodule_key, submodule_path_key,
-                latest_active_job_id, latest_active_json, latest_active_queued_us,
-                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
-            FROM submodule_snapshots
-            WHERE (? IS NULL OR parent_repo_key = ?)
-              AND (? IS NULL OR submodule_key = ?)
-              AND (? IS NULL OR branch_key = ?)
-            ORDER BY parent_repo_key ASC, branch_key ASC, submodule_key ASC
-            "#,
-        ) {
-            if let Ok(rows) = stmt.query_map(
-                params![
-                    parent_norm,
-                    parent_norm,
-                    sub_norm,
-                    sub_norm,
-                    branch_norm,
-                    branch_norm
-                ],
-                |row| {
-                    Ok(muobserve_ipc::CentralSubmoduleSnapshot {
-                        parent_repo_key: row.get(0)?,
-                        branch_key: row.get(1)?,
-                        submodule_key: row.get(2)?,
-                        submodule_path_key: row.get(3)?,
-                        latest_active_job_id: row.get(4)?,
-                        latest_active_json: row.get(5)?,
-                        latest_active_queued_us: row.get(6)?,
-                        latest_completed_job_id: row.get(7)?,
-                        latest_completed_json: row.get(8)?,
-                        latest_completed_queued_us: row.get(9)?,
-                    })
-                },
-            ) {
-                for r in rows.flatten() {
-                    out.push(r);
-                }
-            }
-        }
-        out
+        guard
+            .submodule_snapshots
+            .values()
+            .filter(|s| {
+                parent_norm
+                    .as_ref()
+                    .map(|p| &s.parent_repo_key == p)
+                    .unwrap_or(true)
+                    && sub_norm
+                        .as_ref()
+                        .map(|sk| &s.submodule_key == sk)
+                        .unwrap_or(true)
+                    && branch_norm
+                        .as_ref()
+                        .map(|b| &s.branch_key == b)
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
     }
 
-    /// Converts a [`JobRecord`] into a [`muobserve_ipc::CentralJobRecord`].
-    pub fn to_central_job_record(record: &JobRecord) -> Option<muobserve_ipc::CentralJobRecord> {
+    /// Converts a [`JobRecord`] into a [`CentralJobRecord`].
+    pub fn to_central_job_record(record: &JobRecord) -> Option<CentralJobRecord> {
         let record_json = serde_json::to_string(record).ok()?;
         let repo_key = record.job.repo_name.to_ascii_lowercase();
         let branch_key = normalize_ref(&record.job.ref_name).to_ascii_lowercase();
@@ -810,7 +239,7 @@ impl DuckDbStore {
             None => (None, None, None, None, None, None, None, None),
         };
 
-        Some(muobserve_ipc::CentralJobRecord {
+        Some(CentralJobRecord {
             job_id: record.job.id.clone(),
             event_type: record.job.event_type.clone(),
             repo_name: record.job.repo_name.clone(),
@@ -837,133 +266,33 @@ impl DuckDbStore {
         })
     }
 
-    /// Looks up a single job by ID from `jobs_history`.
+    /// Looks up a single job by ID.
     pub fn get_job(&self, job_id: &str) -> Option<JobRecord> {
-        let conn = self.conn.lock().ok()?;
-        let json_str: String = conn
-            .query_row(
-                "SELECT record_json FROM jobs_history WHERE job_id = ?",
-                params![job_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()??;
-        serde_json::from_str(&json_str).ok()
+        let guard = self.inner.lock().ok()?;
+        let rec = guard.jobs.get(job_id)?;
+        serde_json::from_str(&rec.record_json).ok()
     }
 
-    /// Finds the latest completed (`Completed` or `Failed`) job for a repository/branch,
-    /// falling back to `submodule_snapshots` if the target refers to a submodule.
+    /// Finds the latest completed (`Completed` or `Failed`) job for a repository/branch.
     pub fn find_latest_completed(&self, repo: &str, branch: Option<&str>) -> Option<JobRecord> {
-        let conn = self.conn.lock().ok()?;
-        let (_active, completed) = Self::resolve_repo_snapshots(&conn, repo, branch);
+        let (_active, completed) = self.find_card_context(repo, branch);
         completed
     }
 
-    /// Finds `(latest_active_or_completed, latest_completed)` for a repository/branch,
-    /// ignoring `Skipped` jobs and falling back to `submodule_snapshots` if needed.
+    /// Finds `(latest_active_or_completed, latest_completed)` for a repository/branch.
     pub fn find_card_context(
         &self,
         repo: &str,
         branch: Option<&str>,
     ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let Ok(conn) = self.conn.lock() else {
-            return (None, None);
-        };
-        Self::resolve_repo_snapshots(&conn, repo, branch)
-    }
+        let branch_snapshots = self.load_branch_snapshots(None, None);
+        let sub_snapshots = self.load_submodule_snapshots(None, None, None);
 
-    /// Finds the latest completed (`Completed` or `Failed`) job for a specific submodule.
-    pub fn find_submodule_completed(
-        &self,
-        parent_repo: &str,
-        submodule: &str,
-        branch: Option<&str>,
-    ) -> Option<JobRecord> {
-        let conn = self.conn.lock().ok()?;
-        let (_active, completed) =
-            Self::resolve_submodule_snapshots(&conn, Some(parent_repo), submodule, branch);
-        completed
-    }
-
-    /// Finds `(latest_active_or_completed, latest_completed)` for a specific submodule.
-    pub fn find_submodule_card_context(
-        &self,
-        parent_repo: &str,
-        submodule: &str,
-        branch: Option<&str>,
-    ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let Ok(conn) = self.conn.lock() else {
-            return (None, None);
-        };
-        Self::resolve_submodule_snapshots(&conn, Some(parent_repo), submodule, branch)
-    }
-
-    fn resolve_direct_repo_snapshots(
-        conn: &Connection,
-        repo: &str,
-        branch: Option<&str>,
-    ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let repo_lower = repo.to_ascii_lowercase();
-        let suffix_pattern = format!("%/{}", repo_lower);
-        let branch_norm = branch.map(|b| normalize_ref(b).to_ascii_lowercase());
-
-        let row: Option<(Option<String>, Option<String>)> = if let Some(ref b_key) = branch_norm {
-            conn.query_row(
-                r#"
-                SELECT latest_active_json, latest_completed_json
-                FROM branch_snapshots
-                WHERE (repo_key = ? OR repo_key LIKE ?) AND branch_key = ?
-                ORDER BY COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                LIMIT 1
-                "#,
-                params![repo_lower, suffix_pattern, b_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .unwrap_or(None)
-        } else {
-            conn.query_row(
-                r#"
-                SELECT latest_active_json, latest_completed_json
-                FROM branch_snapshots
-                WHERE (repo_key = ? OR repo_key LIKE ?)
-                ORDER BY
-                    CASE WHEN branch_key = 'main' THEN 0 ELSE 1 END ASC,
-                    COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                LIMIT 1
-                "#,
-                params![repo_lower, suffix_pattern],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .unwrap_or(None)
-        };
-
-        let direct_active = row
-            .as_ref()
-            .and_then(|(a, _)| a.as_deref())
-            .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
-        let direct_completed = row
-            .as_ref()
-            .and_then(|(_, c)| c.as_deref())
-            .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
-
-        (direct_active, direct_completed)
-    }
-
-    fn resolve_repo_snapshots(
-        conn: &Connection,
-        repo: &str,
-        branch: Option<&str>,
-    ) -> (Option<JobRecord>, Option<JobRecord>) {
         let (mut direct_active, mut direct_completed) =
-            Self::resolve_direct_repo_snapshots(conn, repo, branch);
-
-        // 2. Also check submodule_snapshots in case repo is a standalone submodule (e.g. LMA1980/k3-core)
+            resolve_direct_repo_from_snapshots(&branch_snapshots, repo, branch);
         let (sub_active, sub_completed) =
-            Self::resolve_submodule_snapshots(conn, None, repo, branch);
+            resolve_submodule_from_snapshots(&sub_snapshots, &branch_snapshots, None, repo, branch);
 
-        // Enrich direct_completed with submodule metrics if the direct repo build had no metrics
         if let (Some(ref mut d_comp), Some(ref s_comp)) = (&mut direct_completed, &sub_completed) {
             if d_comp.metrics.is_none() && s_comp.metrics.is_some() {
                 d_comp.metrics = s_comp.metrics.clone();
@@ -983,150 +312,40 @@ impl DuckDbStore {
         if direct_active.is_some() || direct_completed.is_some() {
             return (direct_active, direct_completed);
         }
-
         (sub_active, sub_completed)
     }
 
-    fn resolve_submodule_snapshots(
-        conn: &Connection,
-        parent_repo: Option<&str>,
+    /// Finds the latest completed (`Completed` or `Failed`) job for a specific submodule.
+    pub fn find_submodule_completed(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> Option<JobRecord> {
+        let (_active, completed) = self.find_submodule_card_context(parent_repo, submodule, branch);
+        completed
+    }
+
+    /// Finds `(latest_active_or_completed, latest_completed)` for a specific submodule.
+    pub fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
         submodule: &str,
         branch: Option<&str>,
     ) -> (Option<JobRecord>, Option<JobRecord>) {
-        let clean_target = submodule
-            .rsplit_once('/')
-            .map(|(_, r)| r)
-            .unwrap_or(submodule)
-            .to_ascii_lowercase();
-        let norm_underscore = clean_target.replace('-', "_");
-        let norm_hyphen = clean_target.replace('_', "-");
-        let branch_norm = branch.map(|b| normalize_ref(b).to_ascii_lowercase());
-
-        let owner = parent_repo
-            .and_then(|p| p.split_once('/').map(|(o, _)| o))
-            .or_else(|| submodule.split_once('/').map(|(o, _)| o))
-            .unwrap_or("LMA1980");
-
-        let parent_key = parent_repo.map(|p| p.to_ascii_lowercase());
-
-        let row: Option<(Option<String>, Option<String>)> = match (&parent_key, &branch_norm) {
-            (Some(pk), Some(bk)) => {
-                let ps = format!("%/{}", pk);
-                conn.query_row(
-                        r#"
-                        SELECT latest_active_json, latest_completed_json
-                        FROM submodule_snapshots
-                        WHERE (parent_repo_key = ? OR parent_repo_key LIKE ?)
-                          AND branch_key = ?
-                          AND (submodule_key = ? OR submodule_key = ? OR submodule_key = ? OR submodule_path_key = ?)
-                        ORDER BY COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                        LIMIT 1
-                        "#,
-                        params![pk, ps, bk, clean_target, norm_underscore, norm_hyphen, clean_target],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                    .unwrap_or(None)
-            }
-            (Some(pk), None) => {
-                let ps = format!("%/{}", pk);
-                conn.query_row(
-                        r#"
-                        SELECT latest_active_json, latest_completed_json
-                        FROM submodule_snapshots
-                        WHERE (parent_repo_key = ? OR parent_repo_key LIKE ?)
-                          AND (submodule_key = ? OR submodule_key = ? OR submodule_key = ? OR submodule_path_key = ?)
-                        ORDER BY
-                            CASE WHEN branch_key = 'main' THEN 0 ELSE 1 END ASC,
-                            COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                        LIMIT 1
-                        "#,
-                        params![pk, ps, clean_target, norm_underscore, norm_hyphen, clean_target],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                    .unwrap_or(None)
-            }
-            (None, Some(bk)) => conn
-                    .query_row(
-                        r#"
-                        SELECT latest_active_json, latest_completed_json
-                        FROM submodule_snapshots
-                        WHERE branch_key = ?
-                          AND (submodule_key = ? OR submodule_key = ? OR submodule_key = ? OR submodule_path_key = ?)
-                        ORDER BY COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                        LIMIT 1
-                        "#,
-                        params![bk, clean_target, norm_underscore, norm_hyphen, clean_target],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                    .unwrap_or(None),
-            (None, None) => conn
-                    .query_row(
-                        r#"
-                        SELECT latest_active_json, latest_completed_json
-                        FROM submodule_snapshots
-                        WHERE (submodule_key = ? OR submodule_key = ? OR submodule_key = ? OR submodule_path_key = ?)
-                        ORDER BY
-                            CASE WHEN branch_key = 'main' THEN 0 ELSE 1 END ASC,
-                            COALESCE(latest_active_queued_us, latest_completed_queued_us, 0) DESC
-                        LIMIT 1
-                        "#,
-                        params![clean_target, norm_underscore, norm_hyphen, clean_target],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                    .unwrap_or(None),
-        };
-
-        let parse_and_fix_owner = |opt_s: Option<&str>| -> Option<JobRecord> {
-            let mut rec: JobRecord = serde_json::from_str(opt_s?).ok()?;
-            let short = rec
-                .job
-                .repo_name
-                .rsplit_once('/')
-                .map(|(_, r)| r)
-                .unwrap_or(&rec.job.repo_name);
-            rec.job.repo_name = format!("{}/{}", owner, short);
-            Some(rec)
-        };
-
-        let active = row
-            .as_ref()
-            .and_then(|(a, _)| parse_and_fix_owner(a.as_deref()));
-        let completed = row
-            .as_ref()
-            .and_then(|(_, c)| parse_and_fix_owner(c.as_deref()));
-
-        if active.is_some() || completed.is_some() {
-            return (active, completed);
-        }
-
-        // If queried under a parent repo (e.g. /cards/LMA1980/model-runner/submodules/k3-core/card.svg)
-        // and submodule_snapshots had no entry yet, fall back to direct standalone repository snapshots
-        if parent_repo.is_some() {
-            let direct_candidate = format!("{}/{}", owner, clean_target);
-            let (d_act, d_comp) =
-                Self::resolve_direct_repo_snapshots(conn, &direct_candidate, branch);
-            if d_act.is_some() || d_comp.is_some() {
-                return (d_act, d_comp);
-            }
-            if !clean_target.starts_with("k3-") {
-                let k3_candidate = format!("{}/k3-{}", owner, clean_target);
-                let (k_act, k_comp) =
-                    Self::resolve_direct_repo_snapshots(conn, &k3_candidate, branch);
-                if k_act.is_some() || k_comp.is_some() {
-                    return (k_act, k_comp);
-                }
-            }
-        }
-
-        (None, None)
+        let branch_snapshots = self.load_branch_snapshots(None, None);
+        let sub_snapshots = self.load_submodule_snapshots(None, None, None);
+        resolve_submodule_from_snapshots(
+            &sub_snapshots,
+            &branch_snapshots,
+            Some(parent_repo),
+            submodule,
+            branch,
+        )
     }
 
     /// Scans `workspace_dir/logs/<owner>/<repo>/job-*.log` and imports any historical log files
-    /// that were previously evicted from `jobs_index.json` into DuckDB, as well as enriching
+    /// that were previously evicted from `jobs_index.json`, as well as enriching
     /// existing completed/failed records whose `metrics` or `metrics.submodules` were missing.
     pub fn backfill_from_logs_dir(&self, workspace_dir: &Path) -> usize {
         let logs_root = workspace_dir.join("logs");
@@ -1230,13 +449,12 @@ impl DuckDbStore {
             return 0;
         }
 
-        // Sort oldest-first by queued_at so snapshots advance monotonically
         recovered_records.sort_by_key(|r| r.job.queued_at);
         let count = recovered_records.len();
         self.upsert_records_batch(&recovered_records);
         info!(
             recovered_count = count,
-            "Backfilled and enriched historical job records from workspace log files into DuckDB"
+            "Backfilled and enriched historical job records from workspace log files"
         );
         count
     }
@@ -1272,7 +490,6 @@ impl DuckDbStore {
         let mut per_dir_lines: BTreeMap<String, (u64, u64)> = BTreeMap::new();
 
         for line in content.lines() {
-            // Strip optional "<rfc3339> [<node>] [<stage>] [<stream>] " prefix
             let body = if let Some((_, after_stream)) = line.split_once("[stdout] ") {
                 after_stream
             } else if let Some((_, after_stream)) = line.split_once("[stderr] ") {
@@ -1298,10 +515,8 @@ impl DuckDbStore {
                 }
             }
 
-            // Parse cargo-llvm-cov TOTAL or per-file coverage row
             let trimmed = body.trim();
             if trimmed.starts_with("TOTAL ") {
-                // Format: TOTAL <regions> <missed> <reg_cov>% <funcs> <missed> <fn_cov>% <lines> <missed> <line_cov>%
                 let pcts: Vec<f64> = trimmed
                     .split_whitespace()
                     .filter_map(|tok| tok.strip_suffix('%'))
@@ -1312,7 +527,6 @@ impl DuckDbStore {
                 }
             } else if trimmed.contains(".rs ") && trimmed.contains('%') {
                 let cols: Vec<&str> = trimmed.split_whitespace().collect();
-                // cols: [filename, regions, missed_reg, reg_pct, funcs, missed_fn, fn_pct, lines, missed_lines, line_pct, ...]
                 if cols.len() >= 10 {
                     if let Some((dir_prefix, _)) = cols[0].split_once('/') {
                         if let (Ok(total_l), Ok(missed_l)) =
@@ -1328,7 +542,6 @@ impl DuckDbStore {
                 }
             }
 
-            // Parse benchmark summary: "... bench:       53.4 ns/iter"
             if let Some(b_idx) = body.find("bench:") {
                 let after_b = body[b_idx + "bench:".len()..].trim();
                 if let Some(first_tok) = after_b.split_whitespace().next() {
@@ -1347,7 +560,6 @@ impl DuckDbStore {
 
         let benchmark_summary = best_bench_ns.map(|ns| format!("{:.1} ns/iter", ns));
 
-        // Build submodule metrics from workspace_dir/repos/<repo_full>/.gitmodules if present
         let mut submodules = BTreeMap::new();
         let gitmodules_path = workspace_dir
             .join("repos")
@@ -1473,7 +685,6 @@ impl DuckDbStore {
         log_path: &Path,
         workspace_dir: &Path,
     ) -> Option<JobRecord> {
-        // Parse job-<timestamp>-<sha_short>[-suffix]
         let rest = job_id.strip_prefix("job-")?;
         let mut parts = rest.split('-');
         let ts_secs: i64 = parts.next()?.parse().ok()?;
@@ -1491,7 +702,6 @@ impl DuckDbStore {
             return None;
         }
 
-        // Determine if any stage failed or if all passed
         let has_failure = content.contains("Process exited with code")
             || content.contains("Stage failed")
             || content.contains("=== Pipeline Status: FAILED")
@@ -1506,7 +716,6 @@ impl DuckDbStore {
             BTreeMap::new();
 
         for line in content.lines() {
-            // Parse "<rfc3339> [<node_id>] [<stage_id>] [<stream>] <content>"
             if let Some((ts_tok, rest_line)) = line.split_once(" [") {
                 if let Ok(parsed_dt) = DateTime::parse_from_rfc3339(ts_tok.trim()) {
                     let dt_utc = parsed_dt.with_timezone(&Utc);
@@ -1560,7 +769,6 @@ impl DuckDbStore {
             })
             .collect();
 
-        // Attempt to resolve full 40-char commit SHA and branch from workspace_dir/repos/<repo_full>
         let (resolved_sha, resolved_ref) =
             Self::resolve_git_commit_and_ref(workspace_dir, repo_full, &sha_short);
 
