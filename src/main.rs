@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use action_runner_controller::app::create_router;
 use action_runner_controller::cluster::ClusterRegistry;
 use action_runner_controller::config::Config;
+use action_runner_controller::console::{spawn_reconciler, ConsoleConfig, ConsoleState};
 use action_runner_controller::job::JobStore;
 use action_runner_controller::scheduler::DAGScheduler;
 use action_runner_controller::webhook::AppState;
@@ -47,12 +48,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (log_broadcaster, _) = tokio::sync::broadcast::channel(4096);
 
+    let console = ConsoleState::new(ConsoleConfig::from_config(&config));
+    spawn_reconciler(console.clone(), job_store.clone(), cluster.clone());
+
     let state = Arc::new(AppState {
         config,
         job_store,
         cluster,
         tx,
         log_broadcaster,
+        console,
     });
 
     let app = create_router(state);

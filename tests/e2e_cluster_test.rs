@@ -156,6 +156,8 @@ on_action:
         cluster: cluster.clone(),
         tx,
         log_broadcaster,
+
+        console: action_runner_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state.clone());
@@ -458,6 +460,8 @@ edition = "2021"
         cluster: cluster.clone(),
         tx,
         log_broadcaster,
+
+        console: action_runner_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state);
@@ -809,6 +813,8 @@ edition = "2021"
         cluster: cluster.clone(),
         tx,
         log_broadcaster,
+
+        console: action_runner_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state);

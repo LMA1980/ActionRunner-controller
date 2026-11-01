@@ -131,6 +131,8 @@ async fn test_job_card_svg_route_and_headers() {
         cluster,
         tx,
         log_broadcaster,
+
+        console: action_runner_controller::console::ConsoleState::default(),
     });
 
     let job = Job {
@@ -224,6 +226,8 @@ async fn test_sse_dashboard_and_job_events_push() {
         cluster,
         tx,
         log_broadcaster,
+
+        console: action_runner_controller::console::ConsoleState::default(),
     });
 
     let job_id = "job-sse-456".to_string();

@@ -248,6 +248,47 @@ pub fn resolve_workflow_for_event(
     })
 }
 
+/// Default distributed pipeline used when a repository has no `.actionrunner/ActionRunner.yml`
+/// (fmt and clippy on x86 workers, native verification on the RISC-V board).
+pub const DEFAULT_WORKFLOW_YAML: &str = r#"
+version: "3"
+name: "Default Distributed Pipeline"
+tasks:
+  cargo-fmt:
+    tool: "cargo-fmt"
+    args: ["--check"]
+  cargo-clippy:
+    tool: "cargo-clippy"
+    args: ["--all-targets", "--", "-D", "warnings"]
+  cargo-test:
+    tool: "cargo-test"
+    args: ["--workspace"]
+stages:
+  - id: fmt-check
+    name: "Verify Formatting"
+    tasks: ["cargo-fmt"]
+    tags: ["fmt"]
+    threads: 2
+  - id: clippy-check
+    name: "Verify Linter Hygiene"
+    tasks: ["cargo-clippy"]
+    tags: ["clippy"]
+    threads: 4
+  - id: native-k3
+    name: "Native Verification"
+    tasks: ["cargo-test"]
+    tags: ["k3"]
+    depends_on: ["fmt-check", "clippy-check"]
+    threads: 6
+on_action:
+  push: ["fmt-check", "clippy-check", "native-k3"]
+  pull_request: ["fmt-check", "clippy-check", "native-k3"]
+  pullrequest: ["fmt-check", "clippy-check", "native-k3"]
+  merge: ["fmt-check", "clippy-check", "native-k3"]
+  tag: ["fmt-check", "clippy-check", "native-k3"]
+  release: ["fmt-check", "clippy-check", "native-k3"]
+"#;
+
 pub struct DAGScheduler {
     config: Config,
     job_store: JobStore,
@@ -796,44 +837,7 @@ impl DAGScheduler {
         }
 
         // If not found locally, create a default 3-stage distributed workflow (fmt on x86, clippy on x86, verify on k3)
-        let default_yaml = r#"
-version: "3"
-name: "Default Distributed Pipeline"
-tasks:
-  cargo-fmt:
-    tool: "cargo-fmt"
-    args: ["--check"]
-  cargo-clippy:
-    tool: "cargo-clippy"
-    args: ["--all-targets", "--", "-D", "warnings"]
-  cargo-test:
-    tool: "cargo-test"
-    args: ["--workspace"]
-stages:
-  - id: fmt-check
-    name: "Verify Formatting"
-    tasks: ["cargo-fmt"]
-    tags: ["fmt"]
-    threads: 2
-  - id: clippy-check
-    name: "Verify Linter Hygiene"
-    tasks: ["cargo-clippy"]
-    tags: ["clippy"]
-    threads: 4
-  - id: native-k3
-    name: "Native Verification"
-    tasks: ["cargo-test"]
-    tags: ["k3"]
-    depends_on: ["fmt-check", "clippy-check"]
-    threads: 6
-on_action:
-  push: ["fmt-check", "clippy-check", "native-k3"]
-  pull_request: ["fmt-check", "clippy-check", "native-k3"]
-  pullrequest: ["fmt-check", "clippy-check", "native-k3"]
-  merge: ["fmt-check", "clippy-check", "native-k3"]
-  tag: ["fmt-check", "clippy-check", "native-k3"]
-  release: ["fmt-check", "clippy-check", "native-k3"]
-"#;
+        let default_yaml = DEFAULT_WORKFLOW_YAML;
         let wf = ActionRunnerWorkflow::from_yaml(default_yaml)?;
         if let Ok(sub) = wf.subgraph_for_event(&job.event_type) {
             if !sub.stages.is_empty() {
