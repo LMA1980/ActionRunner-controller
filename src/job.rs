@@ -1820,10 +1820,10 @@ mod tests {
                 toolchain: None,
                 depends_on: vec![],
                 status: StageStatus::Assigned {
-                    node_id: "pey-wail-deu".to_string(),
+                    node_id: "worker-riscv64".to_string(),
                     started_at: Utc::now(),
                 },
-                assigned_node: Some("pey-wail-deu".to_string()),
+                assigned_node: Some("worker-riscv64".to_string()),
             },
             StageRecord {
                 id: "stage-2".to_string(),
@@ -1833,16 +1833,16 @@ mod tests {
                 toolchain: None,
                 depends_on: vec![],
                 status: StageStatus::Assigned {
-                    node_id: "rubicon".to_string(),
+                    node_id: "storage-node".to_string(),
                     started_at: Utc::now(),
                 },
-                assigned_node: Some("rubicon".to_string()),
+                assigned_node: Some("storage-node".to_string()),
             },
         ];
         store.set_stages(&job.id, stages).await;
 
-        // Node pey-wail-deu restarts or disconnects:
-        let recovered = store.recover_stages_for_node("pey-wail-deu", None).await;
+        // Node worker-riscv64 restarts or disconnects:
+        let recovered = store.recover_stages_for_node("worker-riscv64", None).await;
         assert_eq!(
             recovered,
             vec![("job-recover-node".to_string(), "stage-1".to_string())]
@@ -1851,14 +1851,14 @@ mod tests {
         let updated_job = store.get_job(&job.id).await.unwrap();
         assert_eq!(updated_job.stages[0].status, StageStatus::Pending);
         assert_eq!(updated_job.stages[0].assigned_node, None);
-        // stage-2 on rubicon should remain untouched
+        // stage-2 on storage-node should remain untouched
         assert!(matches!(
             updated_job.stages[1].status,
             StageStatus::Assigned { .. }
         ));
         assert_eq!(
             updated_job.stages[1].assigned_node.as_deref(),
-            Some("rubicon")
+            Some("storage-node")
         );
     }
 
@@ -2010,7 +2010,7 @@ mod tests {
         let log_file = repo_logs.join("job-1729500000-deadbeef.log");
         std::fs::write(
             &log_file,
-            "2026-10-21T10:00:00Z [pey-wail-deu] [test] [stdout] running 7 tests\n2026-10-21T10:00:02Z [pey-wail-deu] [test] [stdout] test result: ok. 7 passed; 0 failed; 0 ignored\n",
+            "2026-10-21T10:00:00Z [worker-riscv64] [test] [stdout] running 7 tests\n2026-10-21T10:00:02Z [worker-riscv64] [test] [stdout] test result: ok. 7 passed; 0 failed; 0 ignored\n",
         )
         .expect("write historical log");
 
