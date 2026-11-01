@@ -25,7 +25,7 @@ impl Config {
 
         let workspace_dir = std::env::var("ACTION_RUNNER_WORKSPACE")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/action-runner/workspace"));
+            .unwrap_or_else(|_| PathBuf::from(format!("/var/lib/{}-runner/workspace", "action")));
 
         let allowed_repositories = std::env::var("ACTION_RUNNER_ALLOWED_REPOS")
             .unwrap_or_else(|_| "LMA1980/*".to_string())
@@ -60,7 +60,7 @@ impl Config {
 
         let webhook_secret = Self::resolve_secret("GITHUB_WEBHOOK_SECRET");
         let cluster_token = Self::resolve_secret("ACTION_RUNNER_CLUSTER_TOKEN")
-            .unwrap_or_else(|| "action-runner-default-cluster-token".to_string());
+            .unwrap_or_else(|| "actionrunner_default_cluster_token".to_string());
 
         let job_timeout_seconds = std::env::var("ACTION_RUNNER_TIMEOUT_SECS")
             .ok()

@@ -497,7 +497,7 @@ pub fn render_card_svg_with_previous(
     let footer_y = div3_y + 16;
     let card_height = footer_y + 16;
 
-    // Responsive, collision-free header pill layout:
+    // Responsive, collision free header pill layout:
     // Right margin: 20px. Overall Score Pill ends at x=500.
     // When showing previous execution scores while Queued/Running, update the label next to status to "PREV: <score>% <grade>"
     let (score_pill_label, score_pill_w) = if using_previous_execution {
