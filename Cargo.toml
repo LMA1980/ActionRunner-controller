@@ -43,7 +43,7 @@ arc-swap = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
-action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "feat/wave2-hardened-worker" }
+action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "main" }
 tempfile = "3"
 rcgen = "0.14"
 
