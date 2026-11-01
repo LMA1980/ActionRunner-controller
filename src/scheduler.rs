@@ -188,6 +188,9 @@ pub fn build_v3_stage_dispatch_task(
         max_concurrent_per_node: stage.max_concurrent_per_node,
         tasks: typed_tasks,
         sandbox_constraints,
+        traceparent: Some(crate::storage_backend::job_root_traceparent(
+            job_id, commit_sha,
+        )),
     })
 }
 
@@ -631,23 +634,69 @@ impl DAGScheduler {
                     }
                 }
 
+                let mut final_status = JobStatus::Completed {
+                    duration_secs: duration,
+                    exit_code: 0,
+                };
+
+                let gate_req = muobserve_ipc::RegressionGateRequest {
+                    request_id: format!("reg-{}", job.id),
+                    repo_key: job.repo_name.to_ascii_lowercase(),
+                    candidate_commit: job.commit_sha.clone(),
+                    baseline_branch: "main".to_string(),
+                    max_slowdown_pct: 10.0,
+                    max_flakiness_pct: 5.0,
+                };
+                if let Some(gate_report) = self.job_store.evaluate_regression_gate(&gate_req) {
+                    let mut metrics = self
+                        .job_store
+                        .get_job(&job.id)
+                        .await
+                        .and_then(|r| r.metrics)
+                        .unwrap_or_else(|| crate::job::JobMetrics {
+                            quality_score: 100,
+                            letter_grade: "A+".to_string(),
+                            coverage_pct: None,
+                            benchmark_summary: None,
+                            tests_passed: 0,
+                            tests_total: 0,
+                            advisories_count: 0,
+                            clippy_warnings: 0,
+                            submodules: std::collections::BTreeMap::new(),
+                        });
+                    crate::storage_backend::apply_regression_gate_to_job(
+                        &mut metrics,
+                        &mut final_status,
+                        &gate_report,
+                    );
+                    self.job_store.update_metrics(&job.id, metrics).await;
+                }
+
                 self.job_store
-                    .update_status(
-                        &job.id,
-                        JobStatus::Completed {
-                            duration_secs: duration,
-                            exit_code: 0,
-                        },
-                    )
+                    .update_status(&job.id, final_status.clone())
                     .await;
-                self.report_github_status(
-                    &job.repo_name,
-                    &job.commit_sha,
-                    "success",
-                    &format!("All stages completed successfully in {}s", duration),
-                    Some(&target_url),
-                )
-                .await;
+                match final_status {
+                    JobStatus::Failed { ref error } => {
+                        self.report_github_status(
+                            &job.repo_name,
+                            &job.commit_sha,
+                            "failure",
+                            error,
+                            Some(&target_url),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        self.report_github_status(
+                            &job.repo_name,
+                            &job.commit_sha,
+                            "success",
+                            &format!("All stages completed successfully in {}s", duration),
+                            Some(&target_url),
+                        )
+                        .await;
+                    }
+                }
                 break;
             }
 
