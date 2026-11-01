@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
     pub event_type: String,
@@ -18,7 +18,7 @@ pub struct Job {
     pub queued_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "state", content = "details")]
 pub enum JobStatus {
     Queued,
@@ -28,7 +28,7 @@ pub enum JobStatus {
     Skipped { reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubmoduleMetrics {
     pub name: String,
     #[serde(default)]
@@ -47,7 +47,7 @@ pub struct SubmoduleMetrics {
     pub clippy_warnings: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobMetrics {
     pub quality_score: u32,
     pub letter_grade: String,
@@ -93,7 +93,7 @@ pub enum StageStatus {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StageRecord {
     pub id: String,
     pub name: String,
@@ -106,7 +106,7 @@ pub struct StageRecord {
     pub assigned_node: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobRecord {
     pub job: Job,
     pub status: JobStatus,
@@ -166,7 +166,7 @@ pub struct QueueSnapshot {
 #[derive(Clone)]
 pub struct JobStore {
     inner: Arc<RwLock<VecDeque<JobRecord>>>,
-    db: Arc<crate::db::DuckDbStore>,
+    db: Arc<dyn crate::storage_backend::ControllerStorage>,
     notify: Arc<Notify>,
     max_history: usize,
     index_file: Option<PathBuf>,
@@ -174,9 +174,8 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn new(max_history: usize, workspace_dir: Option<&Path>) -> Self {
-        let index_file = workspace_dir.map(|w| w.join("logs").join("jobs_index.json"));
         let db_file = workspace_dir.map(|w| w.join("logs").join("jobs.duckdb"));
-        let db = Arc::new(
+        let local_duckdb = Arc::new(
             crate::db::DuckDbStore::open(db_file.as_deref()).unwrap_or_else(|e| {
                 warn!(
                     "Failed to open disk-backed DuckDB ({}), falling back to in-memory DuckDB",
@@ -186,9 +185,65 @@ impl JobStore {
             }),
         );
 
+        if let Some(ws) = workspace_dir {
+            local_duckdb.backfill_from_logs_dir(ws);
+        }
+
+        let local_storage = Arc::new(crate::storage_backend::LocalDuckDbStorage::new(
+            local_duckdb,
+        ));
+        let mode = crate::storage_backend::StorageBackendMode::from_env();
+        let storage: Arc<dyn crate::storage_backend::ControllerStorage> = match mode {
+            crate::storage_backend::StorageBackendMode::LocalDuckDb => local_storage,
+            crate::storage_backend::StorageBackendMode::DualWrite => {
+                if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
+                    match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
+                        Ok(remote) => Arc::new(crate::storage_backend::DualWriteStorage::new(
+                            local_storage,
+                            Arc::new(remote),
+                        )),
+                        Err(e) => {
+                            warn!(
+                                "Failed to initialize MuObserveRemoteStorage for DualWrite ({}), using LocalDuckDbStorage",
+                                e
+                            );
+                            local_storage
+                        }
+                    }
+                } else {
+                    local_storage
+                }
+            }
+            crate::storage_backend::StorageBackendMode::MuObserveRemote => {
+                if let Some(cfg) = crate::storage_backend::MuObserveRemoteConfig::from_env() {
+                    match crate::storage_backend::MuObserveRemoteStorage::new(cfg) {
+                        Ok(remote) => Arc::new(remote),
+                        Err(e) => {
+                            warn!(
+                                "Failed to initialize MuObserveRemoteStorage ({}), falling back to LocalDuckDbStorage",
+                                e
+                            );
+                            local_storage
+                        }
+                    }
+                } else {
+                    local_storage
+                }
+            }
+        };
+
+        Self::with_storage(max_history, workspace_dir, storage)
+    }
+
+    pub fn with_storage(
+        max_history: usize,
+        workspace_dir: Option<&Path>,
+        db: Arc<dyn crate::storage_backend::ControllerStorage>,
+    ) -> Self {
+        let index_file = workspace_dir.map(|w| w.join("logs").join("jobs_index.json"));
         let notify = Arc::new(Notify::new());
 
-        // 1. If migrating or starting up with a workspace_dir, import jobs_index.json into DuckDB
+        // 1. If migrating or starting up with a workspace_dir, import jobs_index.json into storage
         if let Some(ref path) = index_file {
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(path) {
@@ -208,11 +263,11 @@ impl JobStore {
                                 }
                             }
                         }
-                        // Upsert oldest-first into DuckDB
+                        // Upsert oldest-first into storage
                         let chronological: Vec<JobRecord> = jobs.iter().rev().cloned().collect();
                         db.upsert_records_batch(&chronological);
                         info!(
-                            "Synchronized {} job records from {} into DuckDB",
+                            "Synchronized {} job records from {} into ControllerStorage",
                             jobs.len(),
                             path.display()
                         );
@@ -221,12 +276,7 @@ impl JobStore {
             }
         }
 
-        // 2. Backfill any older log files from workspace_dir/logs/<owner>/<repo>/job-*.log that were evicted before DuckDB
-        if let Some(ws) = workspace_dir {
-            db.backfill_from_logs_dir(ws);
-        }
-
-        // 3. Load recent jobs from DuckDB into the active in-memory queue
+        // 2. Load recent jobs from storage into the active in-memory queue
         let mut initial_jobs: VecDeque<JobRecord> =
             db.load_recent_jobs(max_history).into_iter().collect();
         let mut has_queued = false;
@@ -264,6 +314,17 @@ impl JobStore {
             max_history,
             index_file,
         }
+    }
+
+    pub fn storage(&self) -> &Arc<dyn crate::storage_backend::ControllerStorage> {
+        &self.db
+    }
+
+    pub fn evaluate_regression_gate(
+        &self,
+        req: &muobserve_ipc::RegressionGateRequest,
+    ) -> Option<muobserve_ipc::RegressionGateReport> {
+        self.db.evaluate_regression_gate(req)
     }
 
     async fn persist(&self) {

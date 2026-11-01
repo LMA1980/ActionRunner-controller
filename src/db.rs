@@ -647,6 +647,196 @@ impl DuckDbStore {
         records
     }
 
+    /// Loads `branch_snapshots` rows filtered by optional `repo_key` and `branch_key`.
+    pub fn load_branch_snapshots(
+        &self,
+        repo_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<muobserve_ipc::CentralBranchSnapshot> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let repo_norm = repo_key.map(|r| r.to_ascii_lowercase());
+        let branch_norm = branch_key.map(|b| normalize_ref(b).to_ascii_lowercase());
+
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            r#"
+            SELECT
+                repo_key, branch_key, repo_name, ref_name,
+                latest_active_job_id, latest_active_json, latest_active_queued_us,
+                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+            FROM branch_snapshots
+            WHERE (? IS NULL OR repo_key = ?)
+              AND (? IS NULL OR branch_key = ?)
+            ORDER BY repo_key ASC, branch_key ASC
+            "#,
+        ) {
+            if let Ok(rows) = stmt.query_map(
+                params![repo_norm, repo_norm, branch_norm, branch_norm],
+                |row| {
+                    Ok(muobserve_ipc::CentralBranchSnapshot {
+                        repo_key: row.get(0)?,
+                        branch_key: row.get(1)?,
+                        repo_name: row.get(2)?,
+                        ref_name: row.get(3)?,
+                        latest_active_job_id: row.get(4)?,
+                        latest_active_json: row.get(5)?,
+                        latest_active_queued_us: row.get(6)?,
+                        latest_completed_job_id: row.get(7)?,
+                        latest_completed_json: row.get(8)?,
+                        latest_completed_queued_us: row.get(9)?,
+                    })
+                },
+            ) {
+                for r in rows.flatten() {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// Loads `submodule_snapshots` rows filtered by optional `parent_repo_key`, `submodule_key`, and `branch_key`.
+    pub fn load_submodule_snapshots(
+        &self,
+        parent_repo_key: Option<&str>,
+        submodule_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<muobserve_ipc::CentralSubmoduleSnapshot> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+
+        let parent_norm = parent_repo_key.map(|p| p.to_ascii_lowercase());
+        let sub_norm = submodule_key.map(|s| {
+            s.rsplit_once('/')
+                .map(|(_, r)| r)
+                .unwrap_or(s)
+                .to_ascii_lowercase()
+        });
+        let branch_norm = branch_key.map(|b| normalize_ref(b).to_ascii_lowercase());
+
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            r#"
+            SELECT
+                parent_repo_key, branch_key, submodule_key, submodule_path_key,
+                latest_active_job_id, latest_active_json, latest_active_queued_us,
+                latest_completed_job_id, latest_completed_json, latest_completed_queued_us
+            FROM submodule_snapshots
+            WHERE (? IS NULL OR parent_repo_key = ?)
+              AND (? IS NULL OR submodule_key = ?)
+              AND (? IS NULL OR branch_key = ?)
+            ORDER BY parent_repo_key ASC, branch_key ASC, submodule_key ASC
+            "#,
+        ) {
+            if let Ok(rows) = stmt.query_map(
+                params![
+                    parent_norm,
+                    parent_norm,
+                    sub_norm,
+                    sub_norm,
+                    branch_norm,
+                    branch_norm
+                ],
+                |row| {
+                    Ok(muobserve_ipc::CentralSubmoduleSnapshot {
+                        parent_repo_key: row.get(0)?,
+                        branch_key: row.get(1)?,
+                        submodule_key: row.get(2)?,
+                        submodule_path_key: row.get(3)?,
+                        latest_active_job_id: row.get(4)?,
+                        latest_active_json: row.get(5)?,
+                        latest_active_queued_us: row.get(6)?,
+                        latest_completed_job_id: row.get(7)?,
+                        latest_completed_json: row.get(8)?,
+                        latest_completed_queued_us: row.get(9)?,
+                    })
+                },
+            ) {
+                for r in rows.flatten() {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// Converts a [`JobRecord`] into a [`muobserve_ipc::CentralJobRecord`].
+    pub fn to_central_job_record(record: &JobRecord) -> Option<muobserve_ipc::CentralJobRecord> {
+        let record_json = serde_json::to_string(record).ok()?;
+        let repo_key = record.job.repo_name.to_ascii_lowercase();
+        let branch_key = normalize_ref(&record.job.ref_name).to_ascii_lowercase();
+        let queued_at_us = record.job.queued_at.timestamp_micros();
+        let updated_at_us = record.updated_at.timestamp_micros();
+
+        let (status_state, exit_code, duration_secs) = match &record.status {
+            JobStatus::Queued => ("Queued".to_string(), None, None),
+            JobStatus::Running { .. } => ("Running".to_string(), None, None),
+            JobStatus::Completed {
+                duration_secs,
+                exit_code,
+            } => (
+                "Completed".to_string(),
+                Some(*exit_code),
+                Some(*duration_secs as i64),
+            ),
+            JobStatus::Failed { .. } => ("Failed".to_string(), None, None),
+            JobStatus::Skipped { .. } => ("Skipped".to_string(), None, None),
+        };
+
+        let (
+            quality_score,
+            letter_grade,
+            coverage_pct,
+            benchmark_summary,
+            tests_passed,
+            tests_total,
+            advisories_count,
+            clippy_warnings,
+        ) = match &record.metrics {
+            Some(m) => (
+                Some(m.quality_score as i32),
+                Some(m.letter_grade.clone()),
+                m.coverage_pct,
+                m.benchmark_summary.clone(),
+                Some(m.tests_passed as i32),
+                Some(m.tests_total as i32),
+                Some(m.advisories_count as i32),
+                Some(m.clippy_warnings as i32),
+            ),
+            None => (None, None, None, None, None, None, None, None),
+        };
+
+        Some(muobserve_ipc::CentralJobRecord {
+            job_id: record.job.id.clone(),
+            event_type: record.job.event_type.clone(),
+            repo_name: record.job.repo_name.clone(),
+            repo_key,
+            clone_url: record.job.clone_url.clone(),
+            commit_sha: record.job.commit_sha.clone(),
+            ref_name: record.job.ref_name.clone(),
+            branch_key,
+            sender: record.job.sender.clone(),
+            queued_at_us,
+            updated_at_us,
+            status_state,
+            exit_code,
+            duration_secs,
+            quality_score,
+            letter_grade,
+            coverage_pct,
+            benchmark_summary,
+            tests_passed,
+            tests_total,
+            advisories_count,
+            clippy_warnings,
+            record_json,
+        })
+    }
+
     /// Looks up a single job by ID from `jobs_history`.
     pub fn get_job(&self, job_id: &str) -> Option<JobRecord> {
         let conn = self.conn.lock().ok()?;

@@ -1,0 +1,1422 @@
+//! Pluggable controller persistence abstraction (`ControllerStorage`) supporting
+//! `LocalDuckDbStorage`, `MuObserveRemoteStorage` (Fory RPC over `step-ca` mTLS / TCP),
+//! and `DualWriteStorage` (Phase 1 zero-downtime migration per `AGENTS.md §4`),
+//! plus root W3C `traceparent` generation and `RegressionGateReport` evaluation (`#41`–`#44`).
+
+use std::collections::BTreeMap;
+use std::io::Cursor;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use muobserve_ipc::{
+    decode_control_envelope, encode_control_envelope, read_frame, write_frame,
+    CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot, ControlRpcEnvelope,
+    IpcHeader, QueryBranchSnapshotsRequest, QueryJobsHistoryRequest,
+    QuerySubmoduleSnapshotsRequest, RegressionGateReport, RegressionGateRequest, RegressionVerdict,
+    TraceContext, UpsertJobBatchRequest, UpsertJobRecordRequest, MSG_TYPE_FORY_CONTROL,
+    TRACE_FLAG_SAMPLED, W3C_TRACEPARENT_VERSION,
+};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tracing::{debug, warn};
+
+use crate::db::DuckDbStore;
+use crate::job::{extract_submodule_job, normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
+
+/// Storage backend mode for `ActionRunner-controller` Phase 1–3 migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StorageBackendMode {
+    /// Local embedded DuckDB only (`workspace/controller_history.duckdb`).
+    #[default]
+    LocalDuckDb,
+    /// Phase 1 zero-downtime migration: write to both local DuckDB and remote `MuObserve`,
+    /// reading primarily from local DuckDB with fallback to remote `MuObserve`.
+    DualWrite,
+    /// Remote `MuObserve` control-plane storage via Apache Fory RPC over `MUOB` framing.
+    MuObserveRemote,
+}
+
+impl StorageBackendMode {
+    /// Resolves the storage backend mode from `ACTION_RUNNER_STORAGE_MODE` and `MUOBSERVE_CONTROL_ADDR`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        if let Ok(raw) = std::env::var("ACTION_RUNNER_STORAGE_MODE") {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "local" | "duckdb" | "local_duckdb" => return Self::LocalDuckDb,
+                "dual" | "dual_write" | "dual-write" | "dualwrite" => return Self::DualWrite,
+                "remote" | "muobserve" | "muobserve_remote" => return Self::MuObserveRemote,
+                _ => {}
+            }
+        }
+        if std::env::var("MUOBSERVE_CONTROL_ADDR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+        {
+            Self::DualWrite
+        } else {
+            Self::LocalDuckDb
+        }
+    }
+}
+
+/// Abstract persistence interface for `ActionRunner-controller` job records, branch snapshots,
+/// submodule snapshots, and hardware-stratified regression gate queries (`#43`).
+pub trait ControllerStorage: Send + Sync {
+    /// Upserts a single [`JobRecord`] and synchronizes its branch and submodule snapshots.
+    fn upsert_record(&self, record: &JobRecord);
+
+    /// Upserts a batch of [`JobRecord`] entries atomically and synchronizes snapshots.
+    fn upsert_records_batch(&self, records: &[JobRecord]);
+
+    /// Loads recent jobs ordered newest-first (`queued_at_us DESC`).
+    fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord>;
+
+    /// Loads branch snapshots filtered by optional `repo_key` and `branch_key`.
+    fn load_branch_snapshots(
+        &self,
+        repo_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralBranchSnapshot>;
+
+    /// Loads submodule snapshots filtered by optional `parent_repo_key`, `submodule_key`, and `branch_key`.
+    fn load_submodule_snapshots(
+        &self,
+        parent_repo_key: Option<&str>,
+        submodule_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralSubmoduleSnapshot>;
+
+    /// Looks up a single job by ID.
+    fn get_job(&self, job_id: &str) -> Option<JobRecord>;
+
+    /// Finds the latest completed (`Completed` or `Failed`) job for a repository/branch.
+    fn find_latest_completed(&self, repo: &str, branch: Option<&str>) -> Option<JobRecord> {
+        let (_active, completed) = self.find_card_context(repo, branch);
+        completed
+    }
+
+    /// Finds `(latest_active_or_completed, latest_completed)` for a repository/branch.
+    fn find_card_context(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>);
+
+    /// Finds the latest completed (`Completed` or `Failed`) job for a specific submodule.
+    fn find_submodule_completed(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> Option<JobRecord> {
+        let (_active, completed) = self.find_submodule_card_context(parent_repo, submodule, branch);
+        completed
+    }
+
+    /// Finds `(latest_active_or_completed, latest_completed)` for a specific submodule.
+    fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>);
+
+    /// Evaluates the hardware-stratified regression gate for a candidate commit against a baseline branch.
+    fn evaluate_regression_gate(
+        &self,
+        _req: &RegressionGateRequest,
+    ) -> Option<RegressionGateReport> {
+        None
+    }
+}
+
+/// Local embedded DuckDB implementation of [`ControllerStorage`].
+#[derive(Clone)]
+pub struct LocalDuckDbStorage {
+    store: Arc<DuckDbStore>,
+}
+
+impl LocalDuckDbStorage {
+    /// Wraps an existing [`DuckDbStore`].
+    #[must_use]
+    pub fn new(store: Arc<DuckDbStore>) -> Self {
+        Self { store }
+    }
+
+    /// Opens a [`LocalDuckDbStorage`] at `db_path` (or in-memory when `None`).
+    pub fn open(db_path: Option<&Path>) -> Result<Self, String> {
+        let store = DuckDbStore::open(db_path)?;
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    /// Returns a reference to the underlying [`DuckDbStore`].
+    #[must_use]
+    pub fn inner(&self) -> &Arc<DuckDbStore> {
+        &self.store
+    }
+}
+
+impl ControllerStorage for LocalDuckDbStorage {
+    fn upsert_record(&self, record: &JobRecord) {
+        self.store.upsert_record(record);
+    }
+
+    fn upsert_records_batch(&self, records: &[JobRecord]) {
+        self.store.upsert_records_batch(records);
+    }
+
+    fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord> {
+        self.store.load_recent_jobs(limit)
+    }
+
+    fn load_branch_snapshots(
+        &self,
+        repo_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralBranchSnapshot> {
+        self.store.load_branch_snapshots(repo_key, branch_key)
+    }
+
+    fn load_submodule_snapshots(
+        &self,
+        parent_repo_key: Option<&str>,
+        submodule_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralSubmoduleSnapshot> {
+        self.store
+            .load_submodule_snapshots(parent_repo_key, submodule_key, branch_key)
+    }
+
+    fn get_job(&self, job_id: &str) -> Option<JobRecord> {
+        self.store.get_job(job_id)
+    }
+
+    fn find_latest_completed(&self, repo: &str, branch: Option<&str>) -> Option<JobRecord> {
+        self.store.find_latest_completed(repo, branch)
+    }
+
+    fn find_card_context(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        self.store.find_card_context(repo, branch)
+    }
+
+    fn find_submodule_completed(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> Option<JobRecord> {
+        self.store
+            .find_submodule_completed(parent_repo, submodule, branch)
+    }
+
+    fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        self.store
+            .find_submodule_card_context(parent_repo, submodule, branch)
+    }
+}
+
+/// Connection configuration for [`MuObserveRemoteStorage`].
+#[derive(Debug, Clone)]
+pub struct MuObserveRemoteConfig {
+    /// TCP endpoint of `MuObserve` ingestion/control server (`host:port`).
+    pub endpoint_addr: String,
+    /// Optional TLS SNI server name when `step-ca` mTLS is enabled.
+    pub tls_server_name: Option<String>,
+    /// Optional PEM-encoded `step-ca` root CA bundle.
+    pub ca_cert_pem: Option<String>,
+    /// Optional PEM-encoded client leaf certificate.
+    pub client_cert_pem: Option<String>,
+    /// Optional PEM-encoded client private key.
+    pub client_key_pem: Option<String>,
+    /// Per-RPC timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl MuObserveRemoteConfig {
+    /// Creates a plain-TCP configuration targeting `endpoint_addr` (for local loopback or tests).
+    #[must_use]
+    pub fn plain_tcp(endpoint_addr: impl Into<String>) -> Self {
+        Self {
+            endpoint_addr: endpoint_addr.into(),
+            tls_server_name: None,
+            ca_cert_pem: None,
+            client_cert_pem: None,
+            client_key_pem: None,
+            timeout_ms: 2_500,
+        }
+    }
+
+    /// Creates a `step-ca` mTLS configuration targeting `endpoint_addr`.
+    #[must_use]
+    pub fn with_mtls(
+        endpoint_addr: impl Into<String>,
+        tls_server_name: impl Into<String>,
+        ca_cert_pem: impl Into<String>,
+        client_cert_pem: impl Into<String>,
+        client_key_pem: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint_addr: endpoint_addr.into(),
+            tls_server_name: Some(tls_server_name.into()),
+            ca_cert_pem: Some(ca_cert_pem.into()),
+            client_cert_pem: Some(client_cert_pem.into()),
+            client_key_pem: Some(client_key_pem.into()),
+            timeout_ms: 3_000,
+        }
+    }
+
+    /// Loads [`MuObserveRemoteConfig`] from environment variables (`MUOBSERVE_CONTROL_ADDR`, etc.).
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let endpoint_addr = std::env::var("MUOBSERVE_CONTROL_ADDR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let tls_server_name = std::env::var("MUOBSERVE_TLS_SERVER_NAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let ca_cert_pem = read_env_pem("MUOBSERVE_CA_CERT");
+        let client_cert_pem = read_env_pem("MUOBSERVE_CLIENT_CERT");
+        let client_key_pem = read_env_pem("MUOBSERVE_CLIENT_KEY");
+        let timeout_ms = std::env::var("MUOBSERVE_RPC_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2_500);
+
+        Some(Self {
+            endpoint_addr,
+            tls_server_name,
+            ca_cert_pem,
+            client_cert_pem,
+            client_key_pem,
+            timeout_ms,
+        })
+    }
+}
+
+fn read_env_pem(var_name: &str) -> Option<String> {
+    let raw = std::env::var(var_name).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("-----BEGIN ") {
+        return Some(trimmed.to_string());
+    }
+    // Per AGENTS.md §3: fail closed if a file path cannot be read.
+    std::fs::read_to_string(trimmed)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn build_mtls_client_config(
+    ca_cert_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> Result<Arc<ClientConfig>, String> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    let mut ca_cursor = Cursor::new(ca_cert_pem.as_bytes());
+    let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut ca_cursor)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse CA PEM: {e}"))?;
+    if ca_certs.is_empty() {
+        return Err("CA PEM contains no certificates".to_string());
+    }
+
+    let mut root_store = RootCertStore::empty();
+    for cert in ca_certs {
+        root_store
+            .add(cert)
+            .map_err(|e| format!("Failed to add CA cert: {e}"))?;
+    }
+
+    let mut cert_cursor = Cursor::new(client_cert_pem.as_bytes());
+    let client_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_reader_iter(&mut cert_cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to parse client cert PEM: {e}"))?;
+
+    let mut key_cursor = Cursor::new(client_key_pem.as_bytes());
+    let client_key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_cursor)
+        .map_err(|e| format!("Failed to parse client key PEM: {e}"))?;
+
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, client_key)
+        .map_err(|e| format!("Failed to build mTLS ClientConfig: {e}"))?;
+
+    Ok(Arc::new(client_config))
+}
+
+/// Remote `MuObserve` implementation of [`ControllerStorage`] communicating via
+/// `MUOB`-framed Apache Fory [`ControlRpcEnvelope`] messages over `step-ca` mTLS or TCP.
+#[derive(Clone)]
+pub struct MuObserveRemoteStorage {
+    config: MuObserveRemoteConfig,
+    tls_client_config: Option<Arc<ClientConfig>>,
+    seq: Arc<AtomicU64>,
+}
+
+impl MuObserveRemoteStorage {
+    /// Creates a new [`MuObserveRemoteStorage`] from `config`.
+    pub fn new(config: MuObserveRemoteConfig) -> Result<Self, String> {
+        let tls_client_config = match (
+            config.ca_cert_pem.as_deref(),
+            config.client_cert_pem.as_deref(),
+            config.client_key_pem.as_deref(),
+        ) {
+            (Some(ca), Some(cert), Some(key)) => Some(build_mtls_client_config(ca, cert, key)?),
+            (None, None, None) => None,
+            _ => {
+                return Err(
+                    "Incomplete mTLS configuration: ca_cert_pem, client_cert_pem, and client_key_pem must all be provided together"
+                        .to_string(),
+                )
+            }
+        };
+
+        Ok(Self {
+            config,
+            tls_client_config,
+            seq: Arc::new(AtomicU64::new(1)),
+        })
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn next_request_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.next_seq())
+    }
+
+    async fn exchange_stream<S>(
+        stream: &mut S,
+        seq: u64,
+        req: &ControlRpcEnvelope,
+    ) -> Result<ControlRpcEnvelope, String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let payload =
+            encode_control_envelope(req).map_err(|e| format!("Fory encode error: {e}"))?;
+        let header = IpcHeader::new(MSG_TYPE_FORY_CONTROL, payload.len() as u32, 0, seq);
+        write_frame(stream, &header, &payload)
+            .await
+            .map_err(|e| format!("Write MUOB frame error: {e}"))?;
+        let (resp_hdr, resp_payload) = read_frame(stream)
+            .await
+            .map_err(|e| format!("Read MUOB frame error: {e}"))?;
+        if resp_hdr.msg_type != MSG_TYPE_FORY_CONTROL {
+            return Err(format!(
+                "Unexpected response frame msg_type: {:#06x}",
+                resp_hdr.msg_type
+            ));
+        }
+        decode_control_envelope(&resp_payload).map_err(|e| format!("Fory decode error: {e}"))
+    }
+
+    /// Sends a single [`ControlRpcEnvelope`] request to `MuObserve` and awaits the response envelope.
+    pub async fn send_rpc_async(
+        &self,
+        req: &ControlRpcEnvelope,
+    ) -> Result<ControlRpcEnvelope, String> {
+        let timeout_dur = Duration::from_millis(self.config.timeout_ms.max(100));
+        let seq = self.next_seq();
+        let addr = self.config.endpoint_addr.clone();
+        let tls_cfg = self.tls_client_config.clone();
+        let sni = self
+            .config
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| "muobserve.node-a.cluster.internal".to_string());
+
+        tokio::time::timeout(timeout_dur, async move {
+            let tcp = TcpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("Connect to {addr} failed: {e}"))?;
+            let _ = tcp.set_nodelay(true);
+
+            if let Some(client_cfg) = tls_cfg {
+                let connector = TlsConnector::from(client_cfg);
+                let server_name = ServerName::try_from(sni.clone())
+                    .map_err(|e| format!("Invalid TLS server name '{sni}': {e}"))?;
+                let mut tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| format!("mTLS handshake with {addr} failed: {e}"))?;
+                Self::exchange_stream(&mut tls_stream, seq, req).await
+            } else {
+                let mut tcp = tcp;
+                Self::exchange_stream(&mut tcp, seq, req).await
+            }
+        })
+        .await
+        .map_err(|_| format!("MuObserve RPC timed out after {}ms", self.config.timeout_ms))?
+    }
+
+    /// Executes `send_rpc_async` safely from a synchronous context (even when called inside
+    /// an active single-threaded or multi-threaded Tokio runtime).
+    pub fn send_rpc_blocking(
+        &self,
+        req: &ControlRpcEnvelope,
+    ) -> Result<ControlRpcEnvelope, String> {
+        let this = self.clone();
+        let req_clone = req.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to build RPC runtime: {e}"))?;
+            rt.block_on(this.send_rpc_async(&req_clone))
+        })
+        .join()
+        .map_err(|_| "MuObserve RPC worker thread panicked".to_string())?
+    }
+
+    fn query_jobs_filtered(
+        &self,
+        repo_key: Option<String>,
+        branch_key: Option<String>,
+        job_id: Option<String>,
+        limit: u32,
+    ) -> Vec<CentralJobRecord> {
+        let req = ControlRpcEnvelope::QueryJobsHistoryReq(QueryJobsHistoryRequest {
+            request_id: self.next_request_id("q-jobs"),
+            repo_key,
+            branch_key,
+            job_id,
+            limit,
+        });
+        match self.send_rpc_blocking(&req) {
+            Ok(ControlRpcEnvelope::QueryJobsHistoryResp(resp)) => resp.records,
+            Ok(other) => {
+                warn!("Unexpected RPC response for QueryJobsHistoryReq: {other:?}");
+                Vec::new()
+            }
+            Err(e) => {
+                debug!(error = %e, "MuObserve QueryJobsHistoryReq failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Computes the updated [`CentralBranchSnapshot`] given an optional existing snapshot,
+/// the newly upserted [`JobRecord`], and a fallback lookup when a `Skipped` job supersedes the active job.
+pub fn compute_next_branch_snapshot<F>(
+    existing: Option<&CentralBranchSnapshot>,
+    record: &JobRecord,
+    fallback_unskipped: F,
+) -> Option<CentralBranchSnapshot>
+where
+    F: FnOnce(&str, &str) -> Option<(String, String, i64)>,
+{
+    let record_json = serde_json::to_string(record).ok()?;
+    let repo_key = record.job.repo_name.to_ascii_lowercase();
+    let branch_key = normalize_ref(&record.job.ref_name).to_ascii_lowercase();
+    let queued_at_us = record.job.queued_at.timestamp_micros();
+
+    let (
+        mut active_id,
+        mut active_json,
+        mut active_q_us,
+        mut comp_id,
+        mut comp_json,
+        mut comp_q_us,
+    ) = existing
+        .map(|s| {
+            (
+                s.latest_active_job_id.clone(),
+                s.latest_active_json.clone(),
+                s.latest_active_queued_us,
+                s.latest_completed_job_id.clone(),
+                s.latest_completed_json.clone(),
+                s.latest_completed_queued_us,
+            )
+        })
+        .unwrap_or((None, None, None, None, None, None));
+
+    let is_skipped = matches!(record.status, JobStatus::Skipped { .. });
+    let is_completed = matches!(
+        record.status,
+        JobStatus::Completed { .. } | JobStatus::Failed { .. }
+    );
+
+    if is_skipped {
+        if active_id.as_deref() == Some(record.job.id.as_str()) {
+            if let Some((fb_id, fb_json, fb_q)) = fallback_unskipped(&repo_key, &branch_key) {
+                active_id = Some(fb_id);
+                active_json = Some(fb_json);
+                active_q_us = Some(fb_q);
+            } else {
+                active_id = comp_id.clone();
+                active_json = comp_json.clone();
+                active_q_us = comp_q_us;
+            }
+        }
+    } else {
+        let should_update_active = active_id.is_none()
+            || active_id.as_deref() == Some(record.job.id.as_str())
+            || queued_at_us >= active_q_us.unwrap_or(i64::MIN);
+
+        if should_update_active {
+            active_id = Some(record.job.id.clone());
+            active_json = Some(record_json.clone());
+            active_q_us = Some(queued_at_us);
+        }
+
+        if is_completed {
+            let should_update_comp = comp_id.is_none()
+                || comp_id.as_deref() == Some(record.job.id.as_str())
+                || queued_at_us >= comp_q_us.unwrap_or(i64::MIN);
+
+            if should_update_comp {
+                comp_id = Some(record.job.id.clone());
+                comp_json = Some(record_json);
+                comp_q_us = Some(queued_at_us);
+            }
+        }
+    }
+
+    if active_id.is_some() || comp_id.is_some() {
+        Some(CentralBranchSnapshot {
+            repo_key,
+            branch_key,
+            repo_name: record.job.repo_name.clone(),
+            ref_name: record.job.ref_name.clone(),
+            latest_active_job_id: active_id,
+            latest_active_json: active_json,
+            latest_active_queued_us: active_q_us,
+            latest_completed_job_id: comp_id,
+            latest_completed_json: comp_json,
+            latest_completed_queued_us: comp_q_us,
+        })
+    } else {
+        None
+    }
+}
+
+/// Computes updated [`CentralSubmoduleSnapshot`] entries for `(parent_repo_key, branch_key)`
+/// given existing submodule snapshots and the newly upserted [`JobRecord`].
+#[must_use]
+pub fn compute_next_submodule_snapshots(
+    existing_for_branch: &[CentralSubmoduleSnapshot],
+    record: &JobRecord,
+) -> Vec<CentralSubmoduleSnapshot> {
+    let parent_repo_key = record.job.repo_name.to_ascii_lowercase();
+    let branch_key = normalize_ref(&record.job.ref_name).to_ascii_lowercase();
+    let queued_at_us = record.job.queued_at.timestamp_micros();
+    let is_skipped = matches!(record.status, JobStatus::Skipped { .. });
+    let is_completed = matches!(
+        record.status,
+        JobStatus::Completed { .. } | JobStatus::Failed { .. }
+    );
+
+    let mut by_sub_key: BTreeMap<String, CentralSubmoduleSnapshot> = existing_for_branch
+        .iter()
+        .filter(|s| s.parent_repo_key == parent_repo_key && s.branch_key == branch_key)
+        .map(|s| (s.submodule_key.clone(), s.clone()))
+        .collect();
+
+    if let Some(ref metrics) = record.metrics {
+        for (sub_name, sub) in &metrics.submodules {
+            let Some(sub_record) = extract_submodule_job(record, sub_name) else {
+                continue;
+            };
+            let Ok(sub_json) = serde_json::to_string(&sub_record) else {
+                continue;
+            };
+
+            let sub_short = sub_name
+                .rsplit_once('/')
+                .map(|(_, r)| r)
+                .unwrap_or(sub_name)
+                .to_ascii_lowercase();
+            let path_short = sub
+                .path
+                .rsplit_once('/')
+                .map(|(_, r)| r)
+                .unwrap_or(&sub.path)
+                .to_ascii_lowercase();
+
+            let existing = by_sub_key.get(&sub_short);
+            let (mut act_id, mut act_json, mut act_q_us, mut comp_id, mut comp_json, mut comp_q_us) =
+                existing
+                    .map(|s| {
+                        (
+                            s.latest_active_job_id.clone(),
+                            s.latest_active_json.clone(),
+                            s.latest_active_queued_us,
+                            s.latest_completed_job_id.clone(),
+                            s.latest_completed_json.clone(),
+                            s.latest_completed_queued_us,
+                        )
+                    })
+                    .unwrap_or((None, None, None, None, None, None));
+
+            if !is_skipped {
+                let should_update_act = act_id.is_none()
+                    || act_id.as_deref() == Some(record.job.id.as_str())
+                    || queued_at_us >= act_q_us.unwrap_or(i64::MIN);
+
+                if should_update_act {
+                    act_id = Some(record.job.id.clone());
+                    act_json = Some(sub_json.clone());
+                    act_q_us = Some(queued_at_us);
+                }
+
+                if is_completed || comp_id.is_none() {
+                    let should_update_comp = comp_id.is_none()
+                        || comp_id.as_deref() == Some(record.job.id.as_str())
+                        || queued_at_us >= comp_q_us.unwrap_or(i64::MIN);
+
+                    if should_update_comp {
+                        comp_id = Some(record.job.id.clone());
+                        comp_json = Some(sub_json);
+                        comp_q_us = Some(queued_at_us);
+                    }
+                }
+            }
+
+            by_sub_key.insert(
+                sub_short.clone(),
+                CentralSubmoduleSnapshot {
+                    parent_repo_key: parent_repo_key.clone(),
+                    branch_key: branch_key.clone(),
+                    submodule_key: sub_short,
+                    submodule_path_key: path_short,
+                    latest_active_job_id: act_id,
+                    latest_active_json: act_json,
+                    latest_active_queued_us: act_q_us,
+                    latest_completed_job_id: comp_id,
+                    latest_completed_json: comp_json,
+                    latest_completed_queued_us: comp_q_us,
+                },
+            );
+        }
+    } else {
+        let owner = record
+            .job
+            .repo_name
+            .split_once('/')
+            .map(|(o, _)| o)
+            .unwrap_or("LMA1980");
+
+        for snap in by_sub_key.values_mut() {
+            if is_skipped {
+                if snap.latest_active_job_id.as_deref() == Some(record.job.id.as_str()) {
+                    snap.latest_active_job_id = snap.latest_completed_job_id.clone();
+                    snap.latest_active_json = snap.latest_completed_json.clone();
+                    snap.latest_active_queued_us = snap.latest_completed_queued_us;
+                }
+            } else if matches!(record.status, JobStatus::Queued | JobStatus::Running { .. }) {
+                let should_update = snap.latest_active_job_id.is_none()
+                    || snap.latest_active_job_id.as_deref() == Some(record.job.id.as_str())
+                    || queued_at_us >= snap.latest_active_queued_us.unwrap_or(i64::MIN);
+
+                if should_update {
+                    let sub_job = Job {
+                        id: format!("{}-{}", record.job.id, snap.submodule_key),
+                        event_type: record.job.event_type.clone(),
+                        repo_name: format!("{}/{}", owner, snap.submodule_key),
+                        clone_url: String::new(),
+                        commit_sha: record.job.commit_sha.clone(),
+                        ref_name: record.job.ref_name.clone(),
+                        sender: record.job.sender.clone(),
+                        queued_at: record.job.queued_at,
+                    };
+                    let synth_rec = JobRecord {
+                        job: sub_job,
+                        status: record.status.clone(),
+                        log_file: record.log_file.clone(),
+                        updated_at: record.updated_at,
+                        metrics: None,
+                        stages: Vec::new(),
+                    };
+                    if let Ok(s_json) = serde_json::to_string(&synth_rec) {
+                        snap.latest_active_job_id = Some(record.job.id.clone());
+                        snap.latest_active_json = Some(s_json);
+                        snap.latest_active_queued_us = Some(queued_at_us);
+                    }
+                }
+            }
+        }
+    }
+
+    by_sub_key.into_values().collect()
+}
+
+fn resolve_direct_repo_from_snapshots(
+    snapshots: &[CentralBranchSnapshot],
+    repo: &str,
+    branch: Option<&str>,
+) -> (Option<JobRecord>, Option<JobRecord>) {
+    let repo_lower = repo.to_ascii_lowercase();
+    let suffix = format!("/{repo_lower}");
+    let branch_norm = branch.map(|b| normalize_ref(b).to_ascii_lowercase());
+
+    let mut matching: Vec<&CentralBranchSnapshot> = snapshots
+        .iter()
+        .filter(|s| {
+            let repo_matches = s.repo_key == repo_lower || s.repo_key.ends_with(&suffix);
+            let branch_matches = branch_norm
+                .as_ref()
+                .map(|b| &s.branch_key == b)
+                .unwrap_or(true);
+            repo_matches && branch_matches
+        })
+        .collect();
+
+    matching.sort_by(|a, b| {
+        if branch_norm.is_none() {
+            let a_main = u8::from(a.branch_key != "main");
+            let b_main = u8::from(b.branch_key != "main");
+            if a_main != b_main {
+                return a_main.cmp(&b_main);
+            }
+        }
+        let a_ts = a
+            .latest_active_queued_us
+            .or(a.latest_completed_queued_us)
+            .unwrap_or(0);
+        let b_ts = b
+            .latest_active_queued_us
+            .or(b.latest_completed_queued_us)
+            .unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+
+    let Some(best) = matching.first() else {
+        return (None, None);
+    };
+
+    let active = best
+        .latest_active_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
+    let completed = best
+        .latest_completed_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<JobRecord>(s).ok());
+    (active, completed)
+}
+
+fn resolve_submodule_from_snapshots(
+    sub_snapshots: &[CentralSubmoduleSnapshot],
+    branch_snapshots: &[CentralBranchSnapshot],
+    parent_repo: Option<&str>,
+    submodule: &str,
+    branch: Option<&str>,
+) -> (Option<JobRecord>, Option<JobRecord>) {
+    let clean_target = submodule
+        .rsplit_once('/')
+        .map(|(_, r)| r)
+        .unwrap_or(submodule)
+        .to_ascii_lowercase();
+    let norm_underscore = clean_target.replace('-', "_");
+    let norm_hyphen = clean_target.replace('_', "-");
+    let branch_norm = branch.map(|b| normalize_ref(b).to_ascii_lowercase());
+    let parent_key = parent_repo.map(|p| p.to_ascii_lowercase());
+    let parent_suffix = parent_key.as_ref().map(|pk| format!("/{pk}"));
+
+    let owner = parent_repo
+        .and_then(|p| p.split_once('/').map(|(o, _)| o))
+        .or_else(|| submodule.split_once('/').map(|(o, _)| o))
+        .unwrap_or("LMA1980");
+
+    let mut matching: Vec<&CentralSubmoduleSnapshot> = sub_snapshots
+        .iter()
+        .filter(|s| {
+            let parent_matches = match (&parent_key, &parent_suffix) {
+                (Some(pk), Some(ps)) => &s.parent_repo_key == pk || s.parent_repo_key.ends_with(ps),
+                _ => true,
+            };
+            let branch_matches = branch_norm
+                .as_ref()
+                .map(|b| &s.branch_key == b)
+                .unwrap_or(true);
+            let sub_matches = s.submodule_key == clean_target
+                || s.submodule_key == norm_underscore
+                || s.submodule_key == norm_hyphen
+                || s.submodule_path_key == clean_target;
+            parent_matches && branch_matches && sub_matches
+        })
+        .collect();
+
+    matching.sort_by(|a, b| {
+        if branch_norm.is_none() {
+            let a_main = u8::from(a.branch_key != "main");
+            let b_main = u8::from(b.branch_key != "main");
+            if a_main != b_main {
+                return a_main.cmp(&b_main);
+            }
+        }
+        let a_ts = a
+            .latest_active_queued_us
+            .or(a.latest_completed_queued_us)
+            .unwrap_or(0);
+        let b_ts = b
+            .latest_active_queued_us
+            .or(b.latest_completed_queued_us)
+            .unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+
+    let parse_and_fix_owner = |opt_s: Option<&str>| -> Option<JobRecord> {
+        let mut rec: JobRecord = serde_json::from_str(opt_s?).ok()?;
+        let short = rec
+            .job
+            .repo_name
+            .rsplit_once('/')
+            .map(|(_, r)| r)
+            .unwrap_or(&rec.job.repo_name);
+        rec.job.repo_name = format!("{owner}/{short}");
+        Some(rec)
+    };
+
+    if let Some(best) = matching.first() {
+        let active = parse_and_fix_owner(best.latest_active_json.as_deref());
+        let completed = parse_and_fix_owner(best.latest_completed_json.as_deref());
+        if active.is_some() || completed.is_some() {
+            return (active, completed);
+        }
+    }
+
+    if parent_repo.is_some() {
+        let direct_candidate = format!("{owner}/{clean_target}");
+        let (d_act, d_comp) =
+            resolve_direct_repo_from_snapshots(branch_snapshots, &direct_candidate, branch);
+        if d_act.is_some() || d_comp.is_some() {
+            return (d_act, d_comp);
+        }
+        if !clean_target.starts_with("k3-") {
+            let k3_candidate = format!("{owner}/k3-{clean_target}");
+            let (k_act, k_comp) =
+                resolve_direct_repo_from_snapshots(branch_snapshots, &k3_candidate, branch);
+            if k_act.is_some() || k_comp.is_some() {
+                return (k_act, k_comp);
+            }
+        }
+    }
+
+    (None, None)
+}
+
+impl ControllerStorage for MuObserveRemoteStorage {
+    fn upsert_record(&self, record: &JobRecord) {
+        let Some(central_record) = DuckDbStore::to_central_job_record(record) else {
+            return;
+        };
+        let repo_key = central_record.repo_key.clone();
+        let branch_key = central_record.branch_key.clone();
+
+        let existing_branch = self
+            .load_branch_snapshots(Some(&repo_key), Some(&branch_key))
+            .into_iter()
+            .next();
+        let existing_subs = self.load_submodule_snapshots(Some(&repo_key), None, Some(&branch_key));
+
+        let next_branch =
+            compute_next_branch_snapshot(existing_branch.as_ref(), record, |rk, bk| {
+                self.query_jobs_filtered(Some(rk.to_string()), Some(bk.to_string()), None, 25)
+                    .into_iter()
+                    .find(|j| j.status_state != "Skipped" && j.job_id != record.job.id)
+                    .map(|j| (j.job_id, j.record_json, j.queued_at_us))
+            });
+        let next_subs = compute_next_submodule_snapshots(&existing_subs, record);
+
+        let req = ControlRpcEnvelope::UpsertJobRecordReq(UpsertJobRecordRequest {
+            request_id: self.next_request_id("upsert-job"),
+            record: central_record,
+            branch_snapshot: next_branch,
+            submodule_snapshots: next_subs,
+        });
+
+        if let Err(e) = self.send_rpc_blocking(&req) {
+            warn!(job_id = %record.job.id, error = %e, "MuObserve UpsertJobRecordReq failed");
+        }
+    }
+
+    fn upsert_records_batch(&self, records: &[JobRecord]) {
+        if records.is_empty() {
+            return;
+        }
+
+        let mut central_records: Vec<CentralJobRecord> = Vec::with_capacity(records.len());
+        let mut branch_map: BTreeMap<(String, String), CentralBranchSnapshot> = self
+            .load_branch_snapshots(None, None)
+            .into_iter()
+            .map(|b| ((b.repo_key.clone(), b.branch_key.clone()), b))
+            .collect();
+        let mut sub_map: BTreeMap<(String, String, String), CentralSubmoduleSnapshot> = self
+            .load_submodule_snapshots(None, None, None)
+            .into_iter()
+            .map(|s| {
+                (
+                    (
+                        s.parent_repo_key.clone(),
+                        s.branch_key.clone(),
+                        s.submodule_key.clone(),
+                    ),
+                    s,
+                )
+            })
+            .collect();
+
+        // Keep an ordered history per (repo_key, branch_key) for Skipped fallback resolution
+        let mut history_by_branch: BTreeMap<(String, String), Vec<CentralJobRecord>> =
+            BTreeMap::new();
+
+        for rec in records {
+            let Some(central) = DuckDbStore::to_central_job_record(rec) else {
+                continue;
+            };
+            let key = (central.repo_key.clone(), central.branch_key.clone());
+            history_by_branch
+                .entry(key.clone())
+                .or_default()
+                .push(central.clone());
+
+            let existing_branch = branch_map.get(&key).cloned();
+            let history_ref = history_by_branch.get(&key);
+            if let Some(next_b) =
+                compute_next_branch_snapshot(existing_branch.as_ref(), rec, |_rk, _bk| {
+                    history_ref.and_then(|list| {
+                        list.iter()
+                            .filter(|j| j.status_state != "Skipped" && j.job_id != rec.job.id)
+                            .max_by_key(|j| (j.queued_at_us, j.updated_at_us))
+                            .map(|j| (j.job_id.clone(), j.record_json.clone(), j.queued_at_us))
+                    })
+                })
+            {
+                branch_map.insert(key.clone(), next_b);
+            }
+
+            let existing_subs: Vec<CentralSubmoduleSnapshot> = sub_map
+                .iter()
+                .filter(|((prk, bk, _), _)| prk == &key.0 && bk == &key.1)
+                .map(|(_, v)| v.clone())
+                .collect();
+            for next_s in compute_next_submodule_snapshots(&existing_subs, rec) {
+                sub_map.insert(
+                    (
+                        next_s.parent_repo_key.clone(),
+                        next_s.branch_key.clone(),
+                        next_s.submodule_key.clone(),
+                    ),
+                    next_s,
+                );
+            }
+
+            central_records.push(central);
+        }
+
+        let req = ControlRpcEnvelope::UpsertJobBatchReq(UpsertJobBatchRequest {
+            request_id: self.next_request_id("upsert-batch"),
+            records: central_records,
+            branch_snapshots: branch_map.into_values().collect(),
+            submodule_snapshots: sub_map.into_values().collect(),
+        });
+
+        if let Err(e) = self.send_rpc_blocking(&req) {
+            warn!(count = records.len(), error = %e, "MuObserve UpsertJobBatchReq failed");
+        }
+    }
+
+    fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord> {
+        self.query_jobs_filtered(None, None, None, limit as u32)
+            .into_iter()
+            .filter_map(|r| serde_json::from_str::<JobRecord>(&r.record_json).ok())
+            .collect()
+    }
+
+    fn load_branch_snapshots(
+        &self,
+        repo_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralBranchSnapshot> {
+        let req = ControlRpcEnvelope::QueryBranchSnapshotsReq(QueryBranchSnapshotsRequest {
+            request_id: self.next_request_id("q-branch"),
+            repo_key: repo_key.map(|r| r.to_ascii_lowercase()),
+            branch_key: branch_key.map(|b| normalize_ref(b).to_ascii_lowercase()),
+        });
+        match self.send_rpc_blocking(&req) {
+            Ok(ControlRpcEnvelope::QueryBranchSnapshotsResp(resp)) => resp.snapshots,
+            Ok(other) => {
+                warn!("Unexpected RPC response for QueryBranchSnapshotsReq: {other:?}");
+                Vec::new()
+            }
+            Err(e) => {
+                debug!(error = %e, "MuObserve QueryBranchSnapshotsReq failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn load_submodule_snapshots(
+        &self,
+        parent_repo_key: Option<&str>,
+        submodule_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralSubmoduleSnapshot> {
+        let req = ControlRpcEnvelope::QuerySubmoduleSnapshotsReq(QuerySubmoduleSnapshotsRequest {
+            request_id: self.next_request_id("q-sub"),
+            parent_repo_key: parent_repo_key.map(|p| p.to_ascii_lowercase()),
+            submodule_key: submodule_key.map(|s| {
+                s.rsplit_once('/')
+                    .map(|(_, r)| r)
+                    .unwrap_or(s)
+                    .to_ascii_lowercase()
+            }),
+            branch_key: branch_key.map(|b| normalize_ref(b).to_ascii_lowercase()),
+        });
+        match self.send_rpc_blocking(&req) {
+            Ok(ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(resp)) => resp.snapshots,
+            Ok(other) => {
+                warn!("Unexpected RPC response for QuerySubmoduleSnapshotsReq: {other:?}");
+                Vec::new()
+            }
+            Err(e) => {
+                debug!(error = %e, "MuObserve QuerySubmoduleSnapshotsReq failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn get_job(&self, job_id: &str) -> Option<JobRecord> {
+        self.query_jobs_filtered(None, None, Some(job_id.to_string()), 1)
+            .into_iter()
+            .next()
+            .and_then(|r| serde_json::from_str::<JobRecord>(&r.record_json).ok())
+    }
+
+    fn find_card_context(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        let branch_snapshots = self.load_branch_snapshots(None, None);
+        let sub_snapshots = self.load_submodule_snapshots(None, None, None);
+
+        let (mut direct_active, mut direct_completed) =
+            resolve_direct_repo_from_snapshots(&branch_snapshots, repo, branch);
+        let (sub_active, sub_completed) =
+            resolve_submodule_from_snapshots(&sub_snapshots, &branch_snapshots, None, repo, branch);
+
+        if let (Some(ref mut d_comp), Some(ref s_comp)) = (&mut direct_completed, &sub_completed) {
+            if d_comp.metrics.is_none() && s_comp.metrics.is_some() {
+                d_comp.metrics = s_comp.metrics.clone();
+            }
+        }
+        if let (Some(ref mut d_act), Some(ref s_act)) = (&mut direct_active, &sub_active) {
+            if matches!(
+                d_act.status,
+                JobStatus::Completed { .. } | JobStatus::Failed { .. }
+            ) && d_act.metrics.is_none()
+                && s_act.metrics.is_some()
+            {
+                d_act.metrics = s_act.metrics.clone();
+            }
+        }
+
+        if direct_active.is_some() || direct_completed.is_some() {
+            return (direct_active, direct_completed);
+        }
+        (sub_active, sub_completed)
+    }
+
+    fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        let branch_snapshots = self.load_branch_snapshots(None, None);
+        let sub_snapshots = self.load_submodule_snapshots(None, None, None);
+        resolve_submodule_from_snapshots(
+            &sub_snapshots,
+            &branch_snapshots,
+            Some(parent_repo),
+            submodule,
+            branch,
+        )
+    }
+
+    fn evaluate_regression_gate(
+        &self,
+        req: &RegressionGateRequest,
+    ) -> Option<RegressionGateReport> {
+        let envelope = ControlRpcEnvelope::RegressionGateReq(req.clone());
+        match self.send_rpc_blocking(&envelope) {
+            Ok(ControlRpcEnvelope::RegressionGateResp(report)) => Some(report),
+            Ok(other) => {
+                warn!("Unexpected RPC response for RegressionGateReq: {other:?}");
+                None
+            }
+            Err(e) => {
+                debug!(error = %e, "MuObserve RegressionGateReq failed");
+                None
+            }
+        }
+    }
+}
+
+/// Phase 1 dual-write storage combining [`LocalDuckDbStorage`] and [`MuObserveRemoteStorage`]
+/// for zero-downtime migration per `AGENTS.md §4`.
+#[derive(Clone)]
+pub struct DualWriteStorage {
+    local: Arc<LocalDuckDbStorage>,
+    remote: Arc<MuObserveRemoteStorage>,
+}
+
+impl DualWriteStorage {
+    /// Creates a new [`DualWriteStorage`] mirroring writes to both `local` and `remote`.
+    #[must_use]
+    pub fn new(local: Arc<LocalDuckDbStorage>, remote: Arc<MuObserveRemoteStorage>) -> Self {
+        Self { local, remote }
+    }
+
+    /// Returns a reference to the primary [`LocalDuckDbStorage`].
+    #[must_use]
+    pub fn local(&self) -> &Arc<LocalDuckDbStorage> {
+        &self.local
+    }
+
+    /// Returns a reference to the secondary [`MuObserveRemoteStorage`].
+    #[must_use]
+    pub fn remote(&self) -> &Arc<MuObserveRemoteStorage> {
+        &self.remote
+    }
+}
+
+impl ControllerStorage for DualWriteStorage {
+    fn upsert_record(&self, record: &JobRecord) {
+        self.local.upsert_record(record);
+        self.remote.upsert_record(record);
+    }
+
+    fn upsert_records_batch(&self, records: &[JobRecord]) {
+        self.local.upsert_records_batch(records);
+        self.remote.upsert_records_batch(records);
+    }
+
+    fn load_recent_jobs(&self, limit: usize) -> Vec<JobRecord> {
+        let local_jobs = self.local.load_recent_jobs(limit);
+        if !local_jobs.is_empty() {
+            return local_jobs;
+        }
+        self.remote.load_recent_jobs(limit)
+    }
+
+    fn load_branch_snapshots(
+        &self,
+        repo_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralBranchSnapshot> {
+        let local_snaps = self.local.load_branch_snapshots(repo_key, branch_key);
+        if !local_snaps.is_empty() {
+            return local_snaps;
+        }
+        self.remote.load_branch_snapshots(repo_key, branch_key)
+    }
+
+    fn load_submodule_snapshots(
+        &self,
+        parent_repo_key: Option<&str>,
+        submodule_key: Option<&str>,
+        branch_key: Option<&str>,
+    ) -> Vec<CentralSubmoduleSnapshot> {
+        let local_snaps =
+            self.local
+                .load_submodule_snapshots(parent_repo_key, submodule_key, branch_key);
+        if !local_snaps.is_empty() {
+            return local_snaps;
+        }
+        self.remote
+            .load_submodule_snapshots(parent_repo_key, submodule_key, branch_key)
+    }
+
+    fn get_job(&self, job_id: &str) -> Option<JobRecord> {
+        self.local
+            .get_job(job_id)
+            .or_else(|| self.remote.get_job(job_id))
+    }
+
+    fn find_card_context(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        let (act, comp) = self.local.find_card_context(repo, branch);
+        if act.is_some() || comp.is_some() {
+            return (act, comp);
+        }
+        self.remote.find_card_context(repo, branch)
+    }
+
+    fn find_submodule_card_context(
+        &self,
+        parent_repo: &str,
+        submodule: &str,
+        branch: Option<&str>,
+    ) -> (Option<JobRecord>, Option<JobRecord>) {
+        let (act, comp) = self
+            .local
+            .find_submodule_card_context(parent_repo, submodule, branch);
+        if act.is_some() || comp.is_some() {
+            return (act, comp);
+        }
+        self.remote
+            .find_submodule_card_context(parent_repo, submodule, branch)
+    }
+
+    fn evaluate_regression_gate(
+        &self,
+        req: &RegressionGateRequest,
+    ) -> Option<RegressionGateReport> {
+        self.remote.evaluate_regression_gate(req)
+    }
+}
+
+// ============================================================================
+// Sub-task #44 (M3.057): Root W3C Trace Context & RegressionGateReport Scoring
+// ============================================================================
+
+/// Generates a deterministic root W3C [`TraceContext`] for a CI job from `(job_id, commit_sha)`.
+#[must_use]
+pub fn job_root_trace_context(job_id: &str, commit_sha: &str) -> TraceContext {
+    let mut trace_hasher = Sha256::new();
+    trace_hasher.update(b"muobserve-job-trace:");
+    trace_hasher.update(job_id.as_bytes());
+    trace_hasher.update(b":");
+    trace_hasher.update(commit_sha.as_bytes());
+    let trace_digest = trace_hasher.finalize();
+
+    let mut trace_id = [0u8; 16];
+    trace_id.copy_from_slice(&trace_digest[..16]);
+    if trace_id == [0u8; 16] {
+        trace_id[15] = 1;
+    }
+
+    let mut span_hasher = Sha256::new();
+    span_hasher.update(b"muobserve-job-root-span:");
+    span_hasher.update(job_id.as_bytes());
+    span_hasher.update(b":");
+    span_hasher.update(commit_sha.as_bytes());
+    let span_digest = span_hasher.finalize();
+
+    let mut span_id = [0u8; 8];
+    span_id.copy_from_slice(&span_digest[..8]);
+    if span_id == [0u8; 8] {
+        span_id[7] = 1;
+    }
+
+    TraceContext {
+        version: W3C_TRACEPARENT_VERSION,
+        trace_id,
+        span_id,
+        trace_flags: TRACE_FLAG_SAMPLED,
+    }
+}
+
+/// Formats the deterministic root W3C `traceparent` header (`00-<trace_id>-<span_id>-01`) for a CI job.
+#[must_use]
+pub fn job_root_traceparent(job_id: &str, commit_sha: &str) -> String {
+    job_root_trace_context(job_id, commit_sha).to_traceparent()
+}
+
+/// Maps a numeric quality score (`0..=100`) to `ActionRunner-controller`'s letter grade scale.
+#[must_use]
+pub fn compute_letter_grade(score: u32) -> String {
+    match score {
+        95..=100 => "A+".to_string(),
+        90..=94 => "A".to_string(),
+        80..=89 => "B".to_string(),
+        70..=79 => "C".to_string(),
+        60..=69 => "D".to_string(),
+        _ => "F".to_string(),
+    }
+}
+
+/// Applies a [`RegressionGateReport`] returned by `MuObserve` to a completed job's
+/// [`JobMetrics`] quality scorecard and [`JobStatus`] (`#44`).
+///
+/// - [`RegressionVerdict::Pass`]: preserves quality score and status; enriches `benchmark_summary` if unset.
+/// - [`RegressionVerdict::Warn`]: deducts 5 quality points per flaky test (minimum 5 points),
+///   recomputes `letter_grade`, and annotates `benchmark_summary`.
+/// - [`RegressionVerdict::Fail`] (`RegressionDetected`): deducts 20 points per regressed benchmark
+///   and 25 points per newly failed test (minimum 25 points), caps `quality_score <= 65` (`D`/`F`),
+///   recomputes `letter_grade`, and transitions `status` to [`JobStatus::Failed`].
+pub fn apply_regression_gate_to_job(
+    metrics: &mut JobMetrics,
+    status: &mut JobStatus,
+    report: &RegressionGateReport,
+) {
+    match report.verdict {
+        RegressionVerdict::Pass => {
+            if metrics.benchmark_summary.is_none() && !report.summary.is_empty() {
+                metrics.benchmark_summary = Some(report.summary.clone());
+            }
+        }
+        RegressionVerdict::Warn => {
+            let warn_items = report.flaky_or_failed_tests.len().max(1);
+            let penalty = (warn_items.saturating_mul(5)).min(40) as u32;
+            metrics.quality_score = metrics.quality_score.saturating_sub(penalty);
+            metrics.letter_grade = compute_letter_grade(metrics.quality_score);
+            if !report.summary.is_empty() {
+                metrics.benchmark_summary = Some(match metrics.benchmark_summary.take() {
+                    Some(existing) if !existing.is_empty() => {
+                        format!("{existing} | {}", report.summary)
+                    }
+                    _ => report.summary.clone(),
+                });
+            }
+        }
+        RegressionVerdict::Fail => {
+            let bench_penalty = report.regressed_benchmarks.len().saturating_mul(20);
+            let test_penalty = report.flaky_or_failed_tests.len().saturating_mul(25);
+            let raw_penalty = bench_penalty.saturating_add(test_penalty).clamp(25, 100) as u32;
+            metrics.quality_score = metrics.quality_score.saturating_sub(raw_penalty).min(65);
+            metrics.letter_grade = compute_letter_grade(metrics.quality_score);
+            let reason = if report.summary.is_empty() {
+                format!(
+                    "RegressionDetected: {} benchmark regression(s), {} failing/flaky test(s)",
+                    report.regressed_benchmarks.len(),
+                    report.flaky_or_failed_tests.len()
+                )
+            } else if report.summary.starts_with("RegressionDetected") {
+                report.summary.clone()
+            } else {
+                format!("RegressionDetected: {}", report.summary)
+            };
+            metrics.benchmark_summary = Some(reason.clone());
+            *status = JobStatus::Failed { error: reason };
+        }
+    }
+}

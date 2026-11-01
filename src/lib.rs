@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod job;
 pub mod scheduler;
+pub mod storage_backend;
 pub mod tls;
 pub mod tunnel;
 pub mod webhook;
