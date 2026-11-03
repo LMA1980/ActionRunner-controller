@@ -504,7 +504,18 @@ async fn topology_tracks_simulated_webhooks() {
         .iter()
         .map(|s| s["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["fmt-check", "clippy-check", "native-k3"]);
+    assert_eq!(
+        ids,
+        vec![
+            "fmt-check",
+            "clippy-check",
+            "audit-check",
+            "build-check",
+            "test-check",
+            "coverage-check",
+            "miri-check",
+        ]
+    );
     let refs: Vec<&str> = t0["branches"]
         .as_array()
         .unwrap()

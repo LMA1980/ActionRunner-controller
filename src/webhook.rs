@@ -645,7 +645,7 @@ pub async fn handle_webhook(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

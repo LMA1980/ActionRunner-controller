@@ -188,7 +188,17 @@ impl ActionRunnerWorkflow {
         event: &str,
     ) -> Result<ActionRunnerWorkflow, WorkflowValidationError> {
         self.validate()?;
-        let target_stage_ids = match self.on_action.get(event) {
+        let alias = match event {
+            "pull_request" => Some("pullrequest"),
+            "pullrequest" => Some("pull_request"),
+            "release" => Some("tag"),
+            _ => None,
+        };
+        let target_stage_ids = match self
+            .on_action
+            .get(event)
+            .or_else(|| alias.and_then(|a| self.on_action.get(a)))
+        {
             Some(stages) => stages,
             None => {
                 return Ok(ActionRunnerWorkflow {

@@ -1241,7 +1241,7 @@ pub fn normalize_ref(r: &str) -> &str {
     trimmed.strip_prefix("refs/heads/").unwrap_or(trimmed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use chrono::Utc;

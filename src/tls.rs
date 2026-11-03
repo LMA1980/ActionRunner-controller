@@ -248,7 +248,7 @@ impl CertReloadWatcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};

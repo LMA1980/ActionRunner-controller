@@ -249,44 +249,112 @@ pub fn resolve_workflow_for_event(
 }
 
 /// Default distributed pipeline used when a repository has no `.actionrunner/ActionRunner.yml`
-/// (fmt and clippy on x86 workers, native verification on the RISC-V board).
+/// (fmt and audit on hygiene workers, clippy/build/test/coverage/miri on build/test workers).
 pub const DEFAULT_WORKFLOW_YAML: &str = r#"
 version: "3"
-name: "Default Distributed Pipeline"
+name: "Default Distributed Pipeline: Formatting, Clippy, Audit, Build, Test, Coverage & Miri"
 tasks:
-  cargo-fmt:
+  fmt-task:
     tool: "cargo-fmt"
-    args: ["--check"]
-  cargo-clippy:
+    args: ["--all", "--", "--check"]
+    timeout_seconds: 120
+    sandbox_profile: "default_ci"
+  clippy-task:
     tool: "cargo-clippy"
-    args: ["--all-targets", "--", "-D", "warnings"]
-  cargo-test:
+    args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
+    timeout_seconds: 600
+    sandbox_profile: "default_ci"
+  audit-task:
+    tool: "cargo-audit"
+    args: []
+    timeout_seconds: 180
+    sandbox_profile: "default_ci"
+  build-task:
+    tool: "cargo-build"
+    args: ["--workspace", "--all-targets"]
+    timeout_seconds: 900
+    sandbox_profile: "default_ci"
+  test-task:
     tool: "cargo-test"
     args: ["--workspace"]
+    timeout_seconds: 1200
+    sandbox_profile: "default_ci"
+  coverage-task:
+    tool: "cargo-llvm-cov"
+    args: ["--workspace", "--summary-only"]
+    timeout_seconds: 1800
+    sandbox_profile: "default_ci"
+  miri-task:
+    tool: "cargo-miri"
+    args: ["test", "--workspace", "--lib"]
+    env:
+      CARGO_TARGET_DIR: "target"
+      MIRIFLAGS: "-Zmiri-disable-isolation"
+    timeout_seconds: 1800
+    sandbox_profile: "default_ci"
 stages:
   - id: fmt-check
-    name: "Verify Formatting"
-    tasks: ["cargo-fmt"]
+    name: "Verify Rust Formatting (cargo fmt)"
+    tasks: ["fmt-task"]
     tags: ["fmt"]
     threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
   - id: clippy-check
-    name: "Verify Linter Hygiene"
-    tasks: ["cargo-clippy"]
+    name: "Verify Rust Linter & Clippy Rules (cargo clippy)"
+    tasks: ["clippy-task"]
+    depends_on: ["fmt-check"]
     tags: ["clippy"]
     threads: 4
-  - id: native-k3
-    name: "Native Verification"
-    tasks: ["cargo-test"]
-    tags: ["k3"]
-    depends_on: ["fmt-check", "clippy-check"]
+    exclusive: false
+    max_concurrent_per_node: 1
+  - id: audit-check
+    name: "Verify Dependencies Security Advisories (cargo audit)"
+    tasks: ["audit-task"]
+    depends_on: ["fmt-check"]
+    tags: ["audit"]
+    threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
+  - id: build-check
+    name: "Build Workspace Targets (cargo build)"
+    tasks: ["build-task"]
+    depends_on: ["clippy-check"]
+    tags: ["build"]
     threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+  - id: test-check
+    name: "Execute Test Suite (cargo test)"
+    tasks: ["test-task"]
+    depends_on: ["build-check"]
+    tags: ["test"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+  - id: coverage-check
+    name: "Evaluate Line Code Coverage (cargo llvm-cov)"
+    tasks: ["coverage-task"]
+    depends_on: ["test-check", "audit-check"]
+    tags: ["test"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+  - id: miri-check
+    name: "Verify Safe Execution & Undefined Behavior (cargo miri)"
+    tasks: ["miri-task"]
+    depends_on: ["test-check"]
+    tags: ["test"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
 on_action:
-  push: ["fmt-check", "clippy-check", "native-k3"]
-  pull_request: ["fmt-check", "clippy-check", "native-k3"]
-  pullrequest: ["fmt-check", "clippy-check", "native-k3"]
-  merge: ["fmt-check", "clippy-check", "native-k3"]
-  tag: ["fmt-check", "clippy-check", "native-k3"]
-  release: ["fmt-check", "clippy-check", "native-k3"]
+  push: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
+  pull_request: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
+  pullrequest: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
+  merge: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
+  tag: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
+  release: ["fmt-check", "clippy-check", "audit-check", "build-check", "test-check", "coverage-check", "miri-check"]
 "#;
 
 pub struct DAGScheduler {
