@@ -602,3 +602,79 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
         .load_submodule_snapshots(None, None, None)
         .is_empty());
 }
+
+#[tokio::test]
+async fn test_ha_failback_prevents_standby_queue_stall() {
+    let shared_storage: Arc<dyn ControllerStorage> = Arc::new(InMemoryStorage::open());
+    let ws_a = tempfile::tempdir().expect("ws_a");
+    let ws_b = tempfile::tempdir().expect("ws_b");
+
+    // 1. Standby node-b (Auto) starts first while primary node-a is offline -> node-b holds epoch 1
+    let state_b = build_controller_state(
+        "node-b",
+        HaRoleConfig::Auto,
+        ws_b.path().to_path_buf(),
+        Arc::clone(&shared_storage),
+    );
+    assert_eq!(state_b.job_store.ha_role(), HaRole::Leader);
+    assert_eq!(
+        shared_storage.get_leader_lease().unwrap().holder_id,
+        "node-b"
+    );
+
+    // 2. Primary node-a starts in Auto mode before node-b's lease expires -> initially Standby,
+    //    but HAProxy routes worker heartbeats to node-a (`is_online = true`).
+    let state_a = build_controller_state(
+        "node-a",
+        HaRoleConfig::Auto,
+        ws_a.path().to_path_buf(),
+        Arc::clone(&shared_storage),
+    );
+    assert_eq!(state_a.job_store.ha_role(), HaRole::Standby);
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+    state_a
+        .cluster
+        .register(
+            action_runner_ipc::WorkerRegistration {
+                node_id: "worker-riscv64".to_string(),
+                arch: "riscv64".to_string(),
+                tags: vec!["riscv64".to_string(), "k3".to_string()],
+                toolchains: vec!["system".to_string()],
+                max_slots: 1,
+                ram_total_mb: 32768,
+                btrfs_enabled: false,
+            },
+            cmd_tx,
+        )
+        .await;
+
+    // 3. Coordinator tick on node-a detects active worker heartbeats on Standby and reclaims leadership;
+    //    subsequent tick on node-b steps down to Standby.
+    state_a.tick_ha_coordinator().await;
+    assert_eq!(state_a.job_store.ha_role(), HaRole::Leader);
+    let lease = shared_storage.get_leader_lease().unwrap();
+    assert_eq!(lease.holder_id, "node-a");
+    assert_eq!(lease.epoch, 2);
+
+    state_b.tick_ha_coordinator().await;
+    assert_eq!(state_b.job_store.ha_role(), HaRole::Standby);
+
+    // 4. Verify designated Leader policy (`HaRoleConfig::Leader`) also reclaims lease if demoted
+    state_a.demote_to_standby().await;
+    assert_eq!(state_a.job_store.ha_role(), HaRole::Standby);
+    let ws_c = tempfile::tempdir().expect("ws_c");
+    let state_c = build_controller_state(
+        "node-c",
+        HaRoleConfig::Leader,
+        ws_c.path().to_path_buf(),
+        Arc::clone(&shared_storage),
+    );
+    let _ = state_b.promote_to_leader().await;
+    state_c.tick_ha_coordinator().await;
+    assert_eq!(state_c.job_store.ha_role(), HaRole::Leader);
+    assert_eq!(
+        shared_storage.get_leader_lease().unwrap().holder_id,
+        "node-c"
+    );
+}

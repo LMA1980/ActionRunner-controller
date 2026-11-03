@@ -411,7 +411,19 @@ impl JobStore {
                 by_id.insert(rec.job.id.clone(), rec.clone());
             }
             for rec in remote_jobs {
-                by_id.insert(rec.job.id.clone(), rec);
+                match by_id.get(&rec.job.id) {
+                    Some(local)
+                        if !recover_running
+                            && (local.updated_at > rec.updated_at
+                                || (matches!(local.status, JobStatus::Running { .. })
+                                    && matches!(rec.status, JobStatus::Queued))) =>
+                    {
+                        // Preserve fresher local in-flight state on the active leader.
+                    }
+                    _ => {
+                        by_id.insert(rec.job.id.clone(), rec);
+                    }
+                }
             }
 
             let mut merged: Vec<JobRecord> = by_id.into_values().collect();
@@ -444,6 +456,10 @@ impl JobStore {
                         has_queued = true;
                     }
                 }
+            } else {
+                has_queued = merged
+                    .iter()
+                    .any(|rec| matches!(rec.status, JobStatus::Queued));
             }
 
             count = merged.len();
@@ -455,9 +471,9 @@ impl JobStore {
         }
         if recover_running {
             self.persist().await;
-            if has_queued || !recovered_for_db.is_empty() {
-                self.notify.notify_waiters();
-            }
+        }
+        if (recover_running || self.is_leader()) && (has_queued || !recovered_for_db.is_empty()) {
+            self.notify.notify_waiters();
         }
 
         count
