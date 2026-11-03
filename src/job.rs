@@ -223,6 +223,9 @@ impl JobStore {
         config: &crate::config::Config,
         db: Arc<dyn crate::storage_backend::ControllerStorage>,
     ) -> Self {
+        if !config.bootstrap_admins.is_empty() {
+            db.seed_bootstrap_admins(&config.bootstrap_admins);
+        }
         let initial_role = match config.ha_role {
             crate::config::HaRoleConfig::Leader => {
                 let _ =
@@ -389,6 +392,49 @@ impl JobStore {
     #[must_use]
     pub fn get_job_log(&self, job_id: &str) -> Option<String> {
         self.db.get_job_log(job_id)
+    }
+
+    pub fn seed_bootstrap_admins(&self, admins: &[String]) {
+        self.db.seed_bootstrap_admins(admins);
+    }
+
+    pub fn create_auth_invite(&self, invite: &crate::db::AuthInviteRecord) {
+        self.db.create_auth_invite(invite);
+    }
+
+    #[must_use]
+    pub fn get_auth_invite(&self, invite_id: &str) -> Option<crate::db::AuthInviteRecord> {
+        self.db.get_auth_invite(invite_id)
+    }
+
+    #[must_use]
+    pub fn list_auth_invites(&self) -> Vec<crate::db::AuthInviteRecord> {
+        self.db.list_auth_invites()
+    }
+
+    pub fn redeem_auth_invite(
+        &self,
+        invite_id: &str,
+        presented_hmac: &str,
+        github_login: &str,
+        now: DateTime<Utc>,
+    ) -> Result<crate::db::AuthUserRecord, crate::db::RedeemInviteError> {
+        self.db
+            .redeem_auth_invite(invite_id, presented_hmac, github_login, now)
+    }
+
+    #[must_use]
+    pub fn get_auth_user(&self, github_login: &str) -> Option<crate::db::AuthUserRecord> {
+        self.db.get_auth_user(github_login)
+    }
+
+    #[must_use]
+    pub fn list_auth_users(&self) -> Vec<crate::db::AuthUserRecord> {
+        self.db.list_auth_users()
+    }
+
+    pub fn revoke_auth_user(&self, github_login: &str) -> bool {
+        self.db.revoke_auth_user(github_login)
     }
 
     /// Re-hydrates the in-memory job queue from [`ControllerStorage`] (`#81`).

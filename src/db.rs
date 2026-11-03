@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use muobserve_ipc::{CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -11,6 +12,73 @@ use crate::storage_backend::{
     resolve_direct_repo_from_snapshots, resolve_submodule_from_snapshots, LeaderLease,
 };
 
+/// One-time operator invite record persisted in `auth_invites` (`#93`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthInviteRecord {
+    pub invite_id: String,
+    pub token_hmac: String,
+    pub created_by: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub used_by_github_login: Option<String>,
+    pub used_at: Option<String>,
+}
+
+/// Sanitized view of [`AuthInviteRecord`] returned by `GET /api/auth/invites`
+/// without raw tokens or HMAC digests (`#96`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthInviteView {
+    pub invite_id: String,
+    pub created_by: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub used_by_github_login: Option<String>,
+    pub used_at: Option<String>,
+}
+
+impl From<&AuthInviteRecord> for AuthInviteView {
+    fn from(r: &AuthInviteRecord) -> Self {
+        Self {
+            invite_id: r.invite_id.clone(),
+            created_by: r.created_by.clone(),
+            note: r.note.clone(),
+            created_at: r.created_at.clone(),
+            expires_at: r.expires_at.clone(),
+            used_by_github_login: r.used_by_github_login.clone(),
+            used_at: r.used_at.clone(),
+        }
+    }
+}
+
+/// Bound GitHub operator record persisted in `auth_users` (`#93`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUserRecord {
+    pub github_login: String,
+    pub role: String,
+    pub invited_by: String,
+    pub invite_id: Option<String>,
+    pub bound_at: String,
+    pub revoked: u8,
+}
+
+/// Atomic single-use invite redemption error (`#93`, `#95`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RedeemInviteError {
+    InviteNotFound,
+    InvalidSignature,
+    InviteAlreadyUsed,
+    InviteExpired,
+}
+
+fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[derive(Default)]
 struct InMemoryCatalog {
     jobs: BTreeMap<String, CentralJobRecord>,
@@ -19,6 +87,8 @@ struct InMemoryCatalog {
     job_logs: BTreeMap<String, String>,
     leader_lease: Option<LeaderLease>,
     console_registry_json: Option<String>,
+    auth_invites: BTreeMap<String, AuthInviteRecord>,
+    auth_users: BTreeMap<String, AuthUserRecord>,
 }
 
 /// Pure-Rust in-memory state catalog for test harnesses and log metric extraction
@@ -27,6 +97,9 @@ struct InMemoryCatalog {
 pub struct CatalogStore {
     inner: Mutex<InMemoryCatalog>,
 }
+
+/// Backward-compatible type alias for [`CatalogStore`].
+pub type Db = CatalogStore;
 
 impl CatalogStore {
     #[must_use]
@@ -423,6 +496,138 @@ impl CatalogStore {
     pub fn load_console_registry(&self) -> Option<String> {
         let guard = self.inner.lock().ok()?;
         guard.console_registry_json.clone()
+    }
+
+    /// Seeds `config.bootstrap_admins` as `role = "admin"`, `invited_by = "bootstrap"` (`#93`).
+    pub fn seed_bootstrap_admins(&self, admins: &[String]) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let now_str = Utc::now().to_rfc3339();
+        for raw_login in admins {
+            let clean = raw_login.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            let key = clean.to_ascii_lowercase();
+            guard
+                .auth_users
+                .entry(key)
+                .or_insert_with(|| AuthUserRecord {
+                    github_login: clean.to_string(),
+                    role: "admin".to_string(),
+                    invited_by: "bootstrap".to_string(),
+                    invite_id: None,
+                    bound_at: now_str.clone(),
+                    revoked: 0,
+                });
+        }
+    }
+
+    /// Inserts a newly generated one-time invite into `auth_invites` (`#93`).
+    pub fn create_auth_invite(&self, invite: &AuthInviteRecord) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard
+                .auth_invites
+                .insert(invite.invite_id.clone(), invite.clone());
+        }
+    }
+
+    /// Looks up a single invite by `invite_id` (`#93`).
+    pub fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
+        let guard = self.inner.lock().ok()?;
+        guard.auth_invites.get(invite_id).cloned()
+    }
+
+    /// Lists all invites in `auth_invites` (`#93`, `#96`).
+    pub fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard.auth_invites.values().cloned().collect()
+    }
+
+    /// Atomically verifies and redeems a single-use invite token, marking `used_by_github_login`
+    /// and `used_at`, and upserting the user into `auth_users` with `revoked = 0` (`#93`, `#95`).
+    pub fn redeem_auth_invite(
+        &self,
+        invite_id: &str,
+        presented_hmac: &str,
+        github_login: &str,
+        now: DateTime<Utc>,
+    ) -> Result<AuthUserRecord, RedeemInviteError> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Err(RedeemInviteError::InviteNotFound);
+        };
+        let invite = guard
+            .auth_invites
+            .get_mut(invite_id)
+            .ok_or(RedeemInviteError::InviteNotFound)?;
+
+        if !constant_time_eq_bytes(invite.token_hmac.as_bytes(), presented_hmac.as_bytes()) {
+            return Err(RedeemInviteError::InvalidSignature);
+        }
+
+        if invite.used_at.is_some() || invite.used_by_github_login.is_some() {
+            return Err(RedeemInviteError::InviteAlreadyUsed);
+        }
+
+        let expires_at = DateTime::parse_from_rfc3339(&invite.expires_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|_| RedeemInviteError::InviteExpired)?;
+        if expires_at <= now {
+            return Err(RedeemInviteError::InviteExpired);
+        }
+
+        let login_clean = github_login.trim().to_string();
+        let login_key = login_clean.to_ascii_lowercase();
+        let now_str = now.to_rfc3339();
+
+        invite.used_by_github_login = Some(login_clean.clone());
+        invite.used_at = Some(now_str.clone());
+
+        let invited_by = invite.created_by.clone();
+        let inv_id = invite.invite_id.clone();
+
+        let user = AuthUserRecord {
+            github_login: login_clean,
+            role: "operator".to_string(),
+            invited_by,
+            invite_id: Some(inv_id),
+            bound_at: now_str,
+            revoked: 0,
+        };
+        guard.auth_users.insert(login_key, user.clone());
+        Ok(user)
+    }
+
+    /// Looks up a user in `auth_users` case-insensitively (`#93`).
+    pub fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
+        let guard = self.inner.lock().ok()?;
+        let key = github_login.trim().to_ascii_lowercase();
+        guard.auth_users.get(&key).cloned()
+    }
+
+    /// Lists all bound/revoked users in `auth_users` (`#93`, `#96`).
+    pub fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard.auth_users.values().cloned().collect()
+    }
+
+    /// Revokes a user (`revoked = 1`) in `auth_users` (`#93`, `#96`).
+    pub fn revoke_auth_user(&self, github_login: &str) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        let key = github_login.trim().to_ascii_lowercase();
+        if let Some(user) = guard.auth_users.get_mut(&key) {
+            user.revoked = 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Scans `workspace_dir/logs/<owner>/<repo>/job-*.log` and imports any historical log files

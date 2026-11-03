@@ -80,6 +80,9 @@ pub struct Config {
     pub ha_role: HaRoleConfig,
     pub lease_ttl_seconds: u64,
     pub standby_sync_seconds: u64,
+    pub proxy_secret: Option<String>,
+    pub invite_signing_key: Option<String>,
+    pub bootstrap_admins: Vec<String>,
 }
 
 impl Default for Config {
@@ -106,6 +109,9 @@ impl Default for Config {
             ha_role: HaRoleConfig::Leader,
             lease_ttl_seconds: 15,
             standby_sync_seconds: 5,
+            proxy_secret: None,
+            invite_signing_key: None,
+            bootstrap_admins: Vec::new(),
         }
     }
 }
@@ -188,6 +194,23 @@ impl Config {
             .filter(|&v| v > 0)
             .unwrap_or(5);
 
+        let proxy_secret = Self::resolve_secret_with_file_var(
+            "ACTION_RUNNER_PROXY_SECRET",
+            "ACTION_RUNNER_PROXY_SECRET_FILE",
+        );
+
+        let invite_signing_key = Self::resolve_secret_with_file_var(
+            "ACTION_RUNNER_INVITE_SIGNING_KEY",
+            "ACTION_RUNNER_INVITE_SIGNING_KEY_FILE",
+        );
+
+        let bootstrap_admins = std::env::var("ACTION_RUNNER_BOOTSTRAP_ADMINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Self {
             bind_addr,
             workspace_dir,
@@ -206,6 +229,9 @@ impl Config {
             ha_role,
             lease_ttl_seconds,
             standby_sync_seconds,
+            proxy_secret,
+            invite_signing_key,
+            bootstrap_admins,
         }
     }
 
@@ -249,6 +275,47 @@ impl Config {
     pub fn resolve_secret(env_var: &str) -> Option<String> {
         let val = std::env::var(env_var).ok()?;
         Self::resolve_secret_value(&val)
+    }
+
+    pub fn resolve_secret_with_file_var(env_var: &str, file_env_var: &str) -> Option<String> {
+        if let Ok(file_val) = std::env::var(file_env_var) {
+            let trimmed = file_val.trim();
+            if !trimmed.is_empty() {
+                return Self::resolve_secret_file(trimmed);
+            }
+        }
+        Self::resolve_secret(env_var)
+    }
+
+    pub fn resolve_secret_file(path_str: &str) -> Option<String> {
+        let trimmed = path_str.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let path = Path::new(trimmed);
+        if !path.is_file() {
+            warn!(
+                "Secret file '{}' does not exist or is not a readable file; failing closed",
+                path.display()
+            );
+            return None;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let secret = content.trim().to_string();
+                if secret.is_empty() {
+                    warn!("Secret file at {} is empty; failing closed", path.display());
+                    None
+                } else {
+                    info!("Loaded secret from {}", path.display());
+                    Some(secret)
+                }
+            }
+            Err(err) => {
+                warn!("Failed to read secret file at {}: {}", path.display(), err);
+                None
+            }
+        }
     }
 
     pub fn resolve_secret_value(val: &str) -> Option<String> {
@@ -401,5 +468,40 @@ mod tests {
         assert_eq!(default_cfg.ha_role, HaRoleConfig::Leader);
         assert_eq!(default_cfg.lease_ttl_seconds, 15);
         assert_eq!(default_cfg.standby_sync_seconds, 5);
+        assert_eq!(default_cfg.proxy_secret, None);
+        assert_eq!(default_cfg.invite_signing_key, None);
+        assert!(default_cfg.bootstrap_admins.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_secret_with_file_var_and_fail_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let valid_file = temp_dir.path().join("proxy.secret");
+        std::fs::write(&valid_file, "  proxy-secret-from-file \n").unwrap();
+
+        let env_lit = "TEST_PROXY_SECRET_LIT_92";
+        let env_file = "TEST_PROXY_SECRET_FILE_92";
+
+        std::env::set_var(env_file, valid_file.to_str().unwrap());
+        assert_eq!(
+            Config::resolve_secret_with_file_var(env_lit, env_file),
+            Some("proxy-secret-from-file".to_string())
+        );
+
+        // Missing file in *_FILE must fail closed to None even if literal var is set
+        std::env::set_var(env_lit, "fallback-literal");
+        std::env::set_var(env_file, "/nonexistent/proxy.secret");
+        assert_eq!(
+            Config::resolve_secret_with_file_var(env_lit, env_file),
+            None
+        );
+
+        // When *_FILE is unset, falls back to env_lit
+        std::env::remove_var(env_file);
+        assert_eq!(
+            Config::resolve_secret_with_file_var(env_lit, env_file),
+            Some("fallback-literal".to_string())
+        );
+        std::env::remove_var(env_lit);
     }
 }

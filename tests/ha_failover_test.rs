@@ -51,6 +51,7 @@ fn build_controller_state(
         ha_role,
         lease_ttl_seconds: 15,
         standby_sync_seconds: 5,
+        ..Config::default()
     };
 
     let job_store = JobStore::from_config_with_storage(100, &config, Arc::clone(&storage));

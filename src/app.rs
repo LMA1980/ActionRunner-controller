@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use chrono::Utc;
@@ -52,7 +52,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/jobs/{id}/submodules/{submodule}/card.svg",
             get(get_job_submodule_card),
         )
-        // Read-only console API (MuConsole)
+        // Read-only console API & Operator Auth / Invite Registry (MuConsole)
+        .route("/api/auth/session", get(crate::console::api::auth_session))
+        .route(
+            "/api/auth/invites",
+            get(crate::console::api::list_invites).post(crate::console::api::create_invite),
+        )
+        .route("/api/auth/redeem", post(crate::console::api::redeem_invite))
+        .route(
+            "/api/auth/users/{github_login}",
+            delete(crate::console::api::revoke_user),
+        )
         .route("/api/repos", get(crate::console::api::list_repos))
         .route(
             "/api/repos/{owner}/{repo}/summary",
@@ -174,6 +184,41 @@ fn json_response(status: StatusCode, val: serde_json::Value) -> Response {
         .into_response()
 }
 
+fn check_operator_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_key: Option<&str>,
+) -> Option<Response> {
+    let auth_configured = state.config.log_api_key.is_some()
+        || state.config.proxy_secret.is_some()
+        || headers.contains_key("x-forwarded-user")
+        || headers.contains_key("x-proxy-secret");
+    if !auth_configured {
+        return None;
+    }
+    match crate::console::api::resolve_auth_with_query_key(
+        &state.config,
+        &state.job_store,
+        headers,
+        query_key,
+    ) {
+        crate::console::api::AuthResolution::AdminApiKey
+        | crate::console::api::AuthResolution::BoundUser { .. } => None,
+        crate::console::api::AuthResolution::UninvitedUser { .. } => Some(json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "Forbidden: GitHub account is not bound to an active MuConsole invite"
+            }),
+        )),
+        crate::console::api::AuthResolution::Anonymous => Some(json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({
+                "error": "Unauthorized: valid operator session or API key required"
+            }),
+        )),
+    }
+}
+
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Response {
     let snap = state.job_store.queue_snapshot().await;
     json_response(
@@ -239,7 +284,13 @@ pub async fn get_ha_status(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-pub async fn promote_ha_handler(State(state): State<Arc<AppState>>) -> Response {
+pub async fn promote_ha_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+        return denied;
+    }
     let rehydrated = state.promote_to_leader().await;
     let lease = state.job_store.storage().get_leader_lease();
     json_response(
@@ -254,7 +305,10 @@ pub async fn promote_ha_handler(State(state): State<Arc<AppState>>) -> Response 
     )
 }
 
-pub async fn demote_ha_handler(State(state): State<Arc<AppState>>) -> Response {
+pub async fn demote_ha_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+        return denied;
+    }
     let rehydrated = state.demote_to_standby().await;
     let lease = state.job_store.storage().get_leader_lease();
     json_response(
@@ -367,28 +421,8 @@ pub async fn get_job_log(
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
-    if let Some(ref required_key) = state.config.log_api_key {
-        let auth_hdr = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        let api_key_hdr = headers.get("x-api-key").and_then(|h| h.to_str().ok());
-
-        let authed =
-            auth_hdr == Some(required_key.as_str()) || api_key_hdr == Some(required_key.as_str());
-        if !authed {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [
-                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                ],
-                serde_json::to_string(&serde_json::json!({
-                    "error": "Unauthorized: valid X-Api-Key or Authorization Bearer token required to access execution logs"
-                })).unwrap(),
-            )
-                .into_response();
-        }
+    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+        return denied;
     }
 
     let Some(record) = state.job_store.get_job(&job_id).await else {
@@ -557,8 +591,12 @@ pub async fn get_job_log(
 
 pub async fn resume_job_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
+    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+        return denied;
+    }
     match state.job_store.resume_job(&job_id).await {
         Ok(record) => {
             let full_path = state.config.workspace_dir.join(&record.log_file);
@@ -618,8 +656,12 @@ pub async fn resume_job_handler(
 
 pub async fn restart_job_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
+    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+        return denied;
+    }
     match state.job_store.restart_job(&job_id).await {
         Ok(record) => {
             let full_path = state.config.workspace_dir.join(&record.log_file);
@@ -1120,47 +1162,34 @@ pub async fn handle_events(
     headers: HeaderMap,
     Query(query): Query<EventsQuery>,
 ) -> Response {
-    if let Some(ref required_key) = state.config.log_api_key {
-        let auth_hdr = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        let api_key_hdr = headers.get("x-api-key").and_then(|h| h.to_str().ok());
-        let query_key = query.api_key.as_deref().or(query.token.as_deref());
-
-        let authed = auth_hdr == Some(required_key.as_str())
-            || api_key_hdr == Some(required_key.as_str())
-            || query_key == Some(required_key.as_str());
-        if !authed {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [
-                    (header::CONTENT_TYPE, "application/json"),
-                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                ],
-                serde_json::to_string(&serde_json::json!({
-                    "error": "Unauthorized: valid api key or bearer token required"
-                }))
-                .unwrap(),
-            )
-                .into_response();
-        }
-    }
+    let query_key = query.api_key.as_deref().or(query.token.as_deref());
 
     if let Some(ref job_id) = query.job_id {
+        if let Some(denied) = check_operator_gate(&state, &headers, query_key) {
+            return denied;
+        }
         return stream_job_events(state, job_id.clone()).await;
     }
 
-    if let Some(ref view) = query.view {
-        if view == "job" {
-            if let Some(ref job_id) = query.job_id {
-                return stream_job_events(state, job_id.clone()).await;
-            }
-        }
+    let auth = crate::console::api::resolve_auth_with_query_key(
+        &state.config,
+        &state.job_store,
+        &headers,
+        query_key,
+    );
+    if state.config.log_api_key.is_some()
+        && state.config.proxy_secret.is_none()
+        && !auth.is_authenticated()
+    {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({
+                "error": "Unauthorized: valid operator session or API key required"
+            }),
+        );
     }
 
-    // Reaching this point with a configured key means the caller presented it.
-    let authenticated = state.config.log_api_key.is_some();
+    let authenticated = auth.is_authenticated();
     stream_dashboard_events(state, authenticated)
 }
 
@@ -1170,31 +1199,9 @@ pub async fn handle_job_events(
     Path(job_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Response {
-    if let Some(ref required_key) = state.config.log_api_key {
-        let auth_hdr = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        let api_key_hdr = headers.get("x-api-key").and_then(|h| h.to_str().ok());
-        let query_key = query.api_key.as_deref().or(query.token.as_deref());
-
-        let authed = auth_hdr == Some(required_key.as_str())
-            || api_key_hdr == Some(required_key.as_str())
-            || query_key == Some(required_key.as_str());
-        if !authed {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [
-                    (header::CONTENT_TYPE, "application/json"),
-                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-                ],
-                serde_json::to_string(&serde_json::json!({
-                    "error": "Unauthorized: valid api key or bearer token required"
-                }))
-                .unwrap(),
-            )
-                .into_response();
-        }
+    let query_key = query.api_key.as_deref().or(query.token.as_deref());
+    if let Some(denied) = check_operator_gate(&state, &headers, query_key) {
+        return denied;
     }
 
     stream_job_events(state, job_id).await

@@ -914,3 +914,329 @@ async fn registry_cache_survives_restart_and_keeps_fabric_rev_monotonic() {
     let entry = restarted.entry("LMA1980", "cached").await.unwrap();
     assert!(entry.branches.contains_key("feat/persist"));
 }
+
+// ============================================================================
+// Milestone 7 (#89-#100): Invite-Only GitHub Operator Auth & Route Gating Tests
+// ============================================================================
+
+const PROXY_SECRET: &str = "trusted-proxy-secret-m7";
+const INVITE_KEY: &str = "invite-hmac-signing-key-m7";
+
+async fn seeded_auth_state() -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let api = spawn_github_mock().await;
+    let console = ConsoleState::new(ConsoleConfig {
+        github_api_url: Some(api),
+        ..ConsoleConfig::default()
+    });
+    for r in ["parent", "child", "secret-lib", "private-parent"] {
+        console.refresh_repo("LMA1980", r, None).await;
+    }
+
+    let mut cfg = test_config(Some(API_KEY));
+    cfg.workspace_dir = tmp.path().to_path_buf();
+    cfg.proxy_secret = Some(PROXY_SECRET.to_string());
+    cfg.invite_signing_key = Some(INVITE_KEY.to_string());
+    cfg.bootstrap_admins = vec!["LMA1980".to_string()];
+
+    let job_store = JobStore::from_config(100, &cfg);
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
+    let state = Arc::new(AppState {
+        config: cfg,
+        job_store,
+        cluster: ClusterRegistry::new(),
+        tx,
+        log_broadcaster,
+        console,
+    });
+    (state, tmp)
+}
+
+async fn send_req(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, Value, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req_body = match body {
+        Some(v) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = app
+        .clone()
+        .oneshot(builder.body(req_body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let json_val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json_val, text)
+}
+
+#[tokio::test]
+async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
+    let (state, _tmp) = seeded_auth_state().await;
+    completed_job(
+        &state.job_store,
+        "job-m7-1",
+        "LMA1980/parent",
+        "refs/heads/main",
+        "1234567890abcdef1234567890abcdef12345678",
+        5,
+        None,
+    )
+    .await;
+    state
+        .job_store
+        .append_job_log("job-m7-1", "[stdout] cargo test passed\n");
+    let app = create_router(state.clone());
+
+    // 1. Header spoofing without X-Proxy-Secret is rejected as Anonymous (401 on /log and /restart)
+    let (st, j, _) = send_req(
+        &app,
+        "GET",
+        "/api/auth/session",
+        &[("X-Forwarded-User", "LMA1980")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(j["authenticated"], false);
+    assert_eq!(j["github_login"], Value::Null);
+    assert_eq!(j["invite_bound"], false);
+
+    let (st, _, _) = send_req(
+        &app,
+        "GET",
+        "/api/jobs/job-m7-1/log",
+        &[("X-Forwarded-User", "LMA1980")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    let (st, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/jobs/job-m7-1/restart",
+        &[("X-Forwarded-User", "LMA1980")],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // 2. Uninvited GitHub user with valid X-Proxy-Secret gets 200 (invite_bound: false) on /api/auth/session,
+    //    and 403 Forbidden on /log, /events, /restart, /resume, /ha/promote, /ha/demote
+    let uninvited_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "random-github-user"),
+    ];
+    let (st, j, _) = send_req(&app, "GET", "/api/auth/session", &uninvited_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(j["authenticated"], false);
+    assert_eq!(j["github_login"], "random-github-user");
+    assert_eq!(j["invite_bound"], false);
+    assert_eq!(j["role"], Value::Null);
+
+    for (method, path) in [
+        ("GET", "/api/jobs/job-m7-1/log"),
+        ("GET", "/jobs/job-m7-1/logs"),
+        ("GET", "/api/jobs/job-m7-1/events"),
+        ("POST", "/api/jobs/job-m7-1/restart"),
+        ("POST", "/api/jobs/job-m7-1/resume"),
+        ("POST", "/api/ha/promote"),
+        ("POST", "/api/ha/demote"),
+    ] {
+        let (st, j, _) = send_req(&app, method, path, &uninvited_hdrs, None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "expected 403 on {method} {path}");
+        assert!(j["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not bound to an active MuConsole invite"));
+    }
+
+    // Uninvited user cannot create invites (403)
+    let (st, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &uninvited_hdrs,
+        Some(json!({"note": "attempt"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // 3. Bootstrap admin ("LMA1980") via X-Proxy-Secret is authenticated as admin and can issue invites
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+    let (st, j, _) = send_req(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(j["authenticated"], true);
+    assert_eq!(j["github_login"], "LMA1980");
+    assert_eq!(j["invite_bound"], true);
+    assert_eq!(j["role"], "admin");
+
+    let (st, inv_resp, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({
+            "ttl_seconds": 3600,
+            "note": "Operator onboarding",
+            "base_url": "https://console.lma1980.duckdns.org"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let invite_id = inv_resp["invite_id"].as_str().unwrap().to_string();
+    let invite_token = inv_resp["invite_token"].as_str().unwrap().to_string();
+    let invite_url = inv_resp["invite_url"].as_str().unwrap().to_string();
+    assert!(invite_token.starts_with(&format!("inv_{invite_id}.")));
+    assert_eq!(
+        invite_url,
+        format!("https://console.lma1980.duckdns.org/?invite={invite_token}")
+    );
+
+    // 4. Tampered HMAC signature on /api/auth/redeem is rejected with 401
+    let tampered_token =
+        format!("inv_{invite_id}.ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    let (st, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &uninvited_hdrs,
+        Some(json!({ "invite_token": tampered_token })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // 5. Valid single-use redemption binds "random-github-user" as "operator" (200 OK)
+    let (st, redeem_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &uninvited_hdrs,
+        Some(json!({ "invite_token": invite_token })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(redeem_json["authenticated"], true);
+    assert_eq!(redeem_json["github_login"], "random-github-user");
+    assert_eq!(redeem_json["invite_bound"], true);
+    assert_eq!(redeem_json["role"], "operator");
+
+    // 6. Replay of the already-used invite token returns 409 Conflict
+    let second_user_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "second-user"),
+    ];
+    let (st, replay_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &second_user_hdrs,
+        Some(json!({ "invite_token": invite_token })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(replay_json["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("already been used"));
+
+    // 7. Bound operator now accesses /log, /restart, and private repos in /api/repos (200 OK)
+    let (st, _, log_text) =
+        send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(log_text.contains("cargo test passed"));
+
+    let (st, restart_json, _) = send_req(
+        &app,
+        "POST",
+        "/api/jobs/job-m7-1/restart",
+        &uninvited_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(restart_json["status"], "ok");
+
+    let (st, repos_json, _) = send_req(&app, "GET", "/api/repos", &uninvited_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(repos_json["authenticated"], true);
+    assert!(
+        find_repo(&repos_json, "secret-lib").is_some(),
+        "bound operator must see private repos"
+    );
+
+    // 8. Expired invite token rejection (410 Gone)
+    let (st, exp_inv, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &[("Authorization", &format!("Bearer {API_KEY}"))],
+        Some(json!({ "ttl_seconds": 0, "note": "expired-immediately" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let exp_token = exp_inv["invite_token"].as_str().unwrap().to_string();
+    let (st, exp_err, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &second_user_hdrs,
+        Some(json!({ "invite_token": exp_token })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::GONE);
+    assert!(exp_err["error"].as_str().unwrap_or("").contains("expired"));
+
+    // 9. GET /api/auth/invites lists invites without raw tokens + bound users
+    let (st, list_inv, _) = send_req(&app, "GET", "/api/auth/invites", &admin_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let invites_arr = list_inv["invites"].as_array().unwrap();
+    assert_eq!(invites_arr.len(), 2);
+    assert!(invites_arr[0].get("invite_token").is_none());
+    assert!(invites_arr[0].get("token_hmac").is_none());
+    let used_entry = invites_arr
+        .iter()
+        .find(|i| i["invite_id"] == invite_id)
+        .unwrap();
+    assert_eq!(used_entry["used_by_github_login"], "random-github-user");
+
+    // 10. Revoke user via DELETE /api/auth/users/{github_login} -> subsequent requests return 403
+    let (st, rev_json, _) = send_req(
+        &app,
+        "DELETE",
+        "/api/auth/users/random-github-user",
+        &admin_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(rev_json["revoked"], true);
+
+    let (st, sess_after, _) =
+        send_req(&app, "GET", "/api/auth/session", &uninvited_hdrs, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sess_after["authenticated"], false);
+    assert_eq!(sess_after["invite_bound"], false);
+
+    let (st, _, _) = send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}

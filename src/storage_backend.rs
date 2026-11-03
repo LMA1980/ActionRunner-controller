@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
-use crate::db::CatalogStore;
+use crate::db::{AuthInviteRecord, AuthUserRecord, CatalogStore, RedeemInviteError};
 use crate::job::{extract_submodule_job, normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
 
 /// Storage backend mode for `ActionRunner-controller` after Phase 3 local DuckDB decommissioning (`#45`–`#47`).
@@ -188,6 +188,48 @@ pub trait ControllerStorage: Send + Sync {
     fn load_console_registry(&self) -> Option<String> {
         None
     }
+
+    /// Seeds `config.bootstrap_admins` as `role = "admin"`, `invited_by = "bootstrap"` (`#93`).
+    fn seed_bootstrap_admins(&self, _admins: &[String]) {}
+
+    /// Inserts a newly generated one-time invite into `auth_invites` (`#93`).
+    fn create_auth_invite(&self, _invite: &AuthInviteRecord) {}
+
+    /// Looks up a single invite by `invite_id` (`#93`).
+    fn get_auth_invite(&self, _invite_id: &str) -> Option<AuthInviteRecord> {
+        None
+    }
+
+    /// Lists all invites in `auth_invites` (`#93`, `#96`).
+    fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        Vec::new()
+    }
+
+    /// Atomically verifies and redeems a single-use invite token (`#93`, `#95`).
+    fn redeem_auth_invite(
+        &self,
+        _invite_id: &str,
+        _presented_hmac: &str,
+        _github_login: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AuthUserRecord, RedeemInviteError> {
+        Err(RedeemInviteError::InviteNotFound)
+    }
+
+    /// Looks up a user in `auth_users` case-insensitively (`#93`).
+    fn get_auth_user(&self, _github_login: &str) -> Option<AuthUserRecord> {
+        None
+    }
+
+    /// Lists all bound/revoked users in `auth_users` (`#93`, `#96`).
+    fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        Vec::new()
+    }
+
+    /// Revokes a user (`revoked = 1`) in `auth_users` (`#93`, `#96`).
+    fn revoke_auth_user(&self, _github_login: &str) -> bool {
+        false
+    }
 }
 
 /// Pure-Rust in-memory implementation of [`ControllerStorage`] for unit and integration tests.
@@ -312,6 +354,45 @@ impl ControllerStorage for InMemoryStorage {
 
     fn load_console_registry(&self) -> Option<String> {
         self.store.load_console_registry()
+    }
+
+    fn seed_bootstrap_admins(&self, admins: &[String]) {
+        self.store.seed_bootstrap_admins(admins);
+    }
+
+    fn create_auth_invite(&self, invite: &AuthInviteRecord) {
+        self.store.create_auth_invite(invite);
+    }
+
+    fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
+        self.store.get_auth_invite(invite_id)
+    }
+
+    fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        self.store.list_auth_invites()
+    }
+
+    fn redeem_auth_invite(
+        &self,
+        invite_id: &str,
+        presented_hmac: &str,
+        github_login: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AuthUserRecord, RedeemInviteError> {
+        self.store
+            .redeem_auth_invite(invite_id, presented_hmac, github_login, now)
+    }
+
+    fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
+        self.store.get_auth_user(github_login)
+    }
+
+    fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        self.store.list_auth_users()
+    }
+
+    fn revoke_auth_user(&self, github_login: &str) -> bool {
+        self.store.revoke_auth_user(github_login)
     }
 }
 
@@ -461,6 +542,7 @@ pub struct MuObserveRemoteStorage {
     tls_client_config: Option<Arc<ClientConfig>>,
     seq: Arc<AtomicU64>,
     log_buffer: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    auth_store: Arc<CatalogStore>,
 }
 
 impl MuObserveRemoteStorage {
@@ -486,6 +568,7 @@ impl MuObserveRemoteStorage {
             tls_client_config,
             seq: Arc::new(AtomicU64::new(1)),
             log_buffer: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            auth_store: Arc::new(CatalogStore::new()),
         })
     }
 
@@ -1457,7 +1540,51 @@ impl ControllerStorage for MuObserveRemoteStorage {
             .and_then(|s| s.latest_active_json)
             .filter(|s| !s.is_empty())
     }
+
+    fn seed_bootstrap_admins(&self, admins: &[String]) {
+        self.auth_store.seed_bootstrap_admins(admins);
+    }
+
+    fn create_auth_invite(&self, invite: &AuthInviteRecord) {
+        self.auth_store.create_auth_invite(invite);
+    }
+
+    fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
+        self.auth_store.get_auth_invite(invite_id)
+    }
+
+    fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        self.auth_store.list_auth_invites()
+    }
+
+    fn redeem_auth_invite(
+        &self,
+        invite_id: &str,
+        presented_hmac: &str,
+        github_login: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AuthUserRecord, RedeemInviteError> {
+        self.auth_store
+            .redeem_auth_invite(invite_id, presented_hmac, github_login, now)
+    }
+
+    fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
+        self.auth_store.get_auth_user(github_login)
+    }
+
+    fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        self.auth_store.list_auth_users()
+    }
+
+    fn revoke_auth_user(&self, github_login: &str) -> bool {
+        self.auth_store.revoke_auth_user(github_login)
+    }
 }
+
+pub use crate::db::{
+    AuthInviteRecord as StorageAuthInviteRecord, AuthInviteView as StorageAuthInviteView,
+    AuthUserRecord as StorageAuthUserRecord, RedeemInviteError as StorageRedeemInviteError,
+};
 
 // ============================================================================
 // Sub-task #44 (M3.057): Root W3C Trace Context & RegressionGateReport Scoring
