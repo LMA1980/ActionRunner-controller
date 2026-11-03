@@ -342,7 +342,7 @@ impl DAGScheduler {
             )
             .await;
 
-        let target_url = format!("https://hook.lma1980.duckdns.org/web/#/jobs/{}", job.id);
+        let target_url = job_target_url(&job.id);
         self.report_github_status(
             &job.repo_name,
             &job.commit_sha,
@@ -885,64 +885,139 @@ impl DAGScheduler {
         description: &str,
         target_url: Option<&str>,
     ) {
-        let token = match &self.config.github_token {
-            Some(t) if !t.trim().is_empty() => t.trim(),
-            _ => return,
-        };
+        report_github_commit_status(&self.config, repo, sha, state, description, target_url).await;
+    }
+}
 
-        let mut desc = description.to_string();
-        if desc.len() > 140 {
-            desc.truncate(137);
-            desc.push_str("...");
+/// Returns the canonical dashboard deep-link URL for a job.
+#[must_use]
+pub fn job_target_url(job_id: &str) -> String {
+    format!("https://hook.lma1980.duckdns.org/web/#/jobs/{job_id}")
+}
+
+/// Immediately reports a `"pending"` (`context: "k3-ci"`) commit status to GitHub when a job
+/// enters `JobStatus::Queued`, provided the job has not already transitioned out of `Queued`.
+pub async fn report_queued_github_status(
+    config: &Config,
+    job_store: &JobStore,
+    job_id: &str,
+    repo: &str,
+    sha: &str,
+    queue_position: usize,
+) {
+    if !matches!(
+        job_store.get_job(job_id).await.map(|r| r.status),
+        Some(JobStatus::Queued)
+    ) {
+        return;
+    }
+    let target_url = job_target_url(job_id);
+    let desc = format!(
+        "ActionRunner distributed pipeline queued (position #{})...",
+        queue_position.max(1)
+    );
+    report_github_commit_status(config, repo, sha, "pending", &desc, Some(&target_url)).await;
+}
+
+/// Reports a `k3-ci` commit status to GitHub (`/repos/{repo}/statuses/{sha}`).
+pub async fn report_github_commit_status(
+    config: &Config,
+    repo: &str,
+    sha: &str,
+    state: &str,
+    description: &str,
+    target_url: Option<&str>,
+) {
+    let base_url = std::env::var("GITHUB_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+    report_github_commit_status_with_base_url(
+        &base_url,
+        config,
+        repo,
+        sha,
+        state,
+        description,
+        target_url,
+    )
+    .await;
+}
+
+/// Reports a `k3-ci` commit status against a configurable GitHub API base URL.
+pub async fn report_github_commit_status_with_base_url(
+    api_base_url: &str,
+    config: &Config,
+    repo: &str,
+    sha: &str,
+    state: &str,
+    description: &str,
+    target_url: Option<&str>,
+) {
+    let raw_token = match &config.github_token {
+        Some(t) if !t.trim().is_empty() => t.trim(),
+        _ => return,
+    };
+    let (token, resolved_base_url) = match raw_token.split_once("@http") {
+        Some((tok, rest)) => (tok, format!("http{rest}")),
+        None => (raw_token, api_base_url.to_string()),
+    };
+
+    let mut desc = description.to_string();
+    if desc.len() > 140 {
+        desc.truncate(137);
+        desc.push_str("...");
+    }
+
+    let url = format!(
+        "{}/repos/{}/statuses/{}",
+        resolved_base_url.trim_end_matches('/'),
+        repo,
+        sha
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to create HTTP client for GitHub status reporting");
+            return;
         }
+    };
 
-        let url = format!("https://api.github.com/repos/{}/statuses/{}", repo, sha);
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "Failed to create HTTP client for GitHub status reporting");
-                return;
-            }
-        };
+    let payload = serde_json::json!({
+        "state": state,
+        "target_url": target_url,
+        "description": desc,
+        "context": "k3-ci",
+    });
 
-        let payload = serde_json::json!({
-            "state": state,
-            "target_url": target_url,
-            "description": desc,
-            "context": "k3-ci",
-        });
-
-        match client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "ActionRunner-Controller/0.1.0")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    info!(repo = %repo, sha = %sha, state = %state, "Reported commit status to GitHub");
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    warn!(
-                        repo = %repo,
-                        sha = %sha,
-                        status = %status,
-                        body = %body,
-                        "GitHub commit status API responded with error"
-                    );
-                }
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "ActionRunner-Controller/0.1.0")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                info!(repo = %repo, sha = %sha, state = %state, "Reported commit status to GitHub");
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    repo = %repo,
+                    sha = %sha,
+                    status = %status,
+                    body = %body,
+                    "GitHub commit status API responded with error"
+                );
             }
-            Err(err) => {
-                warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
-            }
+        }
+        Err(err) => {
+            warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
         }
     }
 }

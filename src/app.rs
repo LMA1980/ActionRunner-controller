@@ -576,6 +576,20 @@ pub async fn resume_job_handler(
                 let _ = f.write_all(note.as_bytes()).await;
             }
             state.broadcast_log(&job_id, &note);
+            let pos = state
+                .job_store
+                .job_queue_position(&record.job.id)
+                .await
+                .unwrap_or(1);
+            crate::scheduler::report_queued_github_status(
+                &state.config,
+                &state.job_store,
+                &record.job.id,
+                &record.job.repo_name,
+                &record.job.commit_sha,
+                pos,
+            )
+            .await;
             json_response(
                 StatusCode::OK,
                 serde_json::json!({
@@ -623,6 +637,20 @@ pub async fn restart_job_handler(
                 let _ = f.write_all(note.as_bytes()).await;
             }
             state.broadcast_log(&job_id, &note);
+            let pos = state
+                .job_store
+                .job_queue_position(&record.job.id)
+                .await
+                .unwrap_or(1);
+            crate::scheduler::report_queued_github_status(
+                &state.config,
+                &state.job_store,
+                &record.job.id,
+                &record.job.repo_name,
+                &record.job.commit_sha,
+                pos,
+            )
+            .await;
             json_response(
                 StatusCode::OK,
                 serde_json::json!({
