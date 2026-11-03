@@ -310,7 +310,10 @@ impl DAGScheduler {
         loop {
             while let Some(job) = self
                 .job_store
-                .claim_next_queued_job(self.config.max_concurrent_jobs)
+                .claim_next_queued_job_for_cluster(
+                    self.config.max_concurrent_jobs,
+                    Some(&self.cluster),
+                )
                 .await
             {
                 let this = self.clone();
@@ -319,7 +322,10 @@ impl DAGScheduler {
                 });
             }
 
-            self.job_store.wait_for_event().await;
+            tokio::select! {
+                _ = self.job_store.wait_for_event() => {}
+                _ = sleep(Duration::from_millis(500)) => {}
+            }
         }
     }
 
@@ -768,6 +774,52 @@ impl DAGScheduler {
                         .await;
                     }
                 }
+                break;
+            }
+
+            // "Food sample" yield-and-requeue: if this job currently holds zero active stage leases
+            // (all ready stages are blocked waiting on busy worker nodes), return the job to
+            // `JobStatus::Queued` in-place while preserving its original priority (`queued_at`)
+            // and completed stages so other queued jobs can execute on idle worker nodes.
+            let latest_stages = self.job_store.get_stages(&job.id).await;
+            let has_active_stages = !leased_slots.is_empty()
+                || latest_stages.iter().any(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    )
+                });
+            if !has_active_stages && self.job_store.requeue_preserving_priority(&job.id).await {
+                let completed_count = latest_stages
+                    .iter()
+                    .filter(|s| matches!(s.status, StageStatus::Completed { exit_code: 0, .. }))
+                    .count();
+                let total_count = latest_stages.len();
+                let pos = self
+                    .job_store
+                    .job_queue_position(&job.id)
+                    .await
+                    .unwrap_or(1);
+                info!(
+                    job_id = %job.id,
+                    repo = %job.repo_name,
+                    completed_stages = completed_count,
+                    total_stages = total_count,
+                    queue_position = pos,
+                    "Re-queued job in-place preserving original priority after completing available stages"
+                );
+                let desc = format!(
+                    "Queued (#{}, {}/{} stages pre-computed) waiting for target worker...",
+                    pos, completed_count, total_count
+                );
+                self.report_github_status(
+                    &job.repo_name,
+                    &job.commit_sha,
+                    "pending",
+                    &desc,
+                    Some(&target_url),
+                )
+                .await;
                 break;
             }
 

@@ -81,16 +81,11 @@ impl AppState {
 
     /// Executes a single High-Availability coordinator tick (`#79`–`#82`).
     ///
-    /// - If `Leader`: renews the single-leader lease and synchronizes newly queued jobs
-    ///   from `ControllerStorage`. If configured as `HaRoleConfig::Leader` (designated
-    ///   primary) and another node took the lease during a transient outage, reclaims
-    ///   leadership (`promote_to_leader`). If configured as `HaRoleConfig::Auto` and
-    ///   another node holds a newer active lease, yields to `Standby`.
+    /// - If `Leader`: renews the single-leader lease; if another node has forcibly
+    ///   taken over the lease in `Auto` mode, yields to `Standby`.
     /// - If `Standby`: refreshes `JobStore` (`recover_running = false`) and `ConsoleState`
-    ///   from `ControllerStorage`; promotes to `Leader` if configured as
-    ///   `HaRoleConfig::Leader`, or if configured as `HaRoleConfig::Auto` when either the
-    ///   primary lease expires or HAProxy has failed back active worker heartbeats to this
-    ///   controller instance.
+    ///   from `ControllerStorage`; if `config.ha_role == HaRoleConfig::Auto` and the
+    ///   primary lease has expired, automatically promotes to `Leader`.
     pub async fn tick_ha_coordinator(&self) {
         if self.job_store.is_leader() {
             let renewed = self.job_store.storage().try_acquire_or_renew_lease(
@@ -98,49 +93,31 @@ impl AppState {
                 self.config.lease_ttl_seconds,
                 false,
             );
-            if !renewed {
-                if self.config.ha_role == crate::config::HaRoleConfig::Leader {
-                    let _ = self.promote_to_leader().await;
-                    return;
-                } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
-                    if let Some(lease) = self.job_store.storage().get_leader_lease() {
-                        let now_us = Utc::now().timestamp_micros();
-                        if lease.holder_id != self.config.node_id && !lease.is_expired(now_us) {
-                            warn!(
-                                node_id = %self.config.node_id,
-                                new_leader = %lease.holder_id,
-                                epoch = lease.epoch,
-                                "Another controller holds a newer active leader lease; stepping down to Standby"
-                            );
-                            self.job_store.set_ha_role(crate::config::HaRole::Standby);
-                            return;
-                        }
+            if !renewed && self.config.ha_role == crate::config::HaRoleConfig::Auto {
+                if let Some(lease) = self.job_store.storage().get_leader_lease() {
+                    let now_us = Utc::now().timestamp_micros();
+                    if lease.holder_id != self.config.node_id && !lease.is_expired(now_us) {
+                        warn!(
+                            node_id = %self.config.node_id,
+                            new_leader = %lease.holder_id,
+                            epoch = lease.epoch,
+                            "Another controller holds a newer active leader lease; stepping down to Standby"
+                        );
+                        self.job_store.set_ha_role(crate::config::HaRole::Standby);
                     }
                 }
             }
-            let _ = self.job_store.rehydrate_from_storage(false).await;
-            self.console.sync_from_storage(&self.job_store, false).await;
         } else {
             let _ = self.job_store.rehydrate_from_storage(false).await;
             self.console.sync_from_storage(&self.job_store, false).await;
-            if self.config.ha_role == crate::config::HaRoleConfig::Leader {
+            if self.config.ha_role == crate::config::HaRoleConfig::Auto
+                && self.job_store.storage().try_acquire_or_renew_lease(
+                    &self.config.node_id,
+                    self.config.lease_ttl_seconds,
+                    false,
+                )
+            {
                 let _ = self.promote_to_leader().await;
-            } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
-                let has_online_workers = self
-                    .cluster
-                    .list_nodes_view()
-                    .await
-                    .iter()
-                    .any(|n| n.is_online);
-                if has_online_workers
-                    || self.job_store.storage().try_acquire_or_renew_lease(
-                        &self.config.node_id,
-                        self.config.lease_ttl_seconds,
-                        false,
-                    )
-                {
-                    let _ = self.promote_to_leader().await;
-                }
             }
         }
     }
@@ -588,16 +565,6 @@ pub async fn handle_webhook(
         .join(&repo_name)
         .join(format!("{}.log", job.id));
 
-    if !state.job_store.is_leader() && state.config.ha_role != crate::config::HaRoleConfig::Standby
-    {
-        info!(
-            node_id = %state.config.node_id,
-            ha_policy = %state.config.ha_role.as_str(),
-            "Webhook delivered to Standby controller; promoting to Leader on ingress failback"
-        );
-        let _ = state.promote_to_leader().await;
-    }
-
     let enqueue_res = state.job_store.enqueue_job(job.clone(), log_file).await;
     let final_job_id = enqueue_res.job_id;
 
@@ -733,6 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_secret_required_in_strict_mode() {
         let (state, _rx) = make_test_state(None, false, false);
         let headers = HeaderMap::new();
@@ -747,6 +715,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_rejects_invalid_hmac() {
         let (state, _rx) = make_test_state(Some("mysecret"), false, false);
         let mut headers = HeaderMap::new();
@@ -759,6 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_rejects_path_traversal_repo() {
         let secret = "testsecret";
         let (state, _rx) = make_test_state(Some(secret), false, false);
@@ -776,6 +746,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_ignores_fork_pull_request() {
         let secret = "testsecret";
         let (state, _rx) = make_test_state(Some(secret), false, false);
@@ -804,6 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_accepts_valid_internal_pr() {
         let secret = "testsecret";
         let (state, _rx) = make_test_state(Some(secret), false, false);
@@ -831,6 +803,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_merge_and_push_deduplication() {
         let secret = "testsecret";
         let (state, _rx) = make_test_state(Some(secret), false, false);
@@ -898,6 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_pull_request_wins_over_push() {
         let secret = "testsecret";
         let (state, _rx) = make_test_state(Some(secret), false, false);
@@ -959,6 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_webhook_reports_queued_github_status_immediately() {
         use axum::{extract::Path as AxumPath, routing::post, Router};
         use tokio::sync::Mutex;
@@ -1060,6 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_report_queued_github_status_skips_when_already_running() {
         use axum::{routing::post, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};

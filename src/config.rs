@@ -100,7 +100,7 @@ impl Default for Config {
             cluster_token: "actionrunner_default_cluster_token".to_string(),
             job_timeout_seconds: 1800,
             allow_insecure_no_secret: false,
-            max_concurrent_jobs: 6,
+            max_concurrent_jobs: 3,
             github_token: None,
             node_id: "node-a".to_string(),
             ha_role: HaRoleConfig::Leader,
@@ -162,7 +162,7 @@ impl Config {
         let max_concurrent_jobs = std::env::var("ACTION_RUNNER_MAX_CONCURRENT_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(6);
+            .unwrap_or(3);
 
         let github_token = Self::resolve_secret("GITHUB_TOKEN");
 

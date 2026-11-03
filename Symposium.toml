@@ -1,0 +1,14 @@
+name = "action-runner-controller"
+# Crate-embedded Symposium manifest for action-runner-controller.
+
+[[plugins]]
+depends-on = ["action-runner-ipc"]
+source.cargo = "action-runner-ipc"
+
+[[plugins]]
+depends-on = ["action-runner-tools"]
+source.cargo = "action-runner-tools"
+
+[[plugins]]
+depends-on = ["muobserve-ipc"]
+source.cargo = "muobserve-ipc"
