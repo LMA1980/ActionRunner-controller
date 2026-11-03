@@ -596,6 +596,16 @@ pub async fn handle_webhook(
 
     let _ = state.tx.try_send(job);
 
+    crate::scheduler::report_queued_github_status(
+        &state.config,
+        &state.job_store,
+        &final_job_id,
+        &repo_name,
+        &commit_sha,
+        enqueue_res.queue_position,
+    )
+    .await;
+
     if !enqueue_res.superseded_jobs.is_empty() {
         for sup_id in &enqueue_res.superseded_jobs {
             state
@@ -913,5 +923,164 @@ mod tests {
         assert_eq!(json2["status"], "queued");
         assert_eq!(json2["event"], "pull_request");
         assert_eq!(json2["superseded_jobs"], serde_json::json!([push_job_id]));
+    }
+
+    #[tokio::test]
+    async fn test_webhook_reports_queued_github_status_immediately() {
+        use axum::{extract::Path as AxumPath, routing::post, Router};
+        use tokio::sync::Mutex;
+
+        #[derive(Debug)]
+        struct CapturedStatusEvent {
+            repo: String,
+            sha: String,
+            auth: String,
+            body: serde_json::Value,
+        }
+
+        let captured: Arc<Mutex<Vec<CapturedStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+
+        let mock_github = Router::new().route(
+            "/repos/{owner}/{repo}/statuses/{sha}",
+            post(
+                move |AxumPath((owner, repo, sha)): AxumPath<(String, String, String)>,
+                      headers: HeaderMap,
+                      Json(body): Json<serde_json::Value>| {
+                    let cap = captured_clone.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        cap.lock().await.push(CapturedStatusEvent {
+                            repo: format!("{owner}/{repo}"),
+                            sha,
+                            auth,
+                            body,
+                        });
+                        StatusCode::CREATED
+                    }
+                },
+            ),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_github).await;
+        });
+
+        let secret = "testsecret";
+        let (mut state_arc, _rx) = make_test_state(Some(secret), false, false);
+        Arc::get_mut(&mut state_arc).unwrap().config.github_token =
+            Some(format!("ghs_unit_test_tok@http://{addr}"));
+
+        let commit = "7aa4b27437aaf0dd16243703a347300e0b8575ba";
+        let pr_payload = serde_json::json!({
+            "repository": {
+                "full_name": "LMA1980/ActionRunner-rs",
+                "clone_url": "https://github.com/LMA1980/ActionRunner-rs.git"
+            },
+            "action": "opened",
+            "pull_request": {
+                "head": {
+                    "repo": {"full_name": "LMA1980/ActionRunner-rs"},
+                    "sha": commit,
+                    "ref": "feat/immediate-queued-status"
+                },
+                "base": {"repo": {"full_name": "LMA1980/ActionRunner-rs"}, "ref": "main"},
+                "author_association": "OWNER"
+            }
+        })
+        .to_string();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, pr_payload.as_bytes()).parse().unwrap(),
+        );
+
+        let res = handle_webhook(State(state_arc), headers, Bytes::from(pr_payload)).await;
+        assert!(res.is_ok());
+        let (status, json) = res.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = json["job_id"].as_str().unwrap().to_string();
+
+        let events = captured.lock().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].repo, "LMA1980/ActionRunner-rs");
+        assert_eq!(events[0].sha, commit);
+        assert_eq!(events[0].auth, "Bearer ghs_unit_test_tok");
+        assert_eq!(events[0].body["state"], "pending");
+        assert_eq!(events[0].body["context"], "k3-ci");
+        assert_eq!(
+            events[0].body["description"],
+            "ActionRunner distributed pipeline queued (position #1)..."
+        );
+        assert_eq!(
+            events[0].body["target_url"],
+            format!("https://hook.lma1980.duckdns.org/web/#/jobs/{job_id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_report_queued_github_status_skips_when_already_running() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let mock_github = Router::new().route(
+            "/repos/{owner}/{repo}/statuses/{sha}",
+            post(move || {
+                let h = hits_clone.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::CREATED
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_github).await;
+        });
+
+        let (mut state_arc, _rx) = make_test_state(Some("s"), false, false);
+        Arc::get_mut(&mut state_arc).unwrap().config.github_token =
+            Some(format!("ghs_unit_test_tok@http://{addr}"));
+
+        let job = Job {
+            id: "job-running-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-rs".to_string(),
+            clone_url: "https://github.com/LMA1980/ActionRunner-rs.git".to_string(),
+            commit_sha: "deadbeef12345678deadbeef12345678deadbeef".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        let _ = state_arc
+            .job_store
+            .enqueue_job(job.clone(), std::path::PathBuf::from("logs/j.log"))
+            .await;
+        let claimed = state_arc.job_store.claim_next_queued_job(4).await;
+        assert!(claimed.is_some());
+
+        crate::scheduler::report_queued_github_status(
+            &state_arc.config,
+            &state_arc.job_store,
+            &job.id,
+            &job.repo_name,
+            &job.commit_sha,
+            1,
+        )
+        .await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }
