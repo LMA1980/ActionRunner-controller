@@ -650,7 +650,24 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
         .await;
 
     // 3. Coordinator tick on node-a detects active worker heartbeats on Standby and reclaims leadership;
-    //    subsequent tick on node-b steps down to Standby.
+    //    subsequent tick on node-b steps down to Standby and disconnects any attached worker tunnels (#104).
+    let (cmd_tx_b, mut cmd_rx_b) = mpsc::channel(8);
+    state_b
+        .cluster
+        .register(
+            action_runner_ipc::WorkerRegistration {
+                node_id: "worker-stale-standby".to_string(),
+                arch: "x86_64".to_string(),
+                tags: vec!["default".to_string()],
+                toolchains: vec!["system".to_string()],
+                max_slots: 1,
+                ram_total_mb: 32768,
+                btrfs_enabled: true,
+            },
+            cmd_tx_b,
+        )
+        .await;
+
     state_a.tick_ha_coordinator().await;
     assert_eq!(state_a.job_store.ha_role(), HaRole::Leader);
     let lease = shared_storage.get_leader_lease().unwrap();
@@ -659,6 +676,22 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
 
     state_b.tick_ha_coordinator().await;
     assert_eq!(state_b.job_store.ha_role(), HaRole::Standby);
+    assert!(
+        state_b.cluster.list_nodes_view().await.is_empty(),
+        "Standby step-down must disconnect attached worker tunnels"
+    );
+    assert!(matches!(
+        cmd_rx_b.try_recv(),
+        Ok(action_runner_controller::cluster::WorkerCommand::Disconnect)
+    ));
+
+    // A subsequent tick on node-b must stay Standby (no ping-pong) now that stale workers were disconnected
+    state_b.tick_ha_coordinator().await;
+    assert_eq!(state_b.job_store.ha_role(), HaRole::Standby);
+    assert_eq!(
+        shared_storage.get_leader_lease().unwrap().holder_id,
+        "node-a"
+    );
 
     // 4. Verify designated Leader policy (`HaRoleConfig::Leader`) also reclaims lease if demoted
     state_a.demote_to_standby().await;

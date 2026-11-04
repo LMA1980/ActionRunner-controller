@@ -91,7 +91,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     loop {
         tokio::select! {
             // Outbound commands dispatched to worker
-            Some(cmd) = cmd_rx.recv() => {
+            cmd_opt = cmd_rx.recv() => {
+                let Some(cmd) = cmd_opt else {
+                    break;
+                };
                 seq += 1;
                 match cmd {
                     WorkerCommand::Dispatch(task) => {
@@ -121,6 +124,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             let _ = ws_sender.send(Message::Binary(frame.into())).await;
                         }
                     }
+                    WorkerCommand::Disconnect => {
+                        let _ = ws_sender.send(Message::Close(None)).await;
+                        break;
+                    }
                 }
             }
 
@@ -131,14 +138,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     _ => break, // Disconnected
                 };
 
-                if let Message::Binary(bin) = msg {
-                    if let Ok((hdr, payload)) = IpcHeader::parse(&bin) {
-                        match hdr.msg_type {
-                            MSG_TYPE_WORKER_HEARTBEAT => {
-                                if let Ok(hb) = fory.deserialize::<WorkerHeartbeat>(payload) {
-                                    state.cluster.heartbeat(hb).await;
+                match msg {
+                    Message::Ping(payload) => {
+                        if ws_sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Binary(bin) => {
+                        if let Ok((hdr, payload)) = IpcHeader::parse(&bin) {
+                            match hdr.msg_type {
+                                MSG_TYPE_WORKER_HEARTBEAT => {
+                                    if let Ok(hb) = fory.deserialize::<WorkerHeartbeat>(payload) {
+                                        state.cluster.heartbeat(hb).await;
+                                        // Acknowledge heartbeat at application layer so the worker's
+                                        // inbound read-liveness deadline is refreshed every 5s (#104, #39).
+                                        if ws_sender.send(Message::Pong(Vec::new().into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
-                            }
                             MSG_TYPE_STAGE_COMPLETION => {
                                 if let Ok(report) = fory.deserialize::<StageCompletionReport>(payload) {
                                     info!(
@@ -269,6 +288,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             _ => {}
                         }
                     }
+                    }
+                    _ => {}
                 }
             }
         }

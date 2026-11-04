@@ -29,6 +29,7 @@ pub type NodeView = ClusterNodeView;
 pub enum WorkerCommand {
     Dispatch(StageDispatchTask),
     Cancel(StageCancelTask),
+    Disconnect,
 }
 
 pub struct ActiveWorker {
@@ -278,6 +279,26 @@ impl ClusterRegistry {
         for (tx, cancel_task) in to_cancel {
             let _ = tx.send(WorkerCommand::Cancel(cancel_task)).await;
         }
+    }
+
+    /// Disconnects and unregisters all currently attached worker tunnels (`#104`).
+    ///
+    /// Invoked when a controller instance steps down to `Standby` so workers do not remain
+    /// pinned to a passive standby tunnel after HA failback.
+    pub async fn disconnect_all(&self) -> usize {
+        let drained: Vec<(String, mpsc::Sender<WorkerCommand>)> = {
+            let mut workers = self.workers.write().await;
+            workers.drain().map(|(id, w)| (id, w.command_tx)).collect()
+        };
+        let count = drained.len();
+        for (node_id, tx) in drained {
+            info!(
+                node_id = %node_id,
+                "Closing worker tunnel on controller demotion to Standby"
+            );
+            let _ = tx.try_send(WorkerCommand::Disconnect);
+        }
+        count
     }
 
     pub async fn is_node_online(&self, node_id: &str) -> bool {
