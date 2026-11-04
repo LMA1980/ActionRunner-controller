@@ -265,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_client_cert_san_verification_passes_and_fails_closed() {
         // Valid internal node SAN
         let (_cert_pem, _key_pem, valid_der) = generate_cert("worker-1.ci.ci.internal");
@@ -290,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_mtls_server_config_construction() {
         let dir = tempdir().unwrap();
         let ca_path = dir.path().join("ca.crt");
@@ -309,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_cert_reload_watcher_atomic_swap() {
         let dir = tempdir().unwrap();
         let ca_path = dir.path().join("ca.crt");

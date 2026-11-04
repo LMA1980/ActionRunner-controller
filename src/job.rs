@@ -517,6 +517,7 @@ impl JobStore {
     pub async fn enqueue_job(&self, mut job: Job, mut log_file: PathBuf) -> EnqueueResult {
         let now = Utc::now();
         let mut superseded_jobs = Vec::new();
+        let mut records_to_upsert = Vec::new();
         let queue_position;
 
         {
@@ -643,7 +644,7 @@ impl JobStore {
                                 reason: skip_reason,
                             };
                             record.updated_at = now;
-                            self.db.upsert_record(record);
+                            records_to_upsert.push(record.clone());
                         }
                     }
                 }
@@ -652,7 +653,7 @@ impl JobStore {
             // Ensure unique job.id even when multiple webhooks arrive within the same second
             let base_id = job.id.clone();
             let mut suffix = 2u32;
-            while store.iter().any(|r| r.job.id == job.id) || self.db.get_job(&job.id).is_some() {
+            while store.iter().any(|r| r.job.id == job.id) {
                 job.id = format!("{}-{}", base_id, suffix);
                 log_file = Path::new("logs")
                     .join(&job.repo_name)
@@ -675,7 +676,7 @@ impl JobStore {
                         ),
                     };
                     record.updated_at = now;
-                    self.db.upsert_record(record);
+                    records_to_upsert.push(record.clone());
                 }
             }
 
@@ -697,7 +698,7 @@ impl JobStore {
                 metrics: None,
                 stages: Vec::new(),
             };
-            self.db.upsert_record(&new_record);
+            records_to_upsert.push(new_record.clone());
             store.push_front(new_record);
 
             // Compute 1-based FIFO queue position among all currently Queued jobs
@@ -707,6 +708,9 @@ impl JobStore {
                 .count();
         }
 
+        if !records_to_upsert.is_empty() {
+            self.db.upsert_records_batch(&records_to_upsert);
+        }
         self.persist().await;
         self.notify.notify_waiters();
 
@@ -729,6 +733,18 @@ impl JobStore {
     /// and ensures strict single-pipeline serialization per repository.
     /// Returns `None` immediately when the controller is in `Standby` mode (`#80`).
     pub async fn claim_next_queued_job(&self, max_concurrent: usize) -> Option<Job> {
+        self.claim_next_queued_job_for_cluster(max_concurrent, None)
+            .await
+    }
+
+    /// Atomically claims the oldest `Queued` job in FIFO order whose ready stages can be satisfied
+    /// by an available online worker slot in `cluster` (or whose stages have not yet been resolved
+    /// while at least one worker slot is available).
+    pub async fn claim_next_queued_job_for_cluster(
+        &self,
+        max_concurrent: usize,
+        cluster: Option<&crate::cluster::ClusterRegistry>,
+    ) -> Option<Job> {
         if !self.is_leader() {
             return None;
         }
@@ -752,23 +768,102 @@ impl JobStore {
 
             let mut found = None;
             for record in store.iter_mut().rev() {
-                if matches!(record.status, JobStatus::Queued)
-                    && !running_repos.contains(&record.job.repo_name)
+                if !matches!(record.status, JobStatus::Queued)
+                    || running_repos.contains(&record.job.repo_name)
                 {
-                    record.status = JobStatus::Running { started_at: now };
-                    record.updated_at = now;
-                    self.db.upsert_record(record);
-                    found = Some(record.job.clone());
-                    break;
+                    continue;
                 }
+
+                if let Some(cluster_reg) = cluster {
+                    let can_run = if record.stages.is_empty() {
+                        cluster_reg.has_any_available_slot().await
+                    } else {
+                        let mut any_ready_can_lease = false;
+                        for stage in &record.stages {
+                            if matches!(stage.status, StageStatus::Pending) {
+                                let deps_satisfied = stage.depends_on.iter().all(|dep_id| {
+                                    record.stages.iter().any(|s| {
+                                        s.id == *dep_id
+                                            && matches!(
+                                                s.status,
+                                                StageStatus::Completed { exit_code: 0, .. }
+                                            )
+                                    })
+                                });
+                                if deps_satisfied
+                                    && cluster_reg
+                                        .has_available_slot_for(
+                                            &stage.tags,
+                                            stage.toolchain.as_deref(),
+                                        )
+                                        .await
+                                {
+                                    any_ready_can_lease = true;
+                                    break;
+                                }
+                            }
+                        }
+                        any_ready_can_lease
+                    };
+                    if !can_run {
+                        continue;
+                    }
+                }
+
+                record.status = JobStatus::Running { started_at: now };
+                record.updated_at = now;
+                found = Some((record.job.clone(), record.clone()));
+                break;
             }
             found
         };
 
-        if claimed.is_some() {
+        if let Some((job, record)) = claimed {
+            self.db.upsert_record(&record);
             self.persist().await;
+            Some(job)
+        } else {
+            None
         }
-        claimed
+    }
+
+    /// Re-queues a `Running` job in-place when all of its currently ready stages are blocked
+    /// waiting for busy worker nodes and it holds zero active stage leases.
+    ///
+    /// Preserves the job's original `queued_at` timestamp, queue position, and all completed
+    /// "food sample" stages so it retains its original FIFO priority when a matching worker
+    /// slot becomes free.
+    pub async fn requeue_preserving_priority(&self, job_id: &str) -> bool {
+        let requeued_record = {
+            let mut store = self.inner.write().await;
+            let now = Utc::now();
+            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                let has_active_stages = record.stages.iter().any(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    )
+                });
+                if matches!(record.status, JobStatus::Running { .. }) && !has_active_stages {
+                    record.status = JobStatus::Queued;
+                    record.updated_at = now;
+                    Some(record.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(record) = requeued_record {
+            self.db.upsert_record(&record);
+            self.persist().await;
+            self.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn wait_for_job(&self) {
@@ -788,7 +883,7 @@ impl JobStore {
         let mut active_jobs: Vec<QueueItemView> = Vec::new();
         let mut queued_records: Vec<JobRecord> = Vec::new();
 
-        for record in store.iter() {
+        for record in store.iter().rev() {
             match &record.status {
                 JobStatus::Running { started_at } => {
                     stats.running_jobs += 1;
@@ -824,8 +919,7 @@ impl JobStore {
             }
         }
 
-        // Order queued jobs in FIFO execution order (oldest first = position 1)
-        queued_records.reverse();
+        // `queued_records` was collected in `.rev()` (oldest first = position 1)
         let queued_jobs: Vec<QueueItemView> = queued_records
             .into_iter()
             .enumerate()
@@ -875,53 +969,68 @@ impl JobStore {
     }
 
     pub async fn update_metrics(&self, job_id: &str, metrics: JobMetrics) {
-        {
+        let updated_in_store = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-                record.metrics = Some(metrics);
+                record.metrics = Some(metrics.clone());
                 record.updated_at = Utc::now();
-                self.db.upsert_record(record);
-            } else if let Some(mut record) = self.db.get_job(job_id) {
-                record.metrics = Some(metrics);
-                record.updated_at = Utc::now();
-                self.db.upsert_record(&record);
+                Some(record.clone())
+            } else {
+                None
             }
+        };
+        if let Some(record) = updated_in_store {
+            self.db.upsert_record(&record);
+        } else if let Some(mut record) = self.db.get_job(job_id) {
+            record.metrics = Some(metrics);
+            record.updated_at = Utc::now();
+            self.db.upsert_record(&record);
         }
         self.persist().await;
     }
 
     pub async fn update_status(&self, job_id: &str, status: JobStatus) {
-        {
+        let updated_in_store = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-                record.status = status;
+                record.status = status.clone();
                 record.updated_at = Utc::now();
-                self.db.upsert_record(record);
-            } else if let Some(mut record) = self.db.get_job(job_id) {
-                record.status = status;
-                record.updated_at = Utc::now();
-                self.db.upsert_record(&record);
+                Some(record.clone())
+            } else {
+                None
             }
+        };
+        if let Some(record) = updated_in_store {
+            self.db.upsert_record(&record);
+        } else if let Some(mut record) = self.db.get_job(job_id) {
+            record.status = status;
+            record.updated_at = Utc::now();
+            self.db.upsert_record(&record);
         }
         self.persist().await;
         self.notify.notify_waiters();
     }
 
     pub async fn set_stages(&self, job_id: &str, stages: Vec<StageRecord>) {
-        {
+        let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 record.stages = stages;
                 record.updated_at = Utc::now();
-                self.db.upsert_record(record);
+                Some(record.clone())
+            } else {
+                None
             }
+        };
+        if let Some(record) = updated {
+            self.db.upsert_record(&record);
         }
         self.persist().await;
         self.notify.notify_waiters();
     }
 
     pub async fn update_stage_status(&self, job_id: &str, stage_id: &str, status: StageStatus) {
-        {
+        let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
@@ -933,17 +1042,24 @@ impl JobStore {
                     stage.status = status;
                     record.updated_at = Utc::now();
                 }
-                self.db.upsert_record(record);
+                Some(record.clone())
+            } else {
+                None
             }
+        };
+        if let Some(record) = updated {
+            self.db.upsert_record(&record);
         }
         self.persist().await;
         self.notify.notify_waiters();
     }
 
     pub async fn get_stages(&self, job_id: &str) -> Vec<StageRecord> {
-        let store = self.inner.read().await;
-        if let Some(rec) = store.iter().find(|r| r.job.id == job_id) {
-            return rec.stages.clone();
+        {
+            let store = self.inner.read().await;
+            if let Some(rec) = store.iter().find(|r| r.job.id == job_id) {
+                return rec.stages.clone();
+            }
         }
         self.db
             .get_job(job_id)
@@ -959,6 +1075,7 @@ impl JobStore {
         stage_filter: Option<&[String]>,
     ) -> Vec<(String, String)> {
         let mut recovered = Vec::new();
+        let mut records_to_upsert = Vec::new();
         {
             let mut store = self.inner.write().await;
             let now = Utc::now();
@@ -992,12 +1109,15 @@ impl JobStore {
                         }
                     }
                     if modified {
-                        self.db.upsert_record(record);
+                        records_to_upsert.push(record.clone());
                     }
                 }
             }
         }
 
+        if !records_to_upsert.is_empty() {
+            self.db.upsert_records_batch(&records_to_upsert);
+        }
         if !recovered.is_empty() {
             self.persist().await;
             self.notify.notify_waiters();
@@ -1011,6 +1131,14 @@ impl JobStore {
     /// of the queue (push_front in the storage deque) with an updated queued_at timestamp.
     /// Fails with an error if the job is currently actively Running.
     pub async fn resume_job(&self, job_id: &str) -> Result<JobRecord, String> {
+        let db_fallback = {
+            let store = self.inner.read().await;
+            if store.iter().any(|r| r.job.id == job_id) {
+                None
+            } else {
+                self.db.get_job(job_id)
+            }
+        };
         let res = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
@@ -1023,7 +1151,7 @@ impl JobStore {
                     ));
                 }
                 store.remove(idx).unwrap()
-            } else if let Some(rec) = self.db.get_job(job_id) {
+            } else if let Some(rec) = db_fallback {
                 rec
             } else {
                 return Err(format!("Job '{}' not found", job_id));
@@ -1043,12 +1171,12 @@ impl JobStore {
             record.status = JobStatus::Queued;
             record.job.queued_at = now;
             record.updated_at = now;
-            self.db.upsert_record(&record);
             store.push_front(record.clone());
             Ok(record)
         };
 
-        if res.is_ok() {
+        if let Ok(ref record) = res {
+            self.db.upsert_record(record);
             self.persist().await;
             self.notify.notify_waiters();
         }
@@ -1059,6 +1187,14 @@ impl JobStore {
     /// Fully restarts a job by resetting all stages back to Pending.
     /// Resets metrics, moves to the tail of the queue, and rejects if currently running.
     pub async fn restart_job(&self, job_id: &str) -> Result<JobRecord, String> {
+        let db_fallback = {
+            let store = self.inner.read().await;
+            if store.iter().any(|r| r.job.id == job_id) {
+                None
+            } else {
+                self.db.get_job(job_id)
+            }
+        };
         let res = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
@@ -1071,7 +1207,7 @@ impl JobStore {
                     ));
                 }
                 store.remove(idx).unwrap()
-            } else if let Some(rec) = self.db.get_job(job_id) {
+            } else if let Some(rec) = db_fallback {
                 rec
             } else {
                 return Err(format!("Job '{}' not found", job_id));
@@ -1085,12 +1221,12 @@ impl JobStore {
             record.metrics = None;
             record.job.queued_at = now;
             record.updated_at = now;
-            self.db.upsert_record(&record);
             store.push_front(record.clone());
             Ok(record)
         };
 
-        if res.is_ok() {
+        if let Ok(ref record) = res {
+            self.db.upsert_record(record);
             self.persist().await;
             self.notify.notify_waiters();
         }
@@ -1105,20 +1241,27 @@ impl JobStore {
         node_id: &str,
         pid: u32,
     ) {
-        let mut store = self.inner.write().await;
-        if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
-            for stage in record.stages.iter_mut() {
-                if stage.id == stage_id {
-                    stage.status = StageStatus::Running {
-                        node_id: node_id.to_string(),
-                        started_at: Utc::now(),
-                        pid: Some(pid),
-                    };
-                    stage.assigned_node = Some(node_id.to_string());
-                    break;
+        let updated = {
+            let mut store = self.inner.write().await;
+            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                for stage in record.stages.iter_mut() {
+                    if stage.id == stage_id {
+                        stage.status = StageStatus::Running {
+                            node_id: node_id.to_string(),
+                            started_at: Utc::now(),
+                            pid: Some(pid),
+                        };
+                        stage.assigned_node = Some(node_id.to_string());
+                        break;
+                    }
                 }
+                Some(record.clone())
+            } else {
+                None
             }
-            self.db.upsert_record(record);
+        };
+        if let Some(record) = updated {
+            self.db.upsert_record(&record);
         }
     }
 
@@ -1265,6 +1408,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_submodule_job_lookup() {
         let store = JobStore::new(10, None);
         let job = Job {
@@ -1359,6 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_coalescing_fifo_queue_and_snapshot() {
         let store = JobStore::new(20, None);
 
@@ -1453,6 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_claim_next_queued_job_concurrency_and_per_repo_serialization() {
         let store = JobStore::new(10, None);
 
@@ -1540,6 +1686,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_merge_vs_push_first_received_wins() {
         let store = JobStore::new(10, None);
 
@@ -1625,6 +1772,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_pull_request_vs_push_pull_request_always_wins() {
         let store = JobStore::new(10, None);
 
@@ -1712,6 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_pull_request_supersedes_running_push() {
         let store = JobStore::new(10, None);
 
@@ -1758,6 +1907,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_duplicate_same_event_ignored() {
         let store = JobStore::new(10, None);
 
@@ -1795,6 +1945,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_pr_on_branch_does_not_block_main_merge() {
         let store = JobStore::new(10, None);
 
@@ -1866,6 +2017,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_job_resume_and_restart() {
         let store = JobStore::new(10, None);
         let job = Job {
@@ -1962,6 +2114,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_resumed_job_does_not_cut_queue_line() {
         let store = JobStore::new(10, None);
         let job1 = Job {
@@ -2014,6 +2167,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_recover_stages_for_node() {
         let store = JobStore::new(10, None);
         let job = Job {
@@ -2091,6 +2245,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_duckdb_persistent_history_survives_ring_buffer_eviction_and_ignores_skipped() {
         // Tiny max_history = 2 to force immediate eviction from in-memory deque
         let store = JobStore::new(2, None);
@@ -2226,6 +2381,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_duckdb_backfill_from_historical_logs_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_logs = tmp
@@ -2254,5 +2410,189 @@ mod tests {
         assert_eq!(m.quality_score, 100);
         assert_eq!(m.tests_passed, 7);
         assert_eq!(m.tests_total, 7);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_food_sample_requeue_preserves_priority_and_claims_ready_stages() {
+        use crate::cluster::ClusterRegistry;
+        use action_runner_ipc::WorkerRegistration;
+        use tokio::sync::mpsc;
+
+        let store = JobStore::new(10, None);
+        let cluster = ClusterRegistry::new();
+
+        // Register 2 workers: node-x86 (fmt) and worker-riscv64 (k3)
+        let (tx_x86, _rx_x86) = mpsc::channel(8);
+        cluster
+            .register(
+                WorkerRegistration {
+                    node_id: "node-a".to_string(),
+                    arch: "x86_64".to_string(),
+                    tags: vec!["fmt".to_string()],
+                    max_slots: 1,
+                    ram_total_mb: 32768,
+                    btrfs_enabled: true,
+                    toolchains: vec!["system".to_string()],
+                },
+                tx_x86,
+            )
+            .await;
+
+        let (tx_rv, _rx_rv) = mpsc::channel(8);
+        cluster
+            .register(
+                WorkerRegistration {
+                    node_id: "worker-riscv64".to_string(),
+                    arch: "riscv64".to_string(),
+                    tags: vec!["k3".to_string()],
+                    max_slots: 1,
+                    ram_total_mb: 32768,
+                    btrfs_enabled: false,
+                    toolchains: vec!["system".to_string()],
+                },
+                tx_rv,
+            )
+            .await;
+
+        // Enqueue 3 jobs in order: job-1 (oldest), job-2, job-3 (newest)
+        let t0 = Utc::now() - chrono::Duration::seconds(300);
+        for (idx, repo) in ["LMA1980/repo-1", "LMA1980/repo-2", "LMA1980/repo-3"]
+            .iter()
+            .enumerate()
+        {
+            let job = Job {
+                id: format!("job-{}", idx + 1),
+                event_type: "push".to_string(),
+                repo_name: (*repo).to_string(),
+                clone_url: String::new(),
+                commit_sha: format!("sha{}", idx + 1),
+                ref_name: "refs/heads/main".to_string(),
+                sender: "LMA1980".to_string(),
+                queued_at: t0 + chrono::Duration::seconds((idx as i64) * 10),
+            };
+            store
+                .enqueue_job(job, PathBuf::from(format!("logs/{}.log", idx + 1)))
+                .await;
+        }
+
+        // 1. job-1 is claimed first and completes its `fmt-check` stage on `node-a`,
+        //    and now has `test-check` (tag: k3) running on `worker-riscv64`.
+        let c1 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await
+            .unwrap();
+        assert_eq!(c1.id, "job-1");
+        let _ = cluster
+            .lease_slot("job-1", "test-check", &["k3".to_string()], None, true)
+            .await
+            .expect("lease k3 slot for job-1");
+        store
+            .set_stages(
+                "job-1",
+                vec![
+                    StageRecord {
+                        id: "fmt-check".to_string(),
+                        name: "Fmt".to_string(),
+                        tags: vec!["fmt".to_string()],
+                        threads: 2,
+                        toolchain: None,
+                        depends_on: vec![],
+                        status: StageStatus::Completed {
+                            duration_secs: 2,
+                            exit_code: 0,
+                        },
+                        assigned_node: Some("node-a".to_string()),
+                    },
+                    StageRecord {
+                        id: "test-check".to_string(),
+                        name: "Test".to_string(),
+                        tags: vec!["k3".to_string()],
+                        threads: 6,
+                        toolchain: None,
+                        depends_on: vec!["fmt-check".to_string()],
+                        status: StageStatus::Running {
+                            node_id: "worker-riscv64".to_string(),
+                            started_at: Utc::now(),
+                            pid: Some(1234),
+                        },
+                        assigned_node: Some("worker-riscv64".to_string()),
+                    },
+                ],
+            )
+            .await;
+
+        // 2. job-2 is claimed next, completes its "food sample" `fmt-check` on `node-a`,
+        //    and its next ready stage `test-check` requires `k3` (which is busy with job-1!).
+        let c2 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await
+            .unwrap();
+        assert_eq!(c2.id, "job-2");
+        store
+            .set_stages(
+                "job-2",
+                vec![
+                    StageRecord {
+                        id: "fmt-check".to_string(),
+                        name: "Fmt".to_string(),
+                        tags: vec!["fmt".to_string()],
+                        threads: 2,
+                        toolchain: None,
+                        depends_on: vec![],
+                        status: StageStatus::Completed {
+                            duration_secs: 1,
+                            exit_code: 0,
+                        },
+                        assigned_node: Some("node-a".to_string()),
+                    },
+                    StageRecord {
+                        id: "test-check".to_string(),
+                        name: "Test".to_string(),
+                        tags: vec!["k3".to_string()],
+                        threads: 6,
+                        toolchain: None,
+                        depends_on: vec!["fmt-check".to_string()],
+                        status: StageStatus::Pending,
+                        assigned_node: None,
+                    },
+                ],
+            )
+            .await;
+
+        // Because job-2 has zero active stages and `worker-riscv64` is busy, it re-queues preserving priority!
+        assert!(store.requeue_preserving_priority("job-2").await);
+
+        // Verify job-2 is back at position #1 in the queue (ahead of job-3 at position #2)
+        // and still retains its completed `fmt-check` stage!
+        assert_eq!(store.job_queue_position("job-2").await, Some(1));
+        assert_eq!(store.job_queue_position("job-3").await, Some(2));
+        let j2_rec = store.get_job("job-2").await.unwrap();
+        assert_eq!(j2_rec.job.queued_at, t0 + chrono::Duration::seconds(10));
+        assert!(matches!(
+            j2_rec.stages[0].status,
+            StageStatus::Completed { exit_code: 0, .. }
+        ));
+
+        // 3. Now when the scheduler claims the next job for the cluster while `worker-riscv64` is still busy:
+        //    job-2 (#1) only needs `k3` (busy), so the scheduler skips job-2 (leaving it at #1!)
+        //    and claims job-3 (#2) so job-3 can get its "food sample" on `node-a`!
+        let c3 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await
+            .unwrap();
+        assert_eq!(c3.id, "job-3");
+        assert_eq!(store.job_queue_position("job-2").await, Some(1));
+
+        // 4. Once `worker-riscv64` finishes job-1's stage and releases its slot,
+        //    job-2 (at position #1) is immediately claimed to run its remaining `k3` stage!
+        cluster
+            .release_stage_slot("worker-riscv64", "job-1", "test-check")
+            .await;
+        let c2_resumed = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await
+            .unwrap();
+        assert_eq!(c2_resumed.id, "job-2");
     }
 }

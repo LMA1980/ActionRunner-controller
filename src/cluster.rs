@@ -29,6 +29,7 @@ pub type NodeView = ClusterNodeView;
 pub enum WorkerCommand {
     Dispatch(StageDispatchTask),
     Cancel(StageCancelTask),
+    Disconnect,
 }
 
 pub struct ActiveWorker {
@@ -280,6 +281,26 @@ impl ClusterRegistry {
         }
     }
 
+    /// Disconnects and unregisters all currently attached worker tunnels (`#104`).
+    ///
+    /// Invoked when a controller instance steps down to `Standby` so workers do not remain
+    /// pinned to a passive standby tunnel after HA failback.
+    pub async fn disconnect_all(&self) -> usize {
+        let drained: Vec<(String, mpsc::Sender<WorkerCommand>)> = {
+            let mut workers = self.workers.write().await;
+            workers.drain().map(|(id, w)| (id, w.command_tx)).collect()
+        };
+        let count = drained.len();
+        for (node_id, tx) in drained {
+            info!(
+                node_id = %node_id,
+                "Closing worker tunnel on controller demotion to Standby"
+            );
+            let _ = tx.try_send(WorkerCommand::Disconnect);
+        }
+        count
+    }
+
     pub async fn is_node_online(&self, node_id: &str) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
@@ -318,6 +339,69 @@ impl ClusterRegistry {
             })
             .collect()
     }
+
+    /// Checks whether at least one online, idle worker node in the cluster can satisfy
+    /// a stage with the given `required_tags` and `required_toolchain`.
+    pub async fn has_available_slot_for(
+        &self,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+    ) -> bool {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+
+        for worker in workers.values() {
+            let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+            if secs_since_seen > 15 {
+                continue;
+            }
+            if worker.exclusive_lease.is_some() {
+                continue;
+            }
+            if (worker.leased_stages.len() as u32) >= worker.registration.max_slots {
+                continue;
+            }
+            if let Some(tc) = required_toolchain {
+                if !worker.registration.toolchains.iter().any(|t| t == tc) {
+                    continue;
+                }
+            }
+            let node_tags: HashSet<&str> = worker
+                .registration
+                .tags
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let matches_tags = required_tags.is_empty()
+                || required_tags
+                    .iter()
+                    .all(|req| req == "default" || node_tags.contains(req.as_str()));
+            if matches_tags {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Checks whether any online worker node currently has an available execution slot.
+    pub async fn has_any_available_slot(&self) -> bool {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+
+        for worker in workers.values() {
+            let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+            if secs_since_seen > 15 {
+                continue;
+            }
+            if worker.exclusive_lease.is_some() {
+                continue;
+            }
+            if (worker.leased_stages.len() as u32) < worker.registration.max_slots {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_single_action_per_node_and_heartbeat_immunity() {
         let cluster = ClusterRegistry::new();
         let (tx, _rx) = mpsc::channel(8);
@@ -398,6 +483,7 @@ mod tests {
     /// Stage B (exclusive: true) is requested -> lease_slot returns None (holds in Pending).
     /// When Stage A releases -> Stage B leases successfully.
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_scenario_1_drain_before_dispatch() {
         let cluster = ClusterRegistry::new();
         let (tx, _rx) = mpsc::channel(8);
@@ -449,6 +535,7 @@ mod tests {
     /// Concurrent requests for Stage C (exclusive: false) and Stage D (exclusive: true)
     /// across different jobs, plus Stage E (same job), all return None.
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_scenario_2_full_node_exclusive_lock() {
         let cluster = ClusterRegistry::new();
         let (tx, _rx) = mpsc::channel(8);
@@ -513,6 +600,7 @@ mod tests {
     /// Release Stage B via release_stage_slot -> node immediately unblocks and accepts
     /// new shared leases up to max_slots (3).
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_scenario_3a_deterministic_release_via_release_stage_slot() {
         let cluster = ClusterRegistry::new();
         let (tx, _rx) = mpsc::channel(8);
@@ -565,6 +653,7 @@ mod tests {
 
     /// Scenario 3b: Deterministic Lock Release via cancel_and_release_job_slots
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_scenario_3b_deterministic_release_via_cancel_and_release_job_slots() {
         let cluster = ClusterRegistry::new();
         let (tx, mut rx) = mpsc::channel(8);
@@ -606,6 +695,7 @@ mod tests {
 
     /// Scenario 3c: Deterministic Lock Release via unregister and reconnect
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_scenario_3c_deterministic_release_via_unregister_and_reconnect() {
         let cluster = ClusterRegistry::new();
         let (tx, _rx) = mpsc::channel(8);
@@ -644,6 +734,7 @@ mod tests {
 
     /// Sub-task #24: Cross-node parallel execution with per-node exclusive serialization
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn cross_node_parallel_per_node_exclusive() {
         let cluster = ClusterRegistry::new();
         let (tx1, _rx1) = mpsc::channel(8);
