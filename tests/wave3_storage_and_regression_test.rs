@@ -447,6 +447,7 @@ fn test_w3c_root_traceparent_and_stage_dispatch_propagation_subtask_44() {
             env: std::collections::HashMap::new(),
             timeout_seconds: Some(300),
             sandbox_profile: None,
+            sccache: None,
         },
     );
     let stage = StageConfig {
@@ -459,11 +460,13 @@ fn test_w3c_root_traceparent_and_stage_dispatch_propagation_subtask_44() {
         exclusive: false,
         max_concurrent_per_node: 1,
         tasks: vec!["clippy".to_string()],
+        sccache: None,
     };
     let workflow = ActionRunnerWorkflow {
         version: "3".to_string(),
         name: "CI".to_string(),
         env: std::collections::HashMap::new(),
+        sccache: None,
         tasks: tasks_map,
         stages: vec![stage.clone()],
         on_action: std::collections::HashMap::new(),

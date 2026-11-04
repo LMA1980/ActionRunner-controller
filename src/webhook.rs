@@ -97,17 +97,28 @@ impl AppState {
     ///   controller instance.
     pub async fn tick_ha_coordinator(&self) {
         if self.job_store.is_leader() {
-            let renewed = self.job_store.storage().try_acquire_or_renew_lease(
-                &self.config.node_id,
-                self.config.lease_ttl_seconds,
-                false,
-            );
+            let storage = Arc::clone(self.job_store.storage());
+            let node_id = self.config.node_id.clone();
+            let ttl_secs = self.config.lease_ttl_seconds;
+            let ha_role_cfg = self.config.ha_role;
+            let lease_check = tokio::task::spawn_blocking(move || {
+                let renewed = storage.try_acquire_or_renew_lease(&node_id, ttl_secs, false);
+                let active_lease = if !renewed && ha_role_cfg == crate::config::HaRoleConfig::Auto {
+                    storage.get_leader_lease()
+                } else {
+                    None
+                };
+                (renewed, active_lease)
+            })
+            .await
+            .unwrap_or((true, None));
+
+            let (renewed, active_lease) = lease_check;
             if !renewed {
                 if self.config.ha_role == crate::config::HaRoleConfig::Leader {
                     let _ = self.promote_to_leader().await;
-                    return;
                 } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
-                    if let Some(lease) = self.job_store.storage().get_leader_lease() {
+                    if let Some(lease) = active_lease {
                         let now_us = Utc::now().timestamp_micros();
                         if lease.holder_id != self.config.node_id && !lease.is_expired(now_us) {
                             warn!(
@@ -118,13 +129,13 @@ impl AppState {
                             );
                             self.job_store.set_ha_role(crate::config::HaRole::Standby);
                             let _ = self.cluster.disconnect_all().await;
-                            return;
                         }
                     }
                 }
             }
-            let _ = self.job_store.rehydrate_from_storage(false).await;
-            self.console.sync_from_storage(&self.job_store, false).await;
+            // Note: The active Leader owns the authoritative in-memory JobStore and ConsoleState
+            // and writes through to ControllerStorage on every state transition, so it does not
+            // need to pull full job history from remote storage on every coordinator tick.
         } else {
             let _ = self.job_store.rehydrate_from_storage(false).await;
             self.console.sync_from_storage(&self.job_store, false).await;

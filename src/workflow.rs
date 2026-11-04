@@ -1,3 +1,4 @@
+use action_runner_ipc::SccacheMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -11,6 +12,8 @@ pub struct ActionRunnerWorkflow {
     pub name: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub sccache: Option<SccacheMode>,
     pub tasks: HashMap<String, TaskConfig>,
     pub stages: Vec<StageConfig>,
     pub on_action: HashMap<String, Vec<String>>, // keys: push, pull_request, merge, tag
@@ -26,6 +29,8 @@ pub struct TaskConfig {
     pub env: HashMap<String, String>,
     pub timeout_seconds: Option<u64>,
     pub sandbox_profile: Option<String>,
+    #[serde(default)]
+    pub sccache: Option<SccacheMode>,
 }
 
 pub fn default_threads() -> u32 {
@@ -52,6 +57,8 @@ pub struct StageConfig {
     pub exclusive: bool,
     #[serde(default = "default_max_concurrent_per_node")]
     pub max_concurrent_per_node: u32,
+    #[serde(default)]
+    pub sccache: Option<SccacheMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -195,6 +202,7 @@ impl ActionRunnerWorkflow {
                     version: self.version.clone(),
                     name: self.name.clone(),
                     env: self.env.clone(),
+                    sccache: self.sccache,
                     tasks: HashMap::new(),
                     stages: Vec::new(),
                     on_action: HashMap::new(),
@@ -250,10 +258,24 @@ impl ActionRunnerWorkflow {
             version: self.version.clone(),
             name: self.name.clone(),
             env: self.env.clone(),
+            sccache: self.sccache,
             tasks: filtered_tasks,
             stages: filtered_stages,
             on_action: filtered_on_action,
         })
+    }
+
+    /// Resolve effective `SccacheMode` for a stage (`StageConfig.sccache -> ActionRunnerWorkflow.sccache -> SccacheMode::Try`).
+    pub fn resolve_stage_sccache(&self, stage: &StageConfig) -> SccacheMode {
+        stage.sccache.or(self.sccache).unwrap_or(SccacheMode::Try)
+    }
+
+    /// Resolve effective `SccacheMode` for a task (`TaskConfig.sccache -> StageConfig.sccache -> ActionRunnerWorkflow.sccache -> SccacheMode::Try`).
+    pub fn resolve_task_sccache(&self, stage: &StageConfig, task: &TaskConfig) -> SccacheMode {
+        task.sccache
+            .or(stage.sccache)
+            .or(self.sccache)
+            .unwrap_or(SccacheMode::Try)
     }
 }
 
@@ -683,5 +705,80 @@ on_action:
         assert_eq!(wf.stages.len(), 1);
         assert_eq!(wf.stages[0].id, "normal-test");
         assert!(!wf.stages[0].exclusive, "exclusive must default to false");
+    }
+
+    #[test]
+    fn test_v3_sccache_policy_deserialization_and_inheritance() {
+        let yaml = r#"
+version: "3"
+name: "Sccache Policy Pipeline"
+sccache: try
+tasks:
+  build-default:
+    tool: "cargo-build"
+  build-off:
+    tool: "cargo-build"
+    sccache: false
+  build-mandatory:
+    tool: "cargo-build"
+    sccache: mandatory
+  build-true:
+    tool: "cargo-build"
+    sccache: true
+stages:
+  - id: stage-inherit
+    name: "Inherit Workflow Sccache"
+    tasks: ["build-default", "build-off", "build-mandatory"]
+  - id: stage-disabled
+    name: "Stage Sccache Disabled"
+    sccache: false
+    tasks: ["build-default", "build-true"]
+  - id: stage-mandatory
+    name: "Stage Sccache Mandatory"
+    sccache: mandatory
+    tasks: ["build-default"]
+on_action:
+  push: ["stage-inherit", "stage-disabled", "stage-mandatory"]
+"#;
+        let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("should parse sccache policies");
+        assert_eq!(wf.sccache, Some(SccacheMode::Try));
+
+        let s_inherit = &wf.stages[0];
+        let s_disabled = &wf.stages[1];
+        let s_mandatory = &wf.stages[2];
+
+        assert_eq!(wf.resolve_stage_sccache(s_inherit), SccacheMode::Try);
+        assert_eq!(wf.resolve_stage_sccache(s_disabled), SccacheMode::Off);
+        assert_eq!(
+            wf.resolve_stage_sccache(s_mandatory),
+            SccacheMode::Mandatory
+        );
+
+        let t_default = wf.tasks.get("build-default").unwrap();
+        let t_off = wf.tasks.get("build-off").unwrap();
+        let t_mandatory = wf.tasks.get("build-mandatory").unwrap();
+        let t_true = wf.tasks.get("build-true").unwrap();
+
+        assert_eq!(
+            wf.resolve_task_sccache(s_inherit, t_default),
+            SccacheMode::Try
+        );
+        assert_eq!(wf.resolve_task_sccache(s_inherit, t_off), SccacheMode::Off);
+        assert_eq!(
+            wf.resolve_task_sccache(s_inherit, t_mandatory),
+            SccacheMode::Mandatory
+        );
+        assert_eq!(
+            wf.resolve_task_sccache(s_disabled, t_default),
+            SccacheMode::Off
+        );
+        assert_eq!(
+            wf.resolve_task_sccache(s_disabled, t_true),
+            SccacheMode::Try
+        );
+        assert_eq!(
+            wf.resolve_task_sccache(s_mandatory, t_default),
+            SccacheMode::Mandatory
+        );
     }
 }

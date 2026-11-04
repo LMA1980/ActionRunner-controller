@@ -11,7 +11,7 @@ default = []
 bundled-duckdb = []
 
 [dependencies]
-action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "main" }
+action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "feat/sccache-support" }
 action-runner-tools = { git = "https://github.com/LMA1980/ActionRunner-tools.git", branch = "main" }
 muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git", branch = "main" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
@@ -44,7 +44,7 @@ arc-swap = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
-action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "main" }
+action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "feat/sccache-support" }
 tempfile = "3"
 rcgen = "0.14"
 
