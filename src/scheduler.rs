@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
 use crate::workflow::{ActionRunnerWorkflow, StageConfig};
 use action_runner_ipc::{
-    NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, StageDispatchTask,
+    NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, SccacheMode, StageDispatchTask,
     TypedTaskInvocation,
 };
 use action_runner_tools::{SandboxProfileRequirement, ToolInvocation, ToolRegistry};
@@ -140,6 +140,8 @@ pub fn build_v3_stage_dispatch_task(
             stage_timeout = stage_timeout.min(to);
         }
 
+        let task_sccache = workflow.resolve_task_sccache(stage, task_cfg);
+
         typed_tasks.push(TypedTaskInvocation {
             task_id: task_id.clone(),
             tool_name: task_cfg.tool.clone(),
@@ -147,6 +149,7 @@ pub fn build_v3_stage_dispatch_task(
             working_dir: task_cfg.working_dir.clone(),
             env_vars: env_pairs,
             sandbox: sandbox_spec,
+            sccache_mode: task_sccache,
         });
     }
 
@@ -171,6 +174,15 @@ pub fn build_v3_stage_dispatch_task(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    let stage_sccache = if typed_tasks
+        .iter()
+        .any(|t| t.sccache_mode == SccacheMode::Mandatory)
+    {
+        SccacheMode::Mandatory
+    } else {
+        workflow.resolve_stage_sccache(stage)
+    };
+
     Ok(StageDispatchTask {
         job_id: job_id.to_string(),
         stage_id: stage.id.clone(),
@@ -191,6 +203,7 @@ pub fn build_v3_stage_dispatch_task(
         traceparent: Some(crate::storage_backend::job_root_traceparent(
             job_id, commit_sha,
         )),
+        sccache_mode: stage_sccache,
     })
 }
 
@@ -538,13 +551,25 @@ impl DAGScheduler {
 
                         if deps_satisfied {
                             let stage_cfg = stages_by_id.get(&stage.id).unwrap();
+                            let requires_sccache = workflow.resolve_stage_sccache(stage_cfg)
+                                == SccacheMode::Mandatory
+                                || stage_cfg.tasks.iter().any(|tid| {
+                                    workflow.tasks.get(tid).is_some_and(|tcfg| {
+                                        workflow.resolve_task_sccache(stage_cfg, tcfg)
+                                            == SccacheMode::Mandatory
+                                    })
+                                });
+                            let mut required_tags = stage_cfg.tags.clone();
+                            if requires_sccache && !required_tags.iter().any(|t| t == "sccache") {
+                                required_tags.push("sccache".to_string());
+                            }
                             // Attempt to lease a slot (respecting node capacity and exclusive stage locks)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
                                 .lease_slot(
                                     &job.id,
                                     &stage.id,
-                                    &stage_cfg.tags,
+                                    &required_tags,
                                     stage_cfg.toolchain.as_deref(),
                                     stage_cfg.exclusive,
                                 )
@@ -1096,6 +1121,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: Some(600),
                 sandbox_profile: None,
+                sccache: None,
             },
         );
         tasks.insert(
@@ -1107,6 +1133,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: Some(900),
                 sandbox_profile: None,
+                sccache: None,
             },
         );
 
@@ -1120,12 +1147,14 @@ mod tests {
             toolchain: Some("stable".to_string()),
             exclusive: true,
             max_concurrent_per_node: 1,
+            sccache: None,
         };
 
         let wf = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Test Pipeline".to_string(),
             env: HashMap::from([("CI".to_string(), "true".to_string())]),
+            sccache: None,
             tasks,
             stages: vec![stage.clone()],
             on_action: HashMap::from([("push".to_string(), vec!["stage-ci".to_string()])]),
@@ -1172,6 +1201,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: None,
                 sandbox_profile: None,
+                sccache: None,
             },
         );
 
@@ -1185,12 +1215,14 @@ mod tests {
             toolchain: None,
             exclusive: false,
             max_concurrent_per_node: 1,
+            sccache: None,
         };
 
         let wf_bash = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Malicious Pipeline".to_string(),
             env: HashMap::new(),
+            sccache: None,
             tasks: tasks_bash,
             stages: vec![stage_bash.clone()],
             on_action: HashMap::new(),
@@ -1225,6 +1257,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: None,
                 sandbox_profile: None,
+                sccache: None,
             },
         );
         let stage_sh = StageConfig {
@@ -1237,11 +1270,13 @@ mod tests {
             toolchain: None,
             exclusive: false,
             max_concurrent_per_node: 1,
+            sccache: None,
         };
         let wf_sh = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Sh Pipeline".to_string(),
             env: HashMap::new(),
+            sccache: None,
             tasks: tasks_sh,
             stages: vec![stage_sh.clone()],
             on_action: HashMap::new(),
@@ -1267,6 +1302,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: None,
                 sandbox_profile: None,
+                sccache: None,
             },
         );
         let stage_semi = StageConfig {
@@ -1279,11 +1315,13 @@ mod tests {
             toolchain: None,
             exclusive: false,
             max_concurrent_per_node: 1,
+            sccache: None,
         };
         let wf_semi = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Semi Pipeline".to_string(),
             env: HashMap::new(),
+            sccache: None,
             tasks: tasks_semi,
             stages: vec![stage_semi.clone()],
             on_action: HashMap::new(),
@@ -1304,6 +1342,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_seconds: None,
                 sandbox_profile: None,
+                sccache: None,
             },
         );
         let stage_sub = StageConfig {
@@ -1316,11 +1355,13 @@ mod tests {
             toolchain: None,
             exclusive: false,
             max_concurrent_per_node: 1,
+            sccache: None,
         };
         let wf_sub = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Subshell Pipeline".to_string(),
             env: HashMap::new(),
+            sccache: None,
             tasks: tasks_sub,
             stages: vec![stage_sub.clone()],
             on_action: HashMap::new(),
@@ -1389,5 +1430,66 @@ on_action:
             Err(WorkflowResolveError::LegacyDisabled) => {}
             other => panic!("Expected LegacyDisabled error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_build_v3_stage_dispatch_task_sccache_propagation() {
+        let yaml = r#"
+version: "3"
+name: "Sccache Dispatch Propagation"
+sccache: true
+tasks:
+  t-try:
+    tool: "cargo-clippy"
+    args: ["--workspace"]
+  t-off:
+    tool: "cargo-test"
+    args: ["--workspace"]
+    sccache: false
+  t-mandatory:
+    tool: "cargo-build"
+    args: ["--release"]
+    sccache: mandatory
+stages:
+  - id: s-mixed
+    name: "Mixed Sccache Tasks"
+    tasks: ["t-try", "t-off", "t-mandatory"]
+  - id: s-off
+    name: "Disabled Stage"
+    sccache: false
+    tasks: ["t-try"]
+on_action:
+  push: ["s-mixed", "s-off"]
+"#;
+        let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid workflow");
+        let dispatch_mixed = build_v3_stage_dispatch_task(
+            "job-sccache-1",
+            "LMA1980/ActionRunner-controller",
+            "https://github.com/LMA1980/ActionRunner-controller.git",
+            "1234567890abcdef",
+            &wf.stages[0],
+            &wf,
+            600,
+        )
+        .expect("build mixed dispatch");
+
+        assert_eq!(dispatch_mixed.sccache_mode, SccacheMode::Mandatory);
+        assert_eq!(dispatch_mixed.tasks[0].sccache_mode, SccacheMode::Try);
+        assert_eq!(dispatch_mixed.tasks[1].sccache_mode, SccacheMode::Off);
+        assert_eq!(dispatch_mixed.tasks[2].sccache_mode, SccacheMode::Mandatory);
+
+        let dispatch_off = build_v3_stage_dispatch_task(
+            "job-sccache-1",
+            "LMA1980/ActionRunner-controller",
+            "https://github.com/LMA1980/ActionRunner-controller.git",
+            "1234567890abcdef",
+            &wf.stages[1],
+            &wf,
+            600,
+        )
+        .expect("build off dispatch");
+
+        assert_eq!(dispatch_off.sccache_mode, SccacheMode::Off);
+        assert_eq!(dispatch_off.tasks[0].sccache_mode, SccacheMode::Off);
     }
 }
