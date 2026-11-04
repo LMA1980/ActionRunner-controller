@@ -39,18 +39,21 @@ pub struct ActiveWorker {
     pub cpu_load_pct: f32,
     pub ram_used_mb: u64,
     pub last_heartbeat: DateTime<Utc>,
+    pub last_dispatched_seq: u64,
     pub command_tx: mpsc::Sender<WorkerCommand>,
 }
 
 #[derive(Clone, Default)]
 pub struct ClusterRegistry {
     workers: Arc<RwLock<HashMap<String, ActiveWorker>>>,
+    dispatch_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClusterRegistry {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
+            dispatch_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -81,6 +84,7 @@ impl ClusterRegistry {
                 cpu_load_pct: 0.0,
                 ram_used_mb: 0,
                 last_heartbeat: Utc::now(),
+                last_dispatched_seq: 0,
                 command_tx,
             },
         );
@@ -136,8 +140,31 @@ impl ClusterRegistry {
         let mut workers = self.workers.write().await;
         let now = Utc::now();
 
-        // Collect all eligible idle nodes and pick the most specific match (fewest tags, then lowest CPU load)
-        let mut best_node: Option<(String, usize, i32)> = None;
+        // Collect all eligible idle nodes and balance dispatch across compilation workers:
+        // 1. Prefer fewest currently leased stages on the node (`leased_stages.len()`)
+        // 2. When a stage does not explicitly require native K3 hardware tags (`k3`, `spacemit`,
+        //    `x100`, `a100`, `native`, `ground-truth`, `bench`, `verification`), prefer general
+        //    compilation/cross-compilation nodes (`tier = 0`) over native K3 hardware (`tier = 1`)
+        //    so native silicon remains available for hardware verification/benchmarks unless all
+        //    x86_64 workers are busy.
+        // 3. Round-robin (`last_dispatched_seq`) and CPU load (`load_int`) so all eligible nodes
+        //    (e.g. `node-a` / `entrance` and `node-b` / `rubicon`) share compilation evenly
+        //    without penalizing nodes that advertise extra hygiene tags (`fmt`, `audit`, `docs`).
+        const HW_EXCLUSIVE_TAGS: &[&str] = &[
+            "k3",
+            "spacemit",
+            "x100",
+            "a100",
+            "native",
+            "ground-truth",
+            "bench",
+            "verification",
+        ];
+        let stage_requests_hw = required_tags
+            .iter()
+            .any(|req| HW_EXCLUSIVE_TAGS.contains(&req.as_str()));
+
+        let mut best_node: Option<(String, (usize, u8, u64, i32))> = None;
 
         for (node_id, worker) in workers.iter() {
             // Heartbeat timeout check: 15 seconds (default) or configurable
@@ -193,23 +220,29 @@ impl ClusterRegistry {
                     .all(|req| req == "default" || node_tags.contains(req.as_str()));
 
             if matches_tags {
-                let tag_count = worker.registration.tags.len();
+                let node_is_hw = HW_EXCLUSIVE_TAGS.iter().any(|t| node_tags.contains(t));
+                let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
+                let active_leases = worker.leased_stages.len();
                 let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let candidate = (node_id.clone(), tag_count, load_int);
+                let score = (active_leases, hw_tier, worker.last_dispatched_seq, load_int);
                 if match &best_node {
                     None => true,
-                    Some((best_id, best_tags, best_load)) => {
-                        (tag_count, load_int, node_id.as_str())
-                            < (*best_tags, *best_load, best_id.as_str())
+                    Some((best_id, best_score)) => {
+                        (score, node_id.as_str()) < (*best_score, best_id.as_str())
                     }
                 } {
-                    best_node = Some(candidate);
+                    best_node = Some((node_id.clone(), score));
                 }
             }
         }
 
-        if let Some((chosen_id, _, _)) = best_node {
+        if let Some((chosen_id, _)) = best_node {
             if let Some(worker) = workers.get_mut(&chosen_id) {
+                let seq = self
+                    .dispatch_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                worker.last_dispatched_seq = seq;
                 worker
                     .leased_stages
                     .insert((job_id.to_string(), stage_id.to_string()));
@@ -322,12 +355,16 @@ impl ClusterRegistry {
     pub async fn list_nodes_view(&self) -> Vec<ClusterNodeView> {
         let workers = self.workers.read().await;
         let now = Utc::now();
+        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(15);
 
         workers
             .values()
             .map(|w| {
                 let last_seen_secs_ago = (now - w.last_heartbeat).num_seconds().max(0) as u64;
-                let is_online = last_seen_secs_ago <= 15;
+                let is_online = last_seen_secs_ago <= timeout_secs;
 
                 ClusterNodeView {
                     node_id: w.registration.node_id.clone(),
@@ -357,10 +394,14 @@ impl ClusterRegistry {
     ) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
+        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
 
         for worker in workers.values() {
             let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > 15 {
+            if secs_since_seen > timeout_secs {
                 continue;
             }
             if worker.exclusive_lease.is_some() {
@@ -395,10 +436,14 @@ impl ClusterRegistry {
     pub async fn has_any_available_slot(&self) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
+        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
 
         for worker in workers.values() {
             let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > 15 {
+            if secs_since_seen > timeout_secs {
                 continue;
             }
             if worker.exclusive_lease.is_some() {
@@ -881,5 +926,126 @@ mod tests {
                 view.node_id
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_three_node_compilation_balancing_and_hw_tiering() {
+        let cluster = ClusterRegistry::new();
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let (tx_k3, _rx_k3) = mpsc::channel(8);
+
+        // node-a has extra hygiene tags (fmt, audit, docs) alongside compilation tags (12 tags)
+        cluster
+            .register(
+                make_reg(
+                    "node-a",
+                    &[
+                        "x86_64",
+                        "linux",
+                        "fmt",
+                        "audit",
+                        "docs",
+                        "clippy",
+                        "cross-compile",
+                        "riscv64",
+                        "build",
+                        "test",
+                        "sccache",
+                    ],
+                    1,
+                ),
+                tx_a,
+            )
+            .await;
+
+        // node-b has fewer tags (8 tags)
+        cluster
+            .register(
+                make_reg(
+                    "node-b",
+                    &[
+                        "x86_64",
+                        "linux",
+                        "clippy",
+                        "cross-compile",
+                        "riscv64",
+                        "build",
+                        "test",
+                        "sccache",
+                    ],
+                    1,
+                ),
+                tx_b,
+            )
+            .await;
+
+        // worker-riscv64 carries hardware tags + riscv64
+        cluster
+            .register(
+                make_reg(
+                    "worker-riscv64",
+                    &[
+                        "riscv64", "spacemit", "k3", "x100", "a100", "native", "bench", "sccache",
+                    ],
+                    1,
+                ),
+                tx_k3,
+            )
+            .await;
+
+        let req_riscv64 = vec!["riscv64".to_string()];
+
+        // 1. First riscv64 compilation stage picks node-a (tier 0, seq 0), NOT penalized by having more tags!
+        let l1 = cluster
+            .lease_slot("job-1", "build-1", &req_riscv64, None, false)
+            .await
+            .expect("l1");
+        assert_eq!(l1.0, "node-a");
+
+        // 2. While node-a is busy, second concurrent riscv64 stage picks node-b (tier 0, seq 0)
+        let l2 = cluster
+            .lease_slot("job-1", "build-2", &req_riscv64, None, false)
+            .await
+            .expect("l2");
+        assert_eq!(l2.0, "node-b");
+
+        // 3. While both x86_64 cross-compile nodes are busy, third concurrent riscv64 stage spills to worker-riscv64 (tier 1)
+        let l3 = cluster
+            .lease_slot("job-1", "build-3", &req_riscv64, None, false)
+            .await
+            .expect("l3");
+        assert_eq!(l3.0, "worker-riscv64");
+
+        // Release all three
+        cluster
+            .release_stage_slot("node-a", "job-1", "build-1")
+            .await;
+        cluster
+            .release_stage_slot("node-b", "job-1", "build-2")
+            .await;
+        cluster
+            .release_stage_slot("worker-riscv64", "job-1", "build-3")
+            .await;
+
+        // 4. Next sequential stage alternates between node-a (seq 1) and node-b (seq 2) via round-robin
+        let l4 = cluster
+            .lease_slot("job-2", "clippy-1", &["clippy".to_string()], None, false)
+            .await
+            .expect("l4");
+        assert_eq!(l4.0, "node-a");
+        cluster
+            .release_stage_slot("node-a", "job-2", "clippy-1")
+            .await;
+
+        let l5 = cluster
+            .lease_slot("job-2", "clippy-2", &["clippy".to_string()], None, false)
+            .await
+            .expect("l5");
+        assert_eq!(l5.0, "node-b");
+        cluster
+            .release_stage_slot("node-b", "job-2", "clippy-2")
+            .await;
     }
 }
