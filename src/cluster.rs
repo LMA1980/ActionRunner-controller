@@ -140,9 +140,13 @@ impl ClusterRegistry {
         let mut best_node: Option<(String, usize, i32)> = None;
 
         for (node_id, worker) in workers.iter() {
-            // Heartbeat timeout check: 15 seconds
+            // Heartbeat timeout check: 15 seconds (default) or configurable
+            let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15);
             let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > 15 {
+            if secs_since_seen > timeout_secs {
                 continue;
             }
 
@@ -304,8 +308,12 @@ impl ClusterRegistry {
     pub async fn is_node_online(&self, node_id: &str) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
+        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
         if let Some(worker) = workers.get(node_id) {
-            (now - worker.last_heartbeat).num_seconds().max(0) <= 15
+            (now - worker.last_heartbeat).num_seconds().max(0) <= timeout_secs
         } else {
             false
         }
