@@ -559,6 +559,7 @@ async fn topology_tracks_simulated_webhooks() {
         depends_on: vec![],
         status: StageStatus::Pending,
         assigned_node: None,
+        exclusive: false,
     };
     state
         .job_store
@@ -788,6 +789,7 @@ async fn sse_emits_additive_console_kinds_and_filters_private() {
                 depends_on: vec![],
                 status: StageStatus::Pending,
                 assigned_node: None,
+                exclusive: false,
             }],
         )
         .await;

@@ -9,7 +9,9 @@ use action_runner_controller::app::create_router;
 use action_runner_controller::cluster::ClusterRegistry;
 use action_runner_controller::config::{Config, HaRole, HaRoleConfig};
 use action_runner_controller::console::{ConsoleConfig, ConsoleState};
-use action_runner_controller::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
+use action_runner_controller::job::{
+    Job, JobRecord, JobStatus, JobStore, StageRecord, StageStatus,
+};
 use action_runner_controller::storage_backend::{
     ControllerStorage, InMemoryStorage, MuObserveRemoteConfig, MuObserveRemoteStorage,
 };
@@ -285,6 +287,7 @@ async fn test_standby_promotion_rehydrates_job_store_and_console_state() {
                         exit_code: 0,
                     },
                     assigned_node: Some("node-a".to_string()),
+                    exclusive: false,
                 },
                 StageRecord {
                     id: "native-k3".to_string(),
@@ -299,6 +302,7 @@ async fn test_standby_promotion_rehydrates_job_store_and_console_state() {
                         pid: Some(4242),
                     },
                     assigned_node: Some("worker-riscv64".to_string()),
+                    exclusive: false,
                 },
             ],
         )
@@ -709,5 +713,230 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
     assert_eq!(
         shared_storage.get_leader_lease().unwrap().holder_id,
         "node-c"
+    );
+}
+
+#[tokio::test]
+async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_state() {
+    let shared_storage: Arc<dyn ControllerStorage> = Arc::new(InMemoryStorage::open());
+    let ws_a = tempfile::tempdir().expect("ws_a");
+
+    let state_a = build_controller_state(
+        "node-a",
+        HaRoleConfig::Auto,
+        ws_a.path().to_path_buf(),
+        Arc::clone(&shared_storage),
+    );
+    assert_eq!(state_a.job_store.ha_role(), HaRole::Leader);
+
+    // 1. Enqueue job-1 and transition stage to Running with PID 8888
+    let job1 = Job {
+        id: "job-ha-inflight-pid".to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/ActionRunner-controller".to_string(),
+        clone_url: "https://github.com/LMA1980/ActionRunner-controller.git".to_string(),
+        commit_sha: "aaaa111122223333444455556666777788889999".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now() - chrono::Duration::seconds(30),
+    };
+    state_a
+        .job_store
+        .enqueue_job(
+            job1.clone(),
+            PathBuf::from("logs/LMA1980/ActionRunner-controller/job-ha-inflight-pid.log"),
+        )
+        .await;
+    state_a
+        .job_store
+        .set_stages(
+            "job-ha-inflight-pid",
+            vec![StageRecord {
+                id: "stage-compile".to_string(),
+                name: "Compile".to_string(),
+                tags: vec!["k3".to_string()],
+                threads: 4,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Pending,
+                assigned_node: None,
+                exclusive: false,
+            }],
+        )
+        .await;
+
+    state_a
+        .job_store
+        .update_stage_running("job-ha-inflight-pid", "stage-compile", "worker-a", 8888)
+        .await;
+
+    let j1_local = state_a
+        .job_store
+        .get_job("job-ha-inflight-pid")
+        .await
+        .expect("job1 local");
+    assert!(matches!(j1_local.status, JobStatus::Running { .. }));
+    match &j1_local.stages[0].status {
+        StageStatus::Running { node_id, pid, .. } => {
+            assert_eq!(node_id, "worker-a");
+            assert_eq!(*pid, Some(8888));
+        }
+        other => panic!("expected Running stage with pid, got {:?}", other),
+    }
+
+    // 2. Enqueue job-2, claim it, complete a stage, and requeue it preserving priority
+    let job2 = Job {
+        id: "job-ha-requeued".to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/MuObserve".to_string(),
+        clone_url: "https://github.com/LMA1980/MuObserve.git".to_string(),
+        commit_sha: "bbbb111122223333444455556666777788889999".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now() - chrono::Duration::seconds(20),
+    };
+    state_a
+        .job_store
+        .enqueue_job(
+            job2.clone(),
+            PathBuf::from("logs/LMA1980/MuObserve/job-ha-requeued.log"),
+        )
+        .await;
+    let claimed = state_a
+        .job_store
+        .claim_next_queued_job(4)
+        .await
+        .expect("claim job2");
+    assert_eq!(claimed.id, "job-ha-requeued");
+
+    state_a
+        .job_store
+        .set_stages(
+            "job-ha-requeued",
+            vec![
+                StageRecord {
+                    id: "stage-test".to_string(),
+                    name: "Test".to_string(),
+                    tags: vec!["k3".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Completed {
+                        duration_secs: 3,
+                        exit_code: 0,
+                    },
+                    assigned_node: Some("worker-b".to_string()),
+                    exclusive: false,
+                },
+                StageRecord {
+                    id: "stage-bench".to_string(),
+                    name: "Bench".to_string(),
+                    tags: vec!["k3".to_string()],
+                    threads: 4,
+                    toolchain: None,
+                    depends_on: vec!["stage-test".to_string()],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                },
+            ],
+        )
+        .await;
+    assert!(
+        state_a
+            .job_store
+            .requeue_preserving_priority("job-ha-requeued")
+            .await
+    );
+
+    // 3. Inject stale snapshots directly into shared_storage:
+    //    - stale_j1 has EQUAL updated_at but older StageStatus::Pending (no PID) and Queued status
+    //    - stale_j2 has fewer completed stages and older status
+    let stale_j1 = JobRecord {
+        job: j1_local.job.clone(),
+        log_file: j1_local.log_file.clone(),
+        status: JobStatus::Queued,
+        updated_at: j1_local.updated_at, // EQUAL timestamp (Issue #107 clobber hazard)
+        metrics: None,
+        stages: vec![StageRecord {
+            id: "stage-compile".to_string(),
+            name: "Compile".to_string(),
+            tags: vec!["k3".to_string()],
+            threads: 4,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+        }],
+    };
+    shared_storage.upsert_record(&stale_j1);
+
+    let stale_j2 = JobRecord {
+        job: job2.clone(),
+        log_file: PathBuf::from("logs/LMA1980/MuObserve/job-ha-requeued.log"),
+        status: JobStatus::Running {
+            started_at: Utc::now() - chrono::Duration::seconds(25),
+        },
+        updated_at: Utc::now() - chrono::Duration::seconds(15),
+        metrics: None,
+        stages: vec![StageRecord {
+            id: "stage-test".to_string(),
+            name: "Test".to_string(),
+            tags: vec!["k3".to_string()],
+            threads: 2,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+        }],
+    };
+    shared_storage.upsert_record(&stale_j2);
+
+    // 4. Trigger leader rehydrate with recover_running = false
+    let rehydrated = state_a.job_store.rehydrate_from_storage(false).await;
+    assert!(rehydrated >= 2);
+
+    // 5. Verify the leader preserved in-flight running job status and stage PID 8888
+    let j1_res = state_a
+        .job_store
+        .get_job("job-ha-inflight-pid")
+        .await
+        .expect("job1 after rehydrate");
+    assert!(
+        matches!(j1_res.status, JobStatus::Running { .. }),
+        "Leader must preserve Running status when storage snapshot has equal timestamp"
+    );
+    match &j1_res.stages[0].status {
+        StageStatus::Running { node_id, pid, .. } => {
+            assert_eq!(node_id, "worker-a");
+            assert_eq!(
+                *pid,
+                Some(8888),
+                "Leader stage PID must never be clobbered by stale storage record"
+            );
+        }
+        other => panic!("expected Running stage with PID, got {:?}", other),
+    }
+
+    // 6. Verify leader preserved requeued state and completed stages
+    let j2_res = state_a
+        .job_store
+        .get_job("job-ha-requeued")
+        .await
+        .expect("job2 after rehydrate");
+    assert_eq!(
+        j2_res.status,
+        JobStatus::Queued,
+        "Leader must preserve requeued status"
+    );
+    assert_eq!(j2_res.stages.len(), 2);
+    assert!(
+        matches!(
+            j2_res.stages[0].status,
+            StageStatus::Completed { exit_code: 0, .. }
+        ),
+        "Leader must preserve completed stages"
     );
 }

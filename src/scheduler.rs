@@ -343,6 +343,7 @@ impl DAGScheduler {
     }
 
     async fn execute_job(&self, job: Job) {
+        let mut _guard = crate::job::InFlightJobGuard::new(self.job_store.clone(), job.id.clone());
         let start_time = Utc::now();
         info!(
             job_id = %job.id,
@@ -427,6 +428,7 @@ impl DAGScheduler {
                             existing.status = StageStatus::Pending;
                             existing.assigned_node = None;
                         }
+                        existing.exclusive = s.exclusive;
                         existing
                     } else {
                         StageRecord {
@@ -438,6 +440,7 @@ impl DAGScheduler {
                             depends_on: s.depends_on.clone(),
                             status: StageStatus::Pending,
                             assigned_node: None,
+                            exclusive: s.exclusive,
                         }
                     }
                 })
@@ -455,6 +458,7 @@ impl DAGScheduler {
                     depends_on: s.depends_on.clone(),
                     status: StageStatus::Pending,
                     assigned_node: None,
+                    exclusive: s.exclusive,
                 })
                 .collect()
         };
@@ -799,6 +803,7 @@ impl DAGScheduler {
                         .await;
                     }
                 }
+                _guard.disarm();
                 break;
             }
 
@@ -808,6 +813,7 @@ impl DAGScheduler {
             // and completed stages so other queued jobs can execute on idle worker nodes.
             let latest_stages = self.job_store.get_stages(&job.id).await;
             let has_active_stages = !leased_slots.is_empty()
+                || self.cluster.has_active_leases_for_job(&job.id).await
                 || latest_stages.iter().any(|s| {
                     matches!(
                         s.status,
@@ -815,6 +821,7 @@ impl DAGScheduler {
                     )
                 });
             if !has_active_stages && self.job_store.requeue_preserving_priority(&job.id).await {
+                _guard.disarm();
                 let completed_count = latest_stages
                     .iter()
                     .filter(|s| matches!(s.status, StageStatus::Completed { exit_code: 0, .. }))
