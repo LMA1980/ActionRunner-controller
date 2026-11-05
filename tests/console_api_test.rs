@@ -1393,3 +1393,394 @@ async fn invite_redemption_payload_token_compatibility() {
         "POST /api/auth/redeem without token or invite_token must return 422 Unprocessable Entity"
     );
 }
+
+#[tokio::test]
+async fn session_resolution_anonymous_untrusted_uninvited_and_bound_operator() {
+    let (state, _tmp) = seeded_auth_state().await;
+    let app = create_router(state.clone());
+
+    // 1. Anonymous caller with no headers -> unauthenticated anonymous
+    let (st_anon, j_anon, _) = send_req(&app, "GET", "/api/auth/session", &[], None).await;
+    assert_eq!(st_anon, StatusCode::OK);
+    assert_eq!(j_anon["authenticated"], false);
+    assert_eq!(j_anon["github_login"], Value::Null);
+    assert_eq!(j_anon["invite_bound"], false);
+    assert_eq!(j_anon["role"], Value::Null);
+
+    // 2. Caller with X-Forwarded-User but WITHOUT X-Proxy-Secret -> unauthenticated anonymous (fails closed)
+    let (st_spoof, j_spoof, _) = send_req(
+        &app,
+        "GET",
+        "/api/auth/session",
+        &[("X-Forwarded-User", "malicious-actor")],
+        None,
+    )
+    .await;
+    assert_eq!(st_spoof, StatusCode::OK);
+    assert_eq!(j_spoof["authenticated"], false);
+    assert_eq!(j_spoof["github_login"], Value::Null);
+    assert_eq!(j_spoof["invite_bound"], false);
+    assert_eq!(j_spoof["role"], Value::Null);
+
+    // 3. Caller with INVALID X-Proxy-Secret -> unauthenticated anonymous (fails closed)
+    let (st_wrong, j_wrong, _) = send_req(
+        &app,
+        "GET",
+        "/api/auth/session",
+        &[
+            ("X-Proxy-Secret", "wrong-secret"),
+            ("X-Forwarded-User", "malicious-actor"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_wrong, StatusCode::OK);
+    assert_eq!(j_wrong["authenticated"], false);
+    assert_eq!(j_wrong["github_login"], Value::Null);
+    assert_eq!(j_wrong["invite_bound"], false);
+    assert_eq!(j_wrong["role"], Value::Null);
+
+    // 4. Caller with valid X-Proxy-Secret but EMPTY / whitespace X-Forwarded-User -> unauthenticated anonymous
+    for empty_user in ["", "   ", "\t"] {
+        let (st_empty, j_empty, _) = send_req(
+            &app,
+            "GET",
+            "/api/auth/session",
+            &[
+                ("X-Proxy-Secret", PROXY_SECRET),
+                ("X-Forwarded-User", empty_user),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st_empty, StatusCode::OK);
+        assert_eq!(j_empty["authenticated"], false);
+        assert_eq!(j_empty["github_login"], Value::Null);
+        assert_eq!(j_empty["invite_bound"], false);
+        assert_eq!(j_empty["role"], Value::Null);
+    }
+
+    // 5. Caller with valid X-Proxy-Secret + X-Forwarded-User NOT in auth_users -> UninvitedUser
+    let (st_uninv, j_uninv, _) = send_req(
+        &app,
+        "GET",
+        "/api/auth/session",
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "uninvited-guest"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_uninv, StatusCode::OK);
+    assert_eq!(j_uninv["authenticated"], false);
+    assert_eq!(j_uninv["github_login"], "uninvited-guest");
+    assert_eq!(j_uninv["invite_bound"], false);
+    assert_eq!(j_uninv["role"], Value::Null);
+
+    // 6. Caller with valid X-Proxy-Secret + X-Forwarded-User who is a bootstrap admin -> BoundUser ("admin")
+    let (st_admin, j_admin, _) = send_req(
+        &app,
+        "GET",
+        "/api/auth/session",
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "LMA1980"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(st_admin, StatusCode::OK);
+    assert_eq!(j_admin["authenticated"], true);
+    assert_eq!(j_admin["github_login"], "LMA1980");
+    assert_eq!(j_admin["invite_bound"], true);
+    assert_eq!(j_admin["role"], "admin");
+
+    // 7. Caller with valid X-Proxy-Secret + X-Forwarded-User who was redeemed via invite -> BoundUser ("operator")
+    let (st_inv, inv_resp, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "LMA1980"),
+        ],
+        Some(json!({ "ttl_seconds": 3600, "note": "session resolution test" })),
+    )
+    .await;
+    assert_eq!(st_inv, StatusCode::CREATED);
+    let token = inv_resp["invite_token"].as_str().unwrap();
+
+    let op_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "verified-operator"),
+    ];
+    let (st_red, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &op_hdrs,
+        Some(json!({ "invite_token": token })),
+    )
+    .await;
+    assert_eq!(st_red, StatusCode::OK);
+
+    let (st_op, j_op, _) = send_req(&app, "GET", "/api/auth/session", &op_hdrs, None).await;
+    assert_eq!(st_op, StatusCode::OK);
+    assert_eq!(j_op["authenticated"], true);
+    assert_eq!(j_op["github_login"], "verified-operator");
+    assert_eq!(j_op["invite_bound"], true);
+    assert_eq!(j_op["role"], "operator");
+}
+
+#[tokio::test]
+async fn redeem_invite_unauthorized_when_anonymous_spoofed_or_empty_forwarded_user() {
+    let (state, _tmp) = seeded_auth_state().await;
+    let app = create_router(state.clone());
+
+    // Mint a valid invite token as bootstrap admin
+    let (st_inv, inv_resp, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "LMA1980"),
+        ],
+        Some(json!({ "ttl_seconds": 3600, "note": "unauthorized redemption test" })),
+    )
+    .await;
+    assert_eq!(st_inv, StatusCode::CREATED);
+    let valid_token = inv_resp["invite_token"].as_str().unwrap();
+    let redeem_body = json!({ "invite_token": valid_token });
+
+    // 1. Anonymous caller (no headers) -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Anonymous caller must receive 401; got {st}: {text}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"),
+        "error message must cite required proxy headers: {text}"
+    );
+
+    // 2. Caller with X-Forwarded-User but NO X-Proxy-Secret (spoofed header) -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[("X-Forwarded-User", "attacker")],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Spoofed header without proxy secret must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+
+    // 3. Caller with INVALID X-Proxy-Secret -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[
+            ("X-Proxy-Secret", "wrong-secret-token"),
+            ("X-Forwarded-User", "attacker"),
+        ],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Invalid proxy secret must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+
+    // 4. Caller with valid X-Proxy-Secret but MISSING X-Forwarded-User -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[("X-Proxy-Secret", PROXY_SECRET)],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Missing X-Forwarded-User must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+
+    // 5. Caller with valid X-Proxy-Secret but EMPTY X-Forwarded-User -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[("X-Proxy-Secret", PROXY_SECRET), ("X-Forwarded-User", "")],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Empty X-Forwarded-User must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+
+    // 6. Caller with valid X-Proxy-Secret but whitespace-only X-Forwarded-User -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[
+            ("X-Proxy-Secret", PROXY_SECRET),
+            ("X-Forwarded-User", "   \t  "),
+        ],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Whitespace X-Forwarded-User must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+
+    // 7. Caller with admin API key in Bearer token (no proxy headers) -> 401 Unauthorized
+    let (st, body, text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &[("Authorization", &format!("Bearer {API_KEY}"))],
+        Some(redeem_body.clone()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "Admin API key without proxy headers must receive 401; got {st}: {text}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("valid X-Proxy-Secret and X-Forwarded-User headers required"));
+}
+
+#[tokio::test]
+async fn redeem_invite_valid_token_binds_user_and_grants_operator_role() {
+    let (state, _tmp) = seeded_auth_state().await;
+    let app = create_router(state.clone());
+
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+
+    // 1. Issue a valid invite
+    let (st_inv, inv_resp, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({
+            "ttl_seconds": 3600,
+            "note": "Onboarding test candidate",
+            "base_url": "https://console.lma1980.duckdns.org"
+        })),
+    )
+    .await;
+    assert_eq!(st_inv, StatusCode::CREATED);
+    let invite_token = inv_resp["invite_token"].as_str().unwrap().to_string();
+
+    let candidate_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "new-operator-alice"),
+    ];
+
+    // 2. Pre-condition: Candidate is currently UninvitedUser (authenticated: false, invite_bound: false)
+    let (st_pre, j_pre, _) =
+        send_req(&app, "GET", "/api/auth/session", &candidate_hdrs, None).await;
+    assert_eq!(st_pre, StatusCode::OK);
+    assert_eq!(j_pre["authenticated"], false);
+    assert_eq!(j_pre["github_login"], "new-operator-alice");
+    assert_eq!(j_pre["invite_bound"], false);
+    assert_eq!(j_pre["role"], Value::Null);
+
+    // 3. Redeem the valid invite token -> 200 OK with BoundUser payload
+    let (st_redeem, j_redeem, text_redeem) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &candidate_hdrs,
+        Some(json!({ "invite_token": invite_token })),
+    )
+    .await;
+    assert_eq!(
+        st_redeem,
+        StatusCode::OK,
+        "Expected 200 OK on redemption; got {st_redeem}: {text_redeem}"
+    );
+    assert_eq!(j_redeem["authenticated"], true);
+    assert_eq!(j_redeem["github_login"], "new-operator-alice");
+    assert_eq!(j_redeem["invite_bound"], true);
+    assert_eq!(j_redeem["role"], "operator");
+
+    // 4. Post-condition: Candidate session resolution is now BoundUser ("operator")
+    let (st_post, j_post, _) =
+        send_req(&app, "GET", "/api/auth/session", &candidate_hdrs, None).await;
+    assert_eq!(st_post, StatusCode::OK);
+    assert_eq!(j_post["authenticated"], true);
+    assert_eq!(j_post["github_login"], "new-operator-alice");
+    assert_eq!(j_post["invite_bound"], true);
+    assert_eq!(j_post["role"], "operator");
+
+    // 5. Replay attempt with same token fails with 409 Conflict
+    let (st_replay, j_replay, text_replay) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &candidate_hdrs,
+        Some(json!({ "invite_token": invite_token })),
+    )
+    .await;
+    assert_eq!(
+        st_replay,
+        StatusCode::CONFLICT,
+        "Replay must return 409 Conflict; got {st_replay}: {text_replay}"
+    );
+    assert!(j_replay["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("already been used"));
+}
