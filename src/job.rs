@@ -104,6 +104,8 @@ pub struct StageRecord {
     pub status: StageStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_node: Option<String>,
+    #[serde(default)]
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -163,6 +165,41 @@ pub struct QueueSnapshot {
     pub recent_jobs: Vec<JobRecord>,
 }
 
+pub struct InFlightJobGuard {
+    job_store: Option<JobStore>,
+    job_id: String,
+}
+
+impl std::fmt::Debug for InFlightJobGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlightJobGuard")
+            .field("job_id", &self.job_id)
+            .finish()
+    }
+}
+
+impl InFlightJobGuard {
+    pub fn new(job_store: JobStore, job_id: String) -> Self {
+        job_store.mark_job_in_flight(&job_id);
+        Self {
+            job_store: Some(job_store),
+            job_id,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.job_store = None;
+    }
+}
+
+impl Drop for InFlightJobGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.job_store.take() {
+            store.release_in_flight_job(&self.job_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct JobStore {
     inner: Arc<RwLock<VecDeque<JobRecord>>>,
@@ -172,6 +209,7 @@ pub struct JobStore {
     index_file: Option<PathBuf>,
     ha_role: Arc<std::sync::RwLock<crate::config::HaRole>>,
     node_id: String,
+    in_flight_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl JobStore {
@@ -355,6 +393,7 @@ impl JobStore {
             index_file,
             ha_role: Arc::new(std::sync::RwLock::new(initial_role)),
             node_id,
+            in_flight_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -374,6 +413,30 @@ impl JobStore {
     #[must_use]
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    pub fn is_job_in_flight(&self, job_id: &str) -> bool {
+        let set = self
+            .in_flight_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.contains(job_id)
+    }
+
+    pub fn mark_job_in_flight(&self, job_id: &str) -> bool {
+        let mut set = self
+            .in_flight_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert(job_id.to_string())
+    }
+
+    pub fn release_in_flight_job(&self, job_id: &str) {
+        let mut set = self
+            .in_flight_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.remove(job_id);
     }
 
     pub fn set_ha_role(&self, role: crate::config::HaRole) {
@@ -449,6 +512,7 @@ impl JobStore {
         let mut recovered_for_db = Vec::new();
         let mut has_queued = false;
         let count;
+        let is_leader = self.is_leader();
 
         {
             let mut store = self.inner.write().await;
@@ -460,9 +524,7 @@ impl JobStore {
                 match by_id.get(&rec.job.id) {
                     Some(local)
                         if !recover_running
-                            && (local.updated_at > rec.updated_at
-                                || (matches!(local.status, JobStatus::Running { .. })
-                                    && matches!(rec.status, JobStatus::Queued))) =>
+                            && should_preserve_local_record(is_leader, local, &rec) =>
                     {
                         // Preserve fresher local in-flight state on the active leader.
                     }
@@ -487,6 +549,7 @@ impl JobStore {
                     if matches!(rec.status, JobStatus::Running { .. }) {
                         rec.status = JobStatus::Queued;
                         rec.updated_at = now;
+                        self.release_in_flight_job(&rec.job.id);
                         for stage in &mut rec.stages {
                             if matches!(
                                 stage.status,
@@ -794,75 +857,95 @@ impl JobStore {
         if !self.is_leader() {
             return None;
         }
-        let claimed = {
+        let (claimed, healed) = {
             let mut store = self.inner.write().await;
             let now = Utc::now();
+
+            let mut healed = Vec::new();
+            for r in store.iter_mut() {
+                if matches!(r.status, JobStatus::Queued)
+                    && r.stages.iter().any(|s| {
+                        matches!(
+                            s.status,
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                        )
+                    })
+                {
+                    r.status = JobStatus::Running { started_at: now };
+                    r.updated_at = now;
+                    healed.push(r.clone());
+                }
+            }
 
             let mut running_count = 0;
             let mut running_repos = std::collections::HashSet::new();
 
             for r in store.iter() {
-                if matches!(r.status, JobStatus::Running { .. }) {
+                if matches!(r.status, JobStatus::Running { .. })
+                    || r.stages.iter().any(|s| {
+                        matches!(
+                            s.status,
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                        )
+                    })
+                {
                     running_count += 1;
                     running_repos.insert(r.job.repo_name.clone());
                 }
             }
 
             if running_count >= max_concurrent {
-                return None;
-            }
+                (None, healed)
+            } else {
+                let active_unleased_job_ids: std::collections::HashSet<String> = store
+                    .iter()
+                    .filter(|r| {
+                        matches!(r.status, JobStatus::Running { .. })
+                            && !r.stages.iter().any(|s| {
+                                matches!(
+                                    s.status,
+                                    StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                                )
+                            })
+                    })
+                    .map(|r| r.job.id.clone())
+                    .collect();
 
-            let mut found = None;
-            for record in store.iter_mut().rev() {
-                if !matches!(record.status, JobStatus::Queued)
-                    || running_repos.contains(&record.job.repo_name)
-                {
-                    continue;
-                }
-
-                if let Some(cluster_reg) = cluster {
-                    let can_run = if record.stages.is_empty() {
-                        cluster_reg.has_any_available_slot().await
-                    } else {
-                        let mut any_ready_can_lease = false;
-                        for stage in &record.stages {
-                            if matches!(stage.status, StageStatus::Pending) {
-                                let deps_satisfied = stage.depends_on.iter().all(|dep_id| {
-                                    record.stages.iter().any(|s| {
-                                        s.id == *dep_id
-                                            && matches!(
-                                                s.status,
-                                                StageStatus::Completed { exit_code: 0, .. }
-                                            )
-                                    })
-                                });
-                                if deps_satisfied
-                                    && cluster_reg
-                                        .has_available_slot_for(
-                                            &stage.tags,
-                                            stage.toolchain.as_deref(),
-                                        )
-                                        .await
-                                {
-                                    any_ready_can_lease = true;
-                                    break;
-                                }
-                            }
-                        }
-                        any_ready_can_lease
-                    };
-                    if !can_run {
+                let mut found = None;
+                for record in store.iter_mut().rev() {
+                    if !matches!(record.status, JobStatus::Queued)
+                        || running_repos.contains(&record.job.repo_name)
+                        || self.is_job_in_flight(&record.job.id)
+                    {
                         continue;
                     }
-                }
 
-                record.status = JobStatus::Running { started_at: now };
-                record.updated_at = now;
-                found = Some((record.job.clone(), record.clone()));
-                break;
+                    if let Some(cluster_reg) = cluster {
+                        let can_run = cluster_reg
+                            .sync_and_try_reserve_for_claim(
+                                &active_unleased_job_ids,
+                                &record.job.id,
+                                &record.stages,
+                            )
+                            .await;
+                        if !can_run {
+                            continue;
+                        }
+                    }
+
+                    record.status = JobStatus::Running { started_at: now };
+                    record.updated_at = now;
+                    self.mark_job_in_flight(&record.job.id);
+                    found = Some((record.job.clone(), record.clone()));
+                    break;
+                }
+                (found, healed)
             }
-            found
         };
+
+        for h in healed {
+            self.db.upsert_record(&h);
+        }
 
         if let Some((job, record)) = claimed {
             self.db.upsert_record(&record);
@@ -890,7 +973,10 @@ impl JobStore {
                         StageStatus::Assigned { .. } | StageStatus::Running { .. }
                     )
                 });
-                if matches!(record.status, JobStatus::Running { .. }) && !has_active_stages {
+                if has_active_stages {
+                    return false;
+                }
+                if matches!(record.status, JobStatus::Running { .. }) {
                     record.status = JobStatus::Queued;
                     record.updated_at = now;
                     Some(record.clone())
@@ -903,6 +989,7 @@ impl JobStore {
         };
 
         if let Some(record) = requeued_record {
+            self.release_in_flight_job(job_id);
             self.db.upsert_record(&record);
             self.persist().await;
             self.notify.notify_waiters();
@@ -1036,6 +1123,15 @@ impl JobStore {
     }
 
     pub async fn update_status(&self, job_id: &str, status: JobStatus) {
+        if matches!(
+            status,
+            JobStatus::Queued
+                | JobStatus::Completed { .. }
+                | JobStatus::Failed { .. }
+                | JobStatus::Skipped { .. }
+        ) {
+            self.release_in_flight_job(job_id);
+        }
         let updated_in_store = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
@@ -1086,6 +1182,15 @@ impl JobStore {
                         stage.assigned_node = Some(node_id.clone());
                     }
                     stage.status = status;
+                    if matches!(
+                        stage.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    ) && matches!(record.status, JobStatus::Queued)
+                    {
+                        record.status = JobStatus::Running {
+                            started_at: Utc::now(),
+                        };
+                    }
                     record.updated_at = Utc::now();
                 }
                 Some(record.clone())
@@ -1222,6 +1327,7 @@ impl JobStore {
         };
 
         if let Ok(ref record) = res {
+            self.release_in_flight_job(job_id);
             self.db.upsert_record(record);
             self.persist().await;
             self.notify.notify_waiters();
@@ -1272,6 +1378,7 @@ impl JobStore {
         };
 
         if let Ok(ref record) = res {
+            self.release_in_flight_job(job_id);
             self.db.upsert_record(record);
             self.persist().await;
             self.notify.notify_waiters();
@@ -1290,16 +1397,21 @@ impl JobStore {
         let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                let now = Utc::now();
                 for stage in record.stages.iter_mut() {
                     if stage.id == stage_id {
                         stage.status = StageStatus::Running {
                             node_id: node_id.to_string(),
-                            started_at: Utc::now(),
+                            started_at: now,
                             pid: Some(pid),
                         };
                         stage.assigned_node = Some(node_id.to_string());
                         break;
                     }
+                }
+                record.updated_at = now;
+                if matches!(record.status, JobStatus::Queued) {
+                    record.status = JobStatus::Running { started_at: now };
                 }
                 Some(record.clone())
             } else {
@@ -1308,6 +1420,8 @@ impl JobStore {
         };
         if let Some(record) = updated {
             self.db.upsert_record(&record);
+            self.persist().await;
+            self.notify.notify_waiters();
         }
     }
 
@@ -1444,6 +1558,69 @@ pub fn extract_submodule_job(parent_record: &JobRecord, submodule: &str) -> Opti
 pub fn normalize_ref(r: &str) -> &str {
     let trimmed = r.trim().trim_start_matches('/');
     trimmed.strip_prefix("refs/heads/").unwrap_or(trimmed)
+}
+
+/// Determines whether an in-memory `local` [`JobRecord`] should be preserved over
+/// a snapshot record `rec` loaded from [`ControllerStorage`] during standby or leader rehydration (`#107`).
+#[must_use]
+pub(crate) fn should_preserve_local_record(
+    is_leader: bool,
+    local: &JobRecord,
+    rec: &JobRecord,
+) -> bool {
+    if is_leader {
+        // On the active leader, any record already in self.inner is authoritative
+        // for its own status and stage progression, so never overwrite an existing
+        // local record in by_id unless rec.updated_at > local.updated_at
+        // AND matches!(local.status, JobStatus::Queued) AND local.stages.is_empty().
+        let allow_remote_overwrite = rec.updated_at > local.updated_at
+            && matches!(local.status, JobStatus::Queued)
+            && local.stages.is_empty();
+        if !allow_remote_overwrite {
+            return true;
+        }
+    }
+
+    if local.updated_at >= rec.updated_at {
+        return true;
+    }
+
+    if matches!(local.status, JobStatus::Running { .. }) && matches!(rec.status, JobStatus::Queued)
+    {
+        return true;
+    }
+
+    let local_has_active_stage = local.stages.iter().any(|s| {
+        matches!(
+            s.status,
+            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+        )
+    });
+    let rec_has_active_stage = rec.stages.iter().any(|s| {
+        matches!(
+            s.status,
+            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+        )
+    });
+    if local_has_active_stage && !rec_has_active_stage {
+        return true;
+    }
+
+    let local_completed = local
+        .stages
+        .iter()
+        .filter(|s| matches!(s.status, StageStatus::Completed { .. }))
+        .count();
+    let rec_completed = rec
+        .stages
+        .iter()
+        .filter(|s| matches!(s.status, StageStatus::Completed { .. }))
+        .count();
+    if local_completed > rec_completed {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -2093,6 +2270,7 @@ mod tests {
                     exit_code: 0,
                 },
                 assigned_node: Some("node-1".to_string()),
+                exclusive: false,
             },
             StageRecord {
                 id: "test".to_string(),
@@ -2105,6 +2283,7 @@ mod tests {
                     error: "test failed".to_string(),
                 },
                 assigned_node: Some("node-2".to_string()),
+                exclusive: false,
             },
             StageRecord {
                 id: "bench".to_string(),
@@ -2115,6 +2294,7 @@ mod tests {
                 depends_on: vec!["test".to_string()],
                 status: StageStatus::Pending,
                 assigned_node: None,
+                exclusive: false,
             },
         ];
         store.set_stages(&job.id, stages).await;
@@ -2252,6 +2432,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
                 assigned_node: Some("worker-riscv64".to_string()),
+                exclusive: false,
             },
             StageRecord {
                 id: "stage-2".to_string(),
@@ -2265,6 +2446,7 @@ mod tests {
                     started_at: Utc::now(),
                 },
                 assigned_node: Some("storage-node".to_string()),
+                exclusive: false,
             },
         ];
         store.set_stages(&job.id, stages).await;
@@ -2549,6 +2731,7 @@ mod tests {
                             exit_code: 0,
                         },
                         assigned_node: Some("node-a".to_string()),
+                        exclusive: false,
                     },
                     StageRecord {
                         id: "test-check".to_string(),
@@ -2563,6 +2746,7 @@ mod tests {
                             pid: Some(1234),
                         },
                         assigned_node: Some("worker-riscv64".to_string()),
+                        exclusive: true,
                     },
                 ],
             )
@@ -2591,6 +2775,7 @@ mod tests {
                             exit_code: 0,
                         },
                         assigned_node: Some("node-a".to_string()),
+                        exclusive: false,
                     },
                     StageRecord {
                         id: "test-check".to_string(),
@@ -2601,6 +2786,7 @@ mod tests {
                         depends_on: vec!["fmt-check".to_string()],
                         status: StageStatus::Pending,
                         assigned_node: None,
+                        exclusive: true,
                     },
                 ],
             )
@@ -2640,5 +2826,935 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c2_resumed.id, "job-2");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_no_overclaiming_when_multiple_queued_jobs_await_single_worker_slot() {
+        use action_runner_ipc::WorkerRegistration;
+        use tokio::sync::mpsc;
+
+        let store = JobStore::new(10, None);
+        let cluster = crate::cluster::ClusterRegistry::new();
+
+        let (tx, _rx) = mpsc::channel(8);
+        cluster
+            .register(
+                WorkerRegistration {
+                    node_id: "worker-riscv64".to_string(),
+                    arch: "riscv64".to_string(),
+                    tags: vec!["k3".to_string()],
+                    max_slots: 1,
+                    ram_total_mb: 32768,
+                    btrfs_enabled: false,
+                    toolchains: vec!["system".to_string()],
+                },
+                tx,
+            )
+            .await;
+
+        let t0 = Utc::now() - chrono::Duration::seconds(300);
+        for idx in 1..=3 {
+            let job = Job {
+                id: format!("job-{}", idx),
+                event_type: "push".to_string(),
+                repo_name: format!("LMA1980/repo-{}", idx),
+                clone_url: String::new(),
+                commit_sha: format!("sha{}", idx),
+                ref_name: "refs/heads/main".to_string(),
+                sender: "LMA1980".to_string(),
+                queued_at: t0 + chrono::Duration::seconds((idx as i64) * 10),
+            };
+            store
+                .enqueue_job(job, PathBuf::from(format!("logs/{}.log", idx)))
+                .await;
+
+            store
+                .set_stages(
+                    &format!("job-{}", idx),
+                    vec![
+                        StageRecord {
+                            id: "fmt-check".to_string(),
+                            name: "Format".to_string(),
+                            tags: vec!["fmt".to_string()],
+                            threads: 2,
+                            toolchain: None,
+                            depends_on: vec![],
+                            status: StageStatus::Completed {
+                                duration_secs: 1,
+                                exit_code: 0,
+                            },
+                            assigned_node: Some("node-x".to_string()),
+                            exclusive: false,
+                        },
+                        StageRecord {
+                            id: "test-check".to_string(),
+                            name: "Test".to_string(),
+                            tags: vec!["k3".to_string()],
+                            threads: 4,
+                            toolchain: None,
+                            depends_on: vec!["fmt-check".to_string()],
+                            status: StageStatus::Pending,
+                            assigned_node: None,
+                            exclusive: true,
+                        },
+                    ],
+                )
+                .await;
+        }
+
+        // Before execute_job calls lease_slot, calling claim_next_queued_job_for_cluster in a loop:
+        let c1 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await;
+        assert!(c1.is_some());
+        assert_eq!(c1.unwrap().id, "job-1");
+
+        // Second call must return None because worker-riscv64 has a pending exclusive claim for job-1
+        let c2 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await;
+        assert!(
+            c2.is_none(),
+            "Must not over-claim slot for job-2 while job-1 has pending claim"
+        );
+
+        // Third call must also return None
+        let c3 = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await;
+        assert!(c3.is_none());
+
+        // Verify job-2 and job-3 remain Queued
+        assert_eq!(store.job_queue_position("job-2").await, Some(1));
+        assert_eq!(store.job_queue_position("job-3").await, Some(2));
+        let j2 = store.get_job("job-2").await.unwrap();
+        assert!(matches!(j2.status, JobStatus::Queued));
+        let j3 = store.get_job("job-3").await.unwrap();
+        assert!(matches!(j3.status, JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_exclusive_stage_blocks_claim_until_worker_drains() {
+        use action_runner_ipc::WorkerRegistration;
+        use tokio::sync::mpsc;
+
+        let store = JobStore::new(10, None);
+        let cluster = crate::cluster::ClusterRegistry::new();
+
+        let (tx, _rx) = mpsc::channel(8);
+        cluster
+            .register(
+                WorkerRegistration {
+                    node_id: "worker-dual".to_string(),
+                    arch: "x86_64".to_string(),
+                    tags: vec!["ci".to_string()],
+                    max_slots: 2,
+                    ram_total_mb: 32768,
+                    btrfs_enabled: false,
+                    toolchains: vec!["system".to_string()],
+                },
+                tx,
+            )
+            .await;
+
+        // Lease 1 shared stage on worker-dual (leased_stages.len() == 1)
+        let lease = cluster
+            .lease_slot(
+                "job-shared",
+                "shared-stage",
+                &["ci".to_string()],
+                None,
+                false,
+            )
+            .await;
+        assert!(lease.is_some());
+        assert_eq!(lease.unwrap().0, "worker-dual");
+
+        // Enqueue a job whose only ready stage has exclusive: true
+        let job = Job {
+            id: "job-exclusive".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/exclusive-repo".to_string(),
+            clone_url: String::new(),
+            commit_sha: "abcd".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        store
+            .enqueue_job(job, PathBuf::from("logs/exclusive.log"))
+            .await;
+
+        store
+            .set_stages(
+                "job-exclusive",
+                vec![StageRecord {
+                    id: "exclusive-stage".to_string(),
+                    name: "Exclusive Stage".to_string(),
+                    tags: vec!["ci".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: true,
+                }],
+            )
+            .await;
+
+        // Calling claim_next_queued_job_for_cluster must return None because worker has 1 active leased stage
+        let claim_attempt = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await;
+        assert!(
+            claim_attempt.is_none(),
+            "Exclusive stage must not be claimed until worker drains all active leases"
+        );
+
+        // Worker drains: release the active shared stage slot
+        cluster
+            .release_stage_slot("worker-dual", "job-shared", "shared-stage")
+            .await;
+
+        // Now job-exclusive can be claimed!
+        let claim_success = store
+            .claim_next_queued_job_for_cluster(3, Some(&cluster))
+            .await;
+        assert!(claim_success.is_some());
+        assert_eq!(claim_success.unwrap().id, "job-exclusive");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_update_stage_running_bumps_updated_at_and_promotes_queued() {
+        let store = JobStore::new(10, None);
+        let job = Job {
+            id: "job-stage-run-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/ActionRunner-controller.git".to_string(),
+            commit_sha: "11112222333344445555".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(30),
+        };
+        store
+            .enqueue_job(job.clone(), PathBuf::from("logs/test.log"))
+            .await;
+
+        let stage = StageRecord {
+            id: "stage-build".to_string(),
+            name: "Build".to_string(),
+            tags: vec!["k3".to_string()],
+            threads: 4,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+        };
+        store.set_stages(&job.id, vec![stage]).await;
+
+        let initial_rec = store.get_job(&job.id).await.expect("job exists");
+        assert_eq!(initial_rec.status, JobStatus::Queued);
+        let initial_updated_at = initial_rec.updated_at;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        store
+            .update_stage_running(&job.id, "stage-build", "node-worker-1", 4321)
+            .await;
+
+        let updated_rec = store.get_job(&job.id).await.expect("job exists");
+        assert!(
+            updated_rec.updated_at > initial_updated_at,
+            "record.updated_at must be bumped when stage transitions to running"
+        );
+        assert!(
+            matches!(updated_rec.status, JobStatus::Running { .. }),
+            "Queued job must be promoted to Running when stage transitions to running"
+        );
+        match &updated_rec.stages[0].status {
+            StageStatus::Running {
+                node_id,
+                pid,
+                started_at,
+            } => {
+                assert_eq!(node_id, "node-worker-1");
+                assert_eq!(*pid, Some(4321));
+                assert!(*started_at >= initial_updated_at);
+            }
+            other => panic!("expected StageStatus::Running, got {:?}", other),
+        }
+        assert_eq!(
+            updated_rec.stages[0].assigned_node.as_deref(),
+            Some("node-worker-1")
+        );
+
+        let db_rec = store.storage().get_job(&job.id).expect("in storage");
+        assert!(matches!(db_rec.status, JobStatus::Running { .. }));
+        assert_eq!(db_rec.updated_at, updated_rec.updated_at);
+        match &db_rec.stages[0].status {
+            StageStatus::Running { pid, node_id, .. } => {
+                assert_eq!(node_id, "node-worker-1");
+                assert_eq!(*pid, Some(4321));
+            }
+            other => panic!("expected StageStatus::Running in db, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_state() {
+        let store = JobStore::new(10, None);
+        assert!(store.is_leader());
+
+        // 1. Enqueue job-1 and transition its stage to running with PID
+        let job1 = Job {
+            id: "job-leader-inflight-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/ActionRunner-controller".to_string(),
+            clone_url: "https://github.com/LMA1980/ActionRunner-controller.git".to_string(),
+            commit_sha: "aaaa1111bbbb2222cccc".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(60),
+        };
+        store
+            .enqueue_job(job1.clone(), PathBuf::from("logs/job1.log"))
+            .await;
+        store
+            .set_stages(
+                "job-leader-inflight-1",
+                vec![StageRecord {
+                    id: "stage-compile".to_string(),
+                    name: "Compile".to_string(),
+                    tags: vec!["k3".to_string()],
+                    threads: 4,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                }],
+            )
+            .await;
+        store
+            .update_stage_running("job-leader-inflight-1", "stage-compile", "worker-a", 9999)
+            .await;
+
+        let j1_local = store.get_job("job-leader-inflight-1").await.unwrap();
+        assert!(matches!(j1_local.status, JobStatus::Running { .. }));
+        assert_eq!(
+            j1_local.stages[0].status,
+            StageStatus::Running {
+                node_id: "worker-a".to_string(),
+                started_at: match j1_local.stages[0].status {
+                    StageStatus::Running { started_at, .. } => started_at,
+                    _ => unreachable!(),
+                },
+                pid: Some(9999),
+            }
+        );
+
+        // 2. Enqueue job-2 and requeue it preserving priority after stage completion
+        let job2 = Job {
+            id: "job-leader-requeued-2".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/MuObserve".to_string(),
+            clone_url: "https://github.com/LMA1980/MuObserve.git".to_string(),
+            commit_sha: "dddd3333eeee4444ffff".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now() - chrono::Duration::seconds(45),
+        };
+        store
+            .enqueue_job(job2.clone(), PathBuf::from("logs/job2.log"))
+            .await;
+        let claimed2 = store.claim_next_queued_job(4).await.expect("claim job2");
+        assert_eq!(claimed2.id, "job-leader-requeued-2");
+        store
+            .set_stages(
+                "job-leader-requeued-2",
+                vec![
+                    StageRecord {
+                        id: "stage-lint".to_string(),
+                        name: "Lint".to_string(),
+                        tags: vec!["k3".to_string()],
+                        threads: 2,
+                        toolchain: None,
+                        depends_on: vec![],
+                        status: StageStatus::Completed {
+                            duration_secs: 5,
+                            exit_code: 0,
+                        },
+                        assigned_node: Some("worker-b".to_string()),
+                        exclusive: false,
+                    },
+                    StageRecord {
+                        id: "stage-bench".to_string(),
+                        name: "Bench".to_string(),
+                        tags: vec!["k3".to_string()],
+                        threads: 6,
+                        toolchain: None,
+                        depends_on: vec!["stage-lint".to_string()],
+                        status: StageStatus::Pending,
+                        assigned_node: None,
+                        exclusive: false,
+                    },
+                ],
+            )
+            .await;
+        assert!(
+            store
+                .requeue_preserving_priority("job-leader-requeued-2")
+                .await
+        );
+
+        // 3. Simulate stale/concurrent snapshot in ControllerStorage:
+        //    - job-1 in storage has EQUAL updated_at but older StageStatus::Pending (no PID) and JobStatus::Queued
+        //    - job-2 in storage has fewer completed stages and older status
+        let stale_j1 = JobRecord {
+            job: j1_local.job.clone(),
+            log_file: j1_local.log_file.clone(),
+            status: JobStatus::Queued,
+            updated_at: j1_local.updated_at, // EQUAL timestamp (Issue #107 core reproduction)
+            metrics: None,
+            stages: vec![StageRecord {
+                id: "stage-compile".to_string(),
+                name: "Compile".to_string(),
+                tags: vec!["k3".to_string()],
+                threads: 4,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Pending, // stale: not running, no PID
+                assigned_node: None,
+                exclusive: false,
+            }],
+        };
+        store.storage().upsert_record(&stale_j1);
+
+        let stale_j2 = JobRecord {
+            job: job2.clone(),
+            log_file: PathBuf::from("logs/job2.log"),
+            status: JobStatus::Running {
+                started_at: Utc::now() - chrono::Duration::seconds(40),
+            },
+            updated_at: Utc::now() - chrono::Duration::seconds(30),
+            metrics: None,
+            stages: vec![StageRecord {
+                id: "stage-lint".to_string(),
+                name: "Lint".to_string(),
+                tags: vec!["k3".to_string()],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Pending, // stale: not completed
+                assigned_node: None,
+                exclusive: false,
+            }],
+        };
+        store.storage().upsert_record(&stale_j2);
+
+        // 4. Rehydrate with recover_running = false (leader background or periodic sync)
+        let count = store.rehydrate_from_storage(false).await;
+        assert!(count >= 2);
+
+        // 5. Verify the leader's in-flight and requeued states were NOT clobbered!
+        let j1_after = store.get_job("job-leader-inflight-1").await.unwrap();
+        assert!(
+            matches!(j1_after.status, JobStatus::Running { .. }),
+            "Leader in-flight running job must not be clobbered by stale storage record"
+        );
+        match &j1_after.stages[0].status {
+            StageStatus::Running { node_id, pid, .. } => {
+                assert_eq!(node_id, "worker-a");
+                assert_eq!(
+                    *pid,
+                    Some(9999),
+                    "Leader stage PID must be preserved against equal-timestamp stale storage"
+                );
+            }
+            other => panic!("expected stage to remain Running, got {:?}", other),
+        }
+
+        let j2_after = store.get_job("job-leader-requeued-2").await.unwrap();
+        assert_eq!(
+            j2_after.status,
+            JobStatus::Queued,
+            "Leader requeued job must not be clobbered by stale storage status"
+        );
+        assert_eq!(
+            j2_after.stages.len(),
+            2,
+            "Leader job stages must be preserved"
+        );
+        assert!(
+            matches!(
+                j2_after.stages[0].status,
+                StageStatus::Completed { exit_code: 0, .. }
+            ),
+            "Completed stages must be preserved on leader"
+        );
+    }
+
+    #[test]
+    fn test_should_preserve_local_record_rules() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(10);
+
+        let make_rec =
+            |id: &str, status: JobStatus, updated_at, stages: Vec<StageRecord>| JobRecord {
+                job: Job {
+                    id: id.to_string(),
+                    event_type: "push".to_string(),
+                    repo_name: "LMA1980/test".to_string(),
+                    clone_url: "https://github.com/LMA1980/test.git".to_string(),
+                    commit_sha: "1234".to_string(),
+                    ref_name: "refs/heads/main".to_string(),
+                    sender: "LMA1980".to_string(),
+                    queued_at: t0,
+                },
+                log_file: PathBuf::from("logs/test.log"),
+                status,
+                updated_at,
+                metrics: None,
+                stages,
+            };
+
+        // 1. Leader preserves Running job even if remote is newer
+        let local_running = make_rec("j1", JobStatus::Running { started_at: t0 }, t0, vec![]);
+        let remote_queued_newer = make_rec("j1", JobStatus::Queued, t1, vec![]);
+        assert!(should_preserve_local_record(
+            true,
+            &local_running,
+            &remote_queued_newer
+        ));
+
+        // 2. Leader preserves Queued job with stages even if remote is newer
+        let stage_pending = StageRecord {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            tags: vec![],
+            threads: 1,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+        };
+        let local_queued_with_stages =
+            make_rec("j2", JobStatus::Queued, t0, vec![stage_pending.clone()]);
+        let remote_queued_newer_2 = make_rec("j2", JobStatus::Queued, t1, vec![]);
+        assert!(should_preserve_local_record(
+            true,
+            &local_queued_with_stages,
+            &remote_queued_newer_2
+        ));
+
+        // 3. Leader allows remote overwrite ONLY if remote is newer AND local is Queued AND local has NO stages
+        let local_queued_empty = make_rec("j3", JobStatus::Queued, t0, vec![]);
+        let remote_newer_empty = make_rec("j3", JobStatus::Queued, t1, vec![]);
+        assert!(!should_preserve_local_record(
+            true,
+            &local_queued_empty,
+            &remote_newer_empty
+        ));
+
+        // 4. Standby preserves local when updated_at is equal (Issue #107)
+        let local_standby = make_rec("j4", JobStatus::Queued, t0, vec![]);
+        let remote_same_time = make_rec("j4", JobStatus::Queued, t0, vec![]);
+        assert!(should_preserve_local_record(
+            false,
+            &local_standby,
+            &remote_same_time
+        ));
+
+        // 5. Standby preserves local when local is Running and remote is Queued
+        let local_standby_running =
+            make_rec("j5", JobStatus::Running { started_at: t0 }, t0, vec![]);
+        let remote_queued = make_rec("j5", JobStatus::Queued, t0, vec![]);
+        assert!(should_preserve_local_record(
+            false,
+            &local_standby_running,
+            &remote_queued
+        ));
+
+        // 6. Standby preserves local when local has active stage and remote does not
+        let stage_running = StageRecord {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            tags: vec![],
+            threads: 1,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Running {
+                node_id: "worker-1".to_string(),
+                started_at: t0,
+                pid: Some(123),
+            },
+            assigned_node: Some("worker-1".to_string()),
+            exclusive: false,
+        };
+        let local_active_stage = make_rec(
+            "j6",
+            JobStatus::Running { started_at: t0 },
+            t0,
+            vec![stage_running],
+        );
+        let remote_pending_stage = make_rec(
+            "j6",
+            JobStatus::Running { started_at: t0 },
+            t1,
+            vec![stage_pending],
+        );
+        assert!(should_preserve_local_record(
+            false,
+            &local_active_stage,
+            &remote_pending_stage
+        ));
+
+        // 7. Standby preserves local when local has more completed stages
+        let stage_completed = StageRecord {
+            id: "s0".to_string(),
+            name: "S0".to_string(),
+            tags: vec![],
+            threads: 1,
+            toolchain: None,
+            depends_on: vec![],
+            status: StageStatus::Completed {
+                duration_secs: 2,
+                exit_code: 0,
+            },
+            assigned_node: Some("worker-1".to_string()),
+            exclusive: false,
+        };
+        let local_completed_more = make_rec(
+            "j7",
+            JobStatus::Running { started_at: t0 },
+            t0,
+            vec![stage_completed],
+        );
+        let remote_completed_fewer =
+            make_rec("j7", JobStatus::Running { started_at: t0 }, t1, vec![]);
+        assert!(should_preserve_local_record(
+            false,
+            &local_completed_more,
+            &remote_completed_fewer
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_job_with_active_stages_cannot_be_requeued_and_counted_as_running() {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+
+        // 1. Enqueue job-1 and claim it
+        let job1 = Job {
+            id: "job-active-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: "https://github.com/LMA1980/test-repo.git".to_string(),
+            commit_sha: "sha1".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+        };
+        store.enqueue_job(job1, PathBuf::from("/tmp/j1.log")).await;
+
+        let claimed1 = store.claim_next_queued_job(2).await;
+        assert_eq!(claimed1.map(|j| j.id), Some("job-active-1".to_string()));
+
+        // Assign a stage
+        store
+            .set_stages(
+                "job-active-1",
+                vec![StageRecord {
+                    id: "stage-1".to_string(),
+                    name: "Build".to_string(),
+                    tags: vec!["ci".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Assigned {
+                        node_id: "node-1".to_string(),
+                        started_at: Utc::now(),
+                    },
+                    assigned_node: Some("node-1".to_string()),
+                    exclusive: false,
+                }],
+            )
+            .await;
+
+        // Verify requeue_preserving_priority returns false because stage is Assigned
+        assert!(
+            !store.requeue_preserving_priority("job-active-1").await,
+            "Requeue must be refused while stage is Assigned"
+        );
+        let rec1 = store.get_job("job-active-1").await.unwrap();
+        assert!(matches!(rec1.status, JobStatus::Running { .. }));
+
+        // Now change stage to Running
+        store
+            .update_stage_running("job-active-1", "stage-1", "node-1", 42)
+            .await;
+        assert!(
+            !store.requeue_preserving_priority("job-active-1").await,
+            "Requeue must be refused while stage is Running"
+        );
+
+        // 2. Test self-healing and running_repos counting:
+        // Even if job status was somehow Queued while stage is Running,
+        // claim_next_queued_job_for_cluster heals it in-place and counts it in running_repos/running_count.
+        // Artificially reset job status to Queued while keeping stage Running:
+        {
+            let mut inner = store.inner.write().await;
+            for r in inner.iter_mut() {
+                if r.job.id == "job-active-1" {
+                    r.status = JobStatus::Queued;
+                }
+            }
+        }
+
+        // Add a second job for the same repository
+        let job2 = Job {
+            id: "job-active-2".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-repo".to_string(),
+            clone_url: "https://github.com/LMA1980/test-repo.git".to_string(),
+            commit_sha: "sha2".to_string(),
+            ref_name: "refs/heads/feat".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(5),
+        };
+        store.enqueue_job(job2, PathBuf::from("/tmp/j2.log")).await;
+
+        // Try to claim with max_concurrent = 2:
+        // job-active-1 will be healed to Running, and its repo counted in running_repos.
+        // Therefore, job-active-2 (same repo) must NOT be claimed!
+        let claimed2 = store.claim_next_queued_job(2).await;
+        assert!(
+            claimed2.is_none(),
+            "Same repo candidate must be blocked because active-stages job counts toward running_repos"
+        );
+
+        // Verify job-active-1 was healed in-place to Running
+        let healed_rec1 = store.get_job("job-active-1").await.unwrap();
+        assert!(matches!(healed_rec1.status, JobStatus::Running { .. }));
+
+        // Also test max_concurrent constraint when an active-stages job is present:
+        let job3 = Job {
+            id: "job-diff-repo".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/other-repo".to_string(),
+            clone_url: "https://github.com/LMA1980/other-repo.git".to_string(),
+            commit_sha: "sha3".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now + chrono::Duration::seconds(10),
+        };
+        store.enqueue_job(job3, PathBuf::from("/tmp/j3.log")).await;
+
+        // With max_concurrent = 1, running_count is 1 (job-active-1), so job-diff-repo cannot be claimed
+        assert!(store.claim_next_queued_job(1).await.is_none());
+        // With max_concurrent = 2, job-diff-repo can be claimed
+        let claimed3 = store.claim_next_queued_job(2).await;
+        assert_eq!(claimed3.map(|j| j.id), Some("job-diff-repo".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_update_stage_promotes_queued_job_to_running() {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+
+        // 1. Test update_stage_status with Assigned
+        let job1 = Job {
+            id: "job-promote-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-promote-1".to_string(),
+            clone_url: "https://github.com/LMA1980/test-promote-1.git".to_string(),
+            commit_sha: "sha1".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+        };
+        store.enqueue_job(job1, PathBuf::from("/tmp/p1.log")).await;
+        store
+            .set_stages(
+                "job-promote-1",
+                vec![StageRecord {
+                    id: "stage-1".to_string(),
+                    name: "Build".to_string(),
+                    tags: vec!["ci".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                }],
+            )
+            .await;
+
+        // Verify status is currently Queued
+        let rec1 = store.get_job("job-promote-1").await.unwrap();
+        assert!(matches!(rec1.status, JobStatus::Queued));
+
+        // Update stage status to Assigned
+        store
+            .update_stage_status(
+                "job-promote-1",
+                "stage-1",
+                StageStatus::Assigned {
+                    node_id: "worker-1".to_string(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await;
+
+        // Verify job status is automatically promoted to Running
+        let promoted1 = store.get_job("job-promote-1").await.unwrap();
+        assert!(matches!(promoted1.status, JobStatus::Running { .. }));
+
+        // 2. Test update_stage_running
+        let job2 = Job {
+            id: "job-promote-2".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/test-promote-2".to_string(),
+            clone_url: "https://github.com/LMA1980/test-promote-2.git".to_string(),
+            commit_sha: "sha2".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+        };
+        store.enqueue_job(job2, PathBuf::from("/tmp/p2.log")).await;
+        store
+            .set_stages(
+                "job-promote-2",
+                vec![StageRecord {
+                    id: "stage-2".to_string(),
+                    name: "Test".to_string(),
+                    tags: vec!["ci".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Pending,
+                    assigned_node: None,
+                    exclusive: false,
+                }],
+            )
+            .await;
+
+        let rec2 = store.get_job("job-promote-2").await.unwrap();
+        assert!(matches!(rec2.status, JobStatus::Queued));
+
+        // Update stage to Running via update_stage_running
+        store
+            .update_stage_running("job-promote-2", "stage-2", "worker-1", 1234)
+            .await;
+
+        // Verify job status is automatically promoted to Running
+        let promoted2 = store.get_job("job-promote-2").await.unwrap();
+        assert!(matches!(promoted2.status, JobStatus::Running { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_in_flight_jobs_prevents_duplicate_concurrent_claims() {
+        let store = JobStore::new(10, None);
+        let now = Utc::now();
+
+        let job = Job {
+            id: "job-flight-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/in-flight-repo".to_string(),
+            clone_url: "https://github.com/LMA1980/in-flight-repo.git".to_string(),
+            commit_sha: "sha1".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: now,
+        };
+        store.enqueue_job(job, PathBuf::from("/tmp/f1.log")).await;
+
+        // Initially not in flight
+        assert!(!store.is_job_in_flight("job-flight-1"));
+
+        // Claim the job
+        let claimed = store.claim_next_queued_job(1).await;
+        assert_eq!(claimed.map(|j| j.id), Some("job-flight-1".to_string()));
+
+        // Claimed job is now tracked as in-flight
+        assert!(store.is_job_in_flight("job-flight-1"));
+
+        // Even if status is reset to Queued while still marked in-flight:
+        {
+            let mut inner = store.inner.write().await;
+            for r in inner.iter_mut() {
+                if r.job.id == "job-flight-1" {
+                    r.status = JobStatus::Queued;
+                }
+            }
+        }
+
+        // Attempting to claim again while in-flight skips the job
+        let duplicate_claim = store.claim_next_queued_job(5).await;
+        assert!(
+            duplicate_claim.is_none(),
+            "Job in-flight must never be claimed concurrently"
+        );
+
+        // When requeued via requeue_preserving_priority, in_flight status is cleared
+        // (First restore to Running so requeue succeeds)
+        store
+            .update_status(
+                "job-flight-1",
+                JobStatus::Running {
+                    started_at: Utc::now(),
+                },
+            )
+            .await;
+        // Re-mark in flight
+        store.mark_job_in_flight("job-flight-1");
+        assert!(store.is_job_in_flight("job-flight-1"));
+
+        assert!(store.requeue_preserving_priority("job-flight-1").await);
+        assert!(
+            !store.is_job_in_flight("job-flight-1"),
+            "In-flight tracking must be released on requeue"
+        );
+
+        // Now it can be claimed again
+        let reclaimed = store.claim_next_queued_job(1).await;
+        assert_eq!(reclaimed.map(|j| j.id), Some("job-flight-1".to_string()));
+        assert!(store.is_job_in_flight("job-flight-1"));
+
+        // Completing the job releases in-flight tracking
+        store
+            .update_status(
+                "job-flight-1",
+                JobStatus::Completed {
+                    exit_code: 0,
+                    duration_secs: 10,
+                },
+            )
+            .await;
+        assert!(
+            !store.is_job_in_flight("job-flight-1"),
+            "In-flight tracking must be released on completion"
+        );
+
+        // InFlightJobGuard RAII drop test
+        {
+            let _guard = InFlightJobGuard::new(store.clone(), "job-guard-test".to_string());
+            assert!(store.is_job_in_flight("job-guard-test"));
+        }
+        assert!(
+            !store.is_job_in_flight("job-guard-test"),
+            "InFlightJobGuard Drop must release in-flight job"
+        );
     }
 }

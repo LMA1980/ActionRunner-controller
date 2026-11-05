@@ -1051,6 +1051,7 @@ impl CatalogStore {
                         exit_code: 0,
                     },
                     assigned_node: Some(node_id),
+                    exclusive: false,
                 })
             })
             .collect();
