@@ -321,7 +321,16 @@ impl JobStore {
                         if let Ok(mut jobs) = serde_json::from_str::<VecDeque<JobRecord>>(&content)
                         {
                             for rec in jobs.iter_mut() {
-                                if matches!(rec.status, JobStatus::Running { .. }) {
+                                let has_active_stages = rec.stages.iter().any(|s| {
+                                    matches!(
+                                        s.status,
+                                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                                    )
+                                });
+                                if matches!(rec.status, JobStatus::Running { .. })
+                                    || (matches!(rec.status, JobStatus::Queued)
+                                        && has_active_stages)
+                                {
                                     rec.status = JobStatus::Queued;
                                     rec.updated_at = Utc::now();
                                     for stage in rec.stages.iter_mut() {
@@ -359,7 +368,15 @@ impl JobStore {
             let mut has_queued = false;
             let mut recovered_running = Vec::new();
             for rec in initial_jobs.iter_mut() {
-                if matches!(rec.status, JobStatus::Running { .. }) {
+                let has_active_stages = rec.stages.iter().any(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    )
+                });
+                if matches!(rec.status, JobStatus::Running { .. })
+                    || (matches!(rec.status, JobStatus::Queued) && has_active_stages)
+                {
                     rec.status = JobStatus::Queued;
                     rec.updated_at = Utc::now();
                     for stage in rec.stages.iter_mut() {
@@ -520,15 +537,25 @@ impl JobStore {
             for rec in store.iter() {
                 by_id.insert(rec.job.id.clone(), rec.clone());
             }
-            for rec in remote_jobs {
+            for mut rec in remote_jobs {
+                if self.is_job_in_flight(&rec.job.id) && by_id.contains_key(&rec.job.id) {
+                    continue;
+                }
                 match by_id.get(&rec.job.id) {
                     Some(local)
-                        if !recover_running
-                            && should_preserve_local_record(is_leader, local, &rec) =>
+                        if should_preserve_local_record(
+                            !recover_running && is_leader,
+                            local,
+                            &rec,
+                        ) =>
                     {
-                        // Preserve fresher local in-flight state on the active leader.
+                        // Preserve fresher local in-flight state.
                     }
-                    _ => {
+                    Some(local) => {
+                        merge_completed_stages(local, &mut rec);
+                        by_id.insert(rec.job.id.clone(), rec);
+                    }
+                    None => {
                         by_id.insert(rec.job.id.clone(), rec);
                     }
                 }
@@ -546,10 +573,20 @@ impl JobStore {
             if recover_running {
                 let now = Utc::now();
                 for rec in &mut merged {
-                    if matches!(rec.status, JobStatus::Running { .. }) {
+                    if self.is_job_in_flight(&rec.job.id) {
+                        continue;
+                    }
+                    let has_active_stages = rec.stages.iter().any(|s| {
+                        matches!(
+                            s.status,
+                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                        )
+                    });
+                    if matches!(rec.status, JobStatus::Running { .. })
+                        || (matches!(rec.status, JobStatus::Queued) && has_active_stages)
+                    {
                         rec.status = JobStatus::Queued;
                         rec.updated_at = now;
-                        self.release_in_flight_job(&rec.job.id);
                         for stage in &mut rec.stages {
                             if matches!(
                                 stage.status,
@@ -566,6 +603,19 @@ impl JobStore {
                     }
                 }
             } else {
+                let now = Utc::now();
+                for rec in &mut merged {
+                    if matches!(rec.status, JobStatus::Queued) {
+                        if let Some(started_at) = rec.stages.iter().find_map(|s| match s.status {
+                            StageStatus::Assigned { started_at, .. }
+                            | StageStatus::Running { started_at, .. } => Some(started_at),
+                            _ => None,
+                        }) {
+                            rec.status = JobStatus::Running { started_at };
+                            rec.updated_at = now;
+                        }
+                    }
+                }
                 has_queued = merged
                     .iter()
                     .any(|rec| matches!(rec.status, JobStatus::Queued));
@@ -1398,22 +1448,35 @@ impl JobStore {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 let now = Utc::now();
+                let mut stage_updated = false;
                 for stage in record.stages.iter_mut() {
                     if stage.id == stage_id {
-                        stage.status = StageStatus::Running {
-                            node_id: node_id.to_string(),
-                            started_at: now,
-                            pid: Some(pid),
-                        };
-                        stage.assigned_node = Some(node_id.to_string());
+                        if matches!(
+                            stage.status,
+                            StageStatus::Pending
+                                | StageStatus::Assigned { .. }
+                                | StageStatus::Running { .. }
+                        ) {
+                            stage.status = StageStatus::Running {
+                                node_id: node_id.to_string(),
+                                started_at: now,
+                                pid: Some(pid),
+                            };
+                            stage.assigned_node = Some(node_id.to_string());
+                            stage_updated = true;
+                        }
                         break;
                     }
                 }
-                record.updated_at = now;
-                if matches!(record.status, JobStatus::Queued) {
-                    record.status = JobStatus::Running { started_at: now };
+                if stage_updated {
+                    record.updated_at = now;
+                    if matches!(record.status, JobStatus::Queued) {
+                        record.status = JobStatus::Running { started_at: now };
+                    }
+                    Some(record.clone())
+                } else {
+                    None
                 }
-                Some(record.clone())
             } else {
                 None
             }
@@ -1422,6 +1485,39 @@ impl JobStore {
             self.db.upsert_record(&record);
             self.persist().await;
             self.notify.notify_waiters();
+        }
+    }
+
+    pub async fn recover_stage_if_active(&self, job_id: &str, stage_id: &str) -> bool {
+        let updated = {
+            let mut store = self.inner.write().await;
+            if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
+                if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
+                    if matches!(
+                        stage.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    ) {
+                        stage.status = StageStatus::Pending;
+                        stage.assigned_node = None;
+                        record.updated_at = Utc::now();
+                        Some(record.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(record) = updated {
+            self.db.upsert_record(&record);
+            self.persist().await;
+            self.notify.notify_waiters();
+            true
+        } else {
+            false
         }
     }
 
@@ -1558,6 +1654,26 @@ pub fn extract_submodule_job(parent_record: &JobRecord, submodule: &str) -> Opti
 pub fn normalize_ref(r: &str) -> &str {
     let trimmed = r.trim().trim_start_matches('/');
     trimmed.strip_prefix("refs/heads/").unwrap_or(trimmed)
+}
+
+/// Preserves any stages that already reached `StageStatus::Completed { exit_code: 0, .. }`
+/// in `local` when merging a remote snapshot `remote` for the same job execution.
+pub(crate) fn merge_completed_stages(local: &JobRecord, remote: &mut JobRecord) {
+    if local.job.queued_at != remote.job.queued_at {
+        return;
+    }
+    for r_stage in &mut remote.stages {
+        if !matches!(r_stage.status, StageStatus::Completed { exit_code: 0, .. }) {
+            if let Some(l_stage) = local.stages.iter().find(|s| s.id == r_stage.id) {
+                if matches!(l_stage.status, StageStatus::Completed { exit_code: 0, .. }) {
+                    r_stage.status = l_stage.status.clone();
+                    if r_stage.assigned_node.is_none() {
+                        r_stage.assigned_node = l_stage.assigned_node.clone();
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Determines whether an in-memory `local` [`JobRecord`] should be preserved over
