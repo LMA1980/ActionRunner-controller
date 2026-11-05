@@ -48,6 +48,16 @@ pub async fn handle_cluster_tunnel(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // Reject connection if this controller is not the active leader (#104).
+    if !state.job_store.is_leader() {
+        warn!(
+            controller_id = %state.config.node_id,
+            ha_role = %state.job_store.ha_role().as_str(),
+            "Rejecting worker tunnel connection attempt: controller is in Standby"
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, state)))
 }
 
@@ -64,6 +74,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerCommand>(32);
     let mut registered_node_id: Option<String> = None;
     let mut seq = 0u64;
+
+    // Guard against role changes occurring during WebSocket upgrade handshake (#104)
+    if !state.job_store.is_leader() {
+        warn!(
+            controller_id = %state.config.node_id,
+            "Controller transitioned to Standby before worker registration; closing tunnel"
+        );
+        let close_frame = axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::NORMAL,
+            reason: "controller in standby".into(),
+        };
+        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+        return;
+    }
 
     // First message must be WorkerRegistration
     if let Some(Ok(Message::Binary(bin))) = ws_receiver.next().await {
@@ -125,7 +149,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     WorkerCommand::Disconnect => {
-                        let _ = ws_sender.send(Message::Close(None)).await;
+                        let close_frame = axum::extract::ws::CloseFrame {
+                            code: axum::extract::ws::close_code::NORMAL,
+                            reason: "controller demoted to standby".into(),
+                        };
+                        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
                         break;
                     }
                 }
@@ -140,6 +168,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
                 match msg {
                     Message::Ping(payload) => {
+                        if !state.job_store.is_leader() {
+                            warn!(
+                                node = %node_id,
+                                controller_id = %state.config.node_id,
+                                "Evicting worker tunnel on Ping: controller is not Leader"
+                            );
+                            let close_frame = axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::close_code::NORMAL,
+                                reason: "controller demoted to standby".into(),
+                            };
+                            let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+                            break;
+                        }
                         if ws_sender.send(Message::Pong(payload)).await.is_err() {
                             break;
                         }
@@ -149,6 +190,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         if let Ok((hdr, payload)) = IpcHeader::parse(&bin) {
                             match hdr.msg_type {
                                 MSG_TYPE_WORKER_HEARTBEAT => {
+                                    if !state.job_store.is_leader() {
+                                        warn!(
+                                            node = %node_id,
+                                            controller_id = %state.config.node_id,
+                                            "Evicting worker tunnel on Heartbeat: controller is not Leader"
+                                        );
+                                        let close_frame = axum::extract::ws::CloseFrame {
+                                            code: axum::extract::ws::close_code::NORMAL,
+                                            reason: "controller demoted to standby".into(),
+                                        };
+                                        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+                                        break;
+                                    }
                                     if let Ok(hb) = fory.deserialize::<WorkerHeartbeat>(payload) {
                                         state.cluster.heartbeat(hb).await;
                                         // Acknowledge heartbeat at application layer so the worker's

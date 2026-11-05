@@ -666,11 +666,14 @@ impl JobStore {
 
     async fn persist(&self) {
         if let Some(ref path) = self.index_file {
-            let store = self.inner.read().await;
-            if let Some(parent) = path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            if let Ok(json_str) = serde_json::to_string_pretty(&*store) {
+            let json_str = {
+                let store = self.inner.read().await;
+                serde_json::to_string_pretty(&*store).ok()
+            };
+            if let Some(json_str) = json_str {
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 if let Err(e) = tokio::fs::write(path, json_str).await {
                     warn!("Failed to persist jobs_index.json: {}", e);
                 }
@@ -1005,8 +1008,8 @@ impl JobStore {
             }
         };
 
-        for h in healed {
-            self.db.upsert_record(&h);
+        if !healed.is_empty() {
+            self.db.upsert_records_batch(&healed);
         }
 
         if let Some((job, record)) = claimed {
@@ -1346,13 +1349,14 @@ impl JobStore {
     /// of the queue (push_front in the storage deque) with an updated queued_at timestamp.
     /// Fails with an error if the job is currently actively Running.
     pub async fn resume_job(&self, job_id: &str) -> Result<JobRecord, String> {
-        let db_fallback = {
+        let exists_in_store = {
             let store = self.inner.read().await;
-            if store.iter().any(|r| r.job.id == job_id) {
-                None
-            } else {
-                self.db.get_job(job_id)
-            }
+            store.iter().any(|r| r.job.id == job_id)
+        };
+        let db_fallback = if exists_in_store {
+            None
+        } else {
+            self.db.get_job(job_id)
         };
         let res = {
             let mut store = self.inner.write().await;
@@ -1403,13 +1407,14 @@ impl JobStore {
     /// Fully restarts a job by resetting all stages back to Pending.
     /// Resets metrics, moves to the tail of the queue, and rejects if currently running.
     pub async fn restart_job(&self, job_id: &str) -> Result<JobRecord, String> {
-        let db_fallback = {
+        let exists_in_store = {
             let store = self.inner.read().await;
-            if store.iter().any(|r| r.job.id == job_id) {
-                None
-            } else {
-                self.db.get_job(job_id)
-            }
+            store.iter().any(|r| r.job.id == job_id)
+        };
+        let db_fallback = if exists_in_store {
+            None
+        } else {
+            self.db.get_job(job_id)
         };
         let res = {
             let mut store = self.inner.write().await;
