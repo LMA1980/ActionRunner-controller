@@ -355,7 +355,18 @@ impl ClusterRegistry {
                 node_id = %node_id,
                 "Closing worker tunnel on controller demotion to Standby"
             );
-            let _ = tx.try_send(WorkerCommand::Disconnect);
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) =
+                tx.try_send(WorkerCommand::Disconnect)
+            {
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        tx_clone.send(cmd),
+                    )
+                    .await;
+                });
+            }
         }
         count
     }

@@ -130,18 +130,18 @@ impl AppState {
                         .await;
                     }
                 } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
-                    if let Some(lease) = active_lease {
-                        let now_us = Utc::now().timestamp_micros();
-                        if lease.holder_id != self.config.node_id && !lease.is_expired(now_us) {
-                            warn!(
-                                node_id = %self.config.node_id,
-                                new_leader = %lease.holder_id,
-                                epoch = lease.epoch,
-                                "Another controller holds a newer active leader lease; stepping down to Standby"
-                            );
-                            self.job_store.set_ha_role(crate::config::HaRole::Standby);
-                            let _ = self.cluster.disconnect_all().await;
-                        }
+                    let should_step_down = match &active_lease {
+                        Some(lease) => lease.holder_id != self.config.node_id,
+                        None => true, // Lease lost, expired, or remote storage unreachable
+                    };
+                    if should_step_down {
+                        warn!(
+                            node_id = %self.config.node_id,
+                            active_leader = ?active_lease.as_ref().map(|l| &l.holder_id),
+                            "Lost active leader lease or another controller claimed leadership; stepping down to Standby"
+                        );
+                        self.job_store.set_ha_role(crate::config::HaRole::Standby);
+                        let _ = self.cluster.disconnect_all().await;
                     }
                 }
             }
