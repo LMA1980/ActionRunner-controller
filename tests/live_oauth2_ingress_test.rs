@@ -54,12 +54,16 @@ async fn test_live_oauth2_start_redirect() {
         Some("https://console.lma1980.duckdns.org/oauth2/callback"),
         "redirect_uri mismatch"
     );
+    let scope = params
+        .get("scope")
+        .expect("Missing scope parameter in OAuth2 authorize URL query");
     assert!(
-        params
-            .get("scope")
-            .map(|s| s.contains("read:user"))
-            .unwrap_or(false),
-        "scope must include read:user"
+        scope.contains("user:email"),
+        "scope must include 'user:email' for GitHub user emails API; got: '{scope}'"
+    );
+    assert!(
+        scope.contains("read:org"),
+        "scope must include 'read:org' for GitHub user organizations API; got: '{scope}'"
     );
     assert!(
         params.contains_key("state") && !params["state"].is_empty(),
@@ -118,4 +122,32 @@ async fn test_live_oauth2_sign_out_contract() {
             && (s.contains("max-age=0") || s.contains("1970") || s.contains("expires="))
     });
     assert!(has_expired_cookie, "Set-Cookie must clear session cookie");
+}
+
+#[tokio::test]
+#[ignore = "Hits live public endpoint console.lma1980.duckdns.org"]
+async fn test_live_ingress_csp_quoted_keywords() {
+    let client = make_no_redirect_client();
+    let url = format!("{CONSOLE_BASE}/oauth2/start?rd=/");
+    let resp = client.get(&url).send().await.expect("Failed to connect");
+
+    let headers = resp.headers();
+    let csp = headers
+        .get("content-security-policy")
+        .expect("Missing Content-Security-Policy header on /oauth2/start response")
+        .to_str()
+        .expect("Invalid Content-Security-Policy header string");
+
+    assert!(
+        csp.contains("'self'"),
+        "Content-Security-Policy keyword 'self' must be enclosed in single quotes; got: {csp}"
+    );
+    assert!(
+        csp.contains("'unsafe-inline'"),
+        "Content-Security-Policy keyword 'unsafe-inline' must be enclosed in single quotes; got: {csp}"
+    );
+    assert!(
+        csp.contains("'wasm-unsafe-eval'"),
+        "Content-Security-Policy keyword 'wasm-unsafe-eval' must be enclosed in single quotes; got: {csp}"
+    );
 }
