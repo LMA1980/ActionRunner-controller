@@ -1242,3 +1242,154 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     let (st, _, _) = send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn invite_redemption_payload_token_compatibility() {
+    let (state, _tmp) = seeded_auth_state().await;
+    let app = create_router(state.clone());
+
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+
+    // Mint three invite tokens:
+    // 1) For redemption using {"token": ...} (MuConsole web worker format)
+    // 2) For redemption using {"invite_token": ...} (standard controller format)
+    // 3) For redemption using {"token": ..., "invite_token": ...} (dual-field format)
+    let (st1, inv_resp1, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({
+            "ttl_seconds": 3600,
+            "note": "MuConsole web worker invite (token field)",
+            "base_url": "https://console.lma1980.duckdns.org"
+        })),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::CREATED);
+    let token1 = inv_resp1["invite_token"].as_str().unwrap().to_string();
+
+    let (st2, inv_resp2, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({
+            "ttl_seconds": 3600,
+            "note": "Standard invite (invite_token field)",
+            "base_url": "https://console.lma1980.duckdns.org"
+        })),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::CREATED);
+    let token2 = inv_resp2["invite_token"].as_str().unwrap().to_string();
+
+    let (st3, inv_resp3, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({
+            "ttl_seconds": 3600,
+            "note": "Dual field invite (both token and invite_token)",
+            "base_url": "https://console.lma1980.duckdns.org"
+        })),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::CREATED);
+    let token3 = inv_resp3["invite_token"].as_str().unwrap().to_string();
+
+    // 1. Redeem using MuConsole payload format: {"token": token1}
+    let user1_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "muconsole-user"),
+    ];
+    let (st_token, redeem_token_json, body_text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &user1_hdrs,
+        Some(json!({ "token": token1 })),
+    )
+    .await;
+    assert_eq!(
+        st_token,
+        StatusCode::OK,
+        "POST /api/auth/redeem must accept {{\"token\": ...}} payload matching MuConsole; got status {st_token}: {body_text}"
+    );
+    assert_eq!(redeem_token_json["authenticated"], true);
+    assert_eq!(redeem_token_json["github_login"], "muconsole-user");
+    assert_eq!(redeem_token_json["invite_bound"], true);
+    assert_eq!(redeem_token_json["role"], "operator");
+
+    // 2. Redeem using controller standard payload format: {"invite_token": token2}
+    let user2_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "standard-user"),
+    ];
+    let (st_invite, redeem_invite_json, body_invite_text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &user2_hdrs,
+        Some(json!({ "invite_token": token2 })),
+    )
+    .await;
+    assert_eq!(
+        st_invite,
+        StatusCode::OK,
+        "POST /api/auth/redeem must accept {{\"invite_token\": ...}} payload; got status {st_invite}: {body_invite_text}"
+    );
+    assert_eq!(redeem_invite_json["authenticated"], true);
+    assert_eq!(redeem_invite_json["github_login"], "standard-user");
+    assert_eq!(redeem_invite_json["invite_bound"], true);
+    assert_eq!(redeem_invite_json["role"], "operator");
+
+    // 3. Redeem using dual field payload format: {"token": token3, "invite_token": token3}
+    let user3_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "dual-user"),
+    ];
+    let (st_dual, redeem_dual_json, body_dual_text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &user3_hdrs,
+        Some(json!({
+            "token": token3,
+            "invite_token": token3,
+        })),
+    )
+    .await;
+    assert_eq!(
+        st_dual,
+        StatusCode::OK,
+        "POST /api/auth/redeem must accept dual {{\"token\": ..., \"invite_token\": ...}} payload; got status {st_dual}: {body_dual_text}"
+    );
+    assert_eq!(redeem_dual_json["authenticated"], true);
+    assert_eq!(redeem_dual_json["github_login"], "dual-user");
+    assert_eq!(redeem_dual_json["invite_bound"], true);
+    assert_eq!(redeem_dual_json["role"], "operator");
+
+    // 4. Missing both fields produces 422 Unprocessable Entity
+    let user4_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "missing-user"),
+    ];
+    let (st_missing, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/redeem",
+        &user4_hdrs,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        st_missing,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "POST /api/auth/redeem without token or invite_token must return 422 Unprocessable Entity"
+    );
+}

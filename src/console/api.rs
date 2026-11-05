@@ -899,9 +899,23 @@ pub struct ListInvitesResponse {
     pub users: Vec<AuthUserRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RedeemInviteRequest {
-    pub invite_token: String,
+    #[serde(default)]
+    pub invite_token: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl RedeemInviteRequest {
+    pub fn effective_token(&self) -> Option<&str> {
+        self.invite_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.token.as_deref().filter(|s| !s.is_empty()))
+            .or(self.invite_token.as_deref())
+            .or(self.token.as_deref())
+    }
 }
 
 /// `GET /api/auth/session` (`#96`)
@@ -1092,7 +1106,16 @@ pub async fn redeem_invite(
         );
     };
 
-    if parse_invite_token(&req.invite_token).is_none() {
+    let Some(raw_token) = req.effective_token() else {
+        return json_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &serde_json::json!({
+                "error": "Missing invite token: expected 'invite_token' or 'token' field"
+            }),
+        );
+    };
+
+    if parse_invite_token(raw_token).is_none() {
         return json_status(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({
@@ -1101,8 +1124,7 @@ pub async fn redeem_invite(
         );
     }
 
-    let Some((invite_id, presented_hmac)) = verify_invite_token(signing_key, &req.invite_token)
-    else {
+    let Some((invite_id, presented_hmac)) = verify_invite_token(signing_key, raw_token) else {
         return json_status(
             StatusCode::UNAUTHORIZED,
             &serde_json::json!({
@@ -1220,5 +1242,22 @@ mod tests {
         let tampered =
             format!("inv_{id}.0000000000000000000000000000000000000000000000000000000000000000");
         assert_eq!(verify_invite_token(key, &tampered), None);
+    }
+
+    #[test]
+    fn redeem_invite_request_payload_shapes() {
+        let req_a: RedeemInviteRequest = serde_json::from_str(r#"{"token": "tok_a"}"#).unwrap();
+        assert_eq!(req_a.effective_token(), Some("tok_a"));
+
+        let req_b: RedeemInviteRequest =
+            serde_json::from_str(r#"{"invite_token": "tok_b"}"#).unwrap();
+        assert_eq!(req_b.effective_token(), Some("tok_b"));
+
+        let req_c: RedeemInviteRequest =
+            serde_json::from_str(r#"{"token": "tok_c", "invite_token": "tok_c"}"#).unwrap();
+        assert_eq!(req_c.effective_token(), Some("tok_c"));
+
+        let req_d: RedeemInviteRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req_d.effective_token(), None);
     }
 }
