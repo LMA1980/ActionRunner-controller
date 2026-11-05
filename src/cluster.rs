@@ -36,6 +36,8 @@ pub struct ActiveWorker {
     pub registration: WorkerRegistration,
     pub leased_stages: HashSet<(String, String)>,
     pub exclusive_lease: Option<(String, String)>,
+    pub pending_claims: HashSet<String>,
+    pub pending_exclusive_claim: Option<String>,
     pub cpu_load_pct: f32,
     pub ram_used_mb: u64,
     pub last_heartbeat: DateTime<Utc>,
@@ -81,6 +83,8 @@ impl ClusterRegistry {
                 registration: reg,
                 leased_stages: HashSet::new(),
                 exclusive_lease: None,
+                pending_claims: HashSet::new(),
+                pending_exclusive_claim: None,
                 cpu_load_pct: 0.0,
                 ram_used_mb: 0,
                 last_heartbeat: Utc::now(),
@@ -237,6 +241,12 @@ impl ClusterRegistry {
         }
 
         if let Some((chosen_id, _)) = best_node {
+            for worker in workers.values_mut() {
+                worker.pending_claims.remove(job_id);
+                if worker.pending_exclusive_claim.as_deref() == Some(job_id) {
+                    worker.pending_exclusive_claim = None;
+                }
+            }
             if let Some(worker) = workers.get_mut(&chosen_id) {
                 let seq = self
                     .dispatch_counter
@@ -258,6 +268,12 @@ impl ClusterRegistry {
 
     pub async fn release_stage_slot(&self, node_id: &str, job_id: &str, stage_id: &str) {
         let mut workers = self.workers.write().await;
+        for worker in workers.values_mut() {
+            worker.pending_claims.remove(job_id);
+            if worker.pending_exclusive_claim.as_deref() == Some(job_id) {
+                worker.pending_exclusive_claim = None;
+            }
+        }
         if let Some(worker) = workers.get_mut(node_id) {
             worker
                 .leased_stages
@@ -277,6 +293,8 @@ impl ClusterRegistry {
         if let Some(worker) = workers.get_mut(node_id) {
             worker.leased_stages.clear();
             worker.exclusive_lease = None;
+            worker.pending_claims.clear();
+            worker.pending_exclusive_claim = None;
         }
     }
 
@@ -285,6 +303,10 @@ impl ClusterRegistry {
         {
             let mut workers = self.workers.write().await;
             for worker in workers.values_mut() {
+                worker.pending_claims.remove(job_id);
+                if worker.pending_exclusive_claim.as_deref() == Some(job_id) {
+                    worker.pending_exclusive_claim = None;
+                }
                 if worker
                     .exclusive_lease
                     .as_ref()
@@ -392,6 +414,16 @@ impl ClusterRegistry {
         required_tags: &[String],
         required_toolchain: Option<&str>,
     ) -> bool {
+        self.has_available_slot_for_stage(required_tags, required_toolchain, false)
+            .await
+    }
+
+    pub async fn has_available_slot_for_stage(
+        &self,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+        exclusive: bool,
+    ) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
         let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
@@ -404,10 +436,16 @@ impl ClusterRegistry {
             if secs_since_seen > timeout_secs {
                 continue;
             }
-            if worker.exclusive_lease.is_some() {
+            if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
                 continue;
             }
-            if (worker.leased_stages.len() as u32) >= worker.registration.max_slots {
+            if exclusive {
+                if !worker.leased_stages.is_empty() || !worker.pending_claims.is_empty() {
+                    continue;
+                }
+            } else if ((worker.leased_stages.len() + worker.pending_claims.len()) as u32)
+                >= worker.registration.max_slots
+            {
                 continue;
             }
             if let Some(tc) = required_toolchain {
@@ -446,13 +484,183 @@ impl ClusterRegistry {
             if secs_since_seen > timeout_secs {
                 continue;
             }
-            if worker.exclusive_lease.is_some() {
+            if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
                 continue;
             }
-            if (worker.leased_stages.len() as u32) < worker.registration.max_slots {
+            if ((worker.leased_stages.len() + worker.pending_claims.len()) as u32)
+                < worker.registration.max_slots
+            {
                 return true;
             }
         }
+        false
+    }
+
+    /// Checks whether any worker node currently holds an active stage lease (or exclusive lock)
+    /// belonging to `job_id`.
+    pub async fn has_active_leases_for_job(&self, job_id: &str) -> bool {
+        let workers = self.workers.read().await;
+        workers.values().any(|w| {
+            w.exclusive_lease.as_ref().is_some_and(|(j, _)| j == job_id)
+                || w.leased_stages.iter().any(|(j, _)| j == job_id)
+        })
+    }
+
+    pub async fn sync_and_try_reserve_for_claim(
+        &self,
+        active_unleased_job_ids: &HashSet<String>,
+        job_id: &str,
+        stages: &[crate::job::StageRecord],
+    ) -> bool {
+        let mut workers = self.workers.write().await;
+        let now = Utc::now();
+
+        // 1. Prune pending claims across all workers
+        for worker in workers.values_mut() {
+            worker.pending_claims.retain(|jid| {
+                active_unleased_job_ids.contains(jid)
+                    && !worker
+                        .leased_stages
+                        .iter()
+                        .any(|(leased_jid, _)| leased_jid == jid)
+            });
+            if let Some(ref jid) = worker.pending_exclusive_claim {
+                if !active_unleased_job_ids.contains(jid)
+                    || worker
+                        .leased_stages
+                        .iter()
+                        .any(|(leased_jid, _)| leased_jid == jid)
+                {
+                    worker.pending_exclusive_claim = None;
+                }
+            }
+        }
+
+        // 2. Check if stages.is_empty()
+        if stages.is_empty() {
+            let mut best_node: Option<(String, usize, i32)> = None;
+            for (node_id, worker) in workers.iter() {
+                let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+                if secs_since_seen > 15 {
+                    continue;
+                }
+                if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
+                    continue;
+                }
+                if (worker.leased_stages.len() + worker.pending_claims.len()) as u32
+                    >= worker.registration.max_slots
+                {
+                    continue;
+                }
+
+                let tag_count = worker.registration.tags.len();
+                let load_int = (worker.cpu_load_pct * 100.0) as i32;
+                let candidate = (node_id.clone(), tag_count, load_int);
+                if match &best_node {
+                    None => true,
+                    Some((best_id, best_tags, best_load)) => {
+                        (tag_count, load_int, node_id.as_str())
+                            < (*best_tags, *best_load, best_id.as_str())
+                    }
+                } {
+                    best_node = Some(candidate);
+                }
+            }
+
+            if let Some((chosen_id, _, _)) = best_node {
+                if let Some(worker) = workers.get_mut(&chosen_id) {
+                    worker.pending_claims.insert(job_id.to_string());
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // 3. If !stages.is_empty(), iterate over ready Pending stages
+        for stage in stages {
+            if !matches!(stage.status, crate::job::StageStatus::Pending) {
+                continue;
+            }
+            let deps_satisfied = stage.depends_on.iter().all(|dep_id| {
+                stages.iter().any(|s| {
+                    s.id == *dep_id
+                        && matches!(
+                            s.status,
+                            crate::job::StageStatus::Completed { exit_code: 0, .. }
+                        )
+                })
+            });
+            if !deps_satisfied {
+                continue;
+            }
+
+            let mut best_node: Option<(String, usize, i32)> = None;
+            for (node_id, worker) in workers.iter() {
+                let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+                if secs_since_seen > 15 {
+                    continue;
+                }
+                if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
+                    continue;
+                }
+                if stage.exclusive {
+                    if !worker.leased_stages.is_empty() || !worker.pending_claims.is_empty() {
+                        continue;
+                    }
+                } else if (worker.leased_stages.len() + worker.pending_claims.len()) as u32
+                    >= worker.registration.max_slots
+                {
+                    continue;
+                }
+
+                // Verify toolchain if requested
+                if let Some(ref tc) = stage.toolchain {
+                    if !worker.registration.toolchains.iter().any(|t| t == tc) {
+                        continue;
+                    }
+                }
+
+                // Verify required tags (empty tags or "default" matches any available node)
+                let node_tags: HashSet<&str> = worker
+                    .registration
+                    .tags
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                let matches_tags = stage.tags.is_empty()
+                    || stage
+                        .tags
+                        .iter()
+                        .all(|req| req == "default" || node_tags.contains(req.as_str()));
+                if !matches_tags {
+                    continue;
+                }
+
+                let tag_count = worker.registration.tags.len();
+                let load_int = (worker.cpu_load_pct * 100.0) as i32;
+                let candidate = (node_id.clone(), tag_count, load_int);
+                if match &best_node {
+                    None => true,
+                    Some((best_id, best_tags, best_load)) => {
+                        (tag_count, load_int, node_id.as_str())
+                            < (*best_tags, *best_load, best_id.as_str())
+                    }
+                } {
+                    best_node = Some(candidate);
+                }
+            }
+
+            if let Some((chosen_id, _, _)) = best_node {
+                if let Some(worker) = workers.get_mut(&chosen_id) {
+                    worker.pending_claims.insert(job_id.to_string());
+                    if stage.exclusive {
+                        worker.pending_exclusive_claim = Some(job_id.to_string());
+                    }
+                    return true;
+                }
+            }
+        }
+
         false
     }
 }
@@ -1047,5 +1255,40 @@ mod tests {
         cluster
             .release_stage_slot("node-b", "job-2", "clippy-2")
             .await;
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_has_active_leases_for_job() {
+        let cluster = ClusterRegistry::new();
+        let (tx, _rx) = mpsc::channel(10);
+        let reg = make_reg("node-1", &["ci"], 2);
+        cluster.register(reg, tx).await;
+
+        assert!(!cluster.has_active_leases_for_job("job-1").await);
+
+        let lease = cluster
+            .lease_slot_with_limit("job-1", "stage-1", &["ci".to_string()], None, false, None)
+            .await;
+        assert!(lease.is_some());
+        assert!(cluster.has_active_leases_for_job("job-1").await);
+        assert!(!cluster.has_active_leases_for_job("job-2").await);
+
+        cluster
+            .release_stage_slot("node-1", "job-1", "stage-1")
+            .await;
+        assert!(!cluster.has_active_leases_for_job("job-1").await);
+
+        // Test exclusive lease
+        let exc_lease = cluster
+            .lease_slot_with_limit("job-2", "stage-2", &["ci".to_string()], None, true, None)
+            .await;
+        assert!(exc_lease.is_some());
+        assert!(cluster.has_active_leases_for_job("job-2").await);
+
+        cluster
+            .release_stage_slot("node-1", "job-2", "stage-2")
+            .await;
+        assert!(!cluster.has_active_leases_for_job("job-2").await);
     }
 }
