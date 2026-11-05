@@ -100,10 +100,9 @@ impl AppState {
             let storage = Arc::clone(self.job_store.storage());
             let node_id = self.config.node_id.clone();
             let ttl_secs = self.config.lease_ttl_seconds;
-            let ha_role_cfg = self.config.ha_role;
             let lease_check = tokio::task::spawn_blocking(move || {
                 let renewed = storage.try_acquire_or_renew_lease(&node_id, ttl_secs, false);
-                let active_lease = if !renewed && ha_role_cfg == crate::config::HaRoleConfig::Auto {
+                let active_lease = if !renewed {
                     storage.get_leader_lease()
                 } else {
                     None
@@ -116,7 +115,20 @@ impl AppState {
             let (renewed, active_lease) = lease_check;
             if !renewed {
                 if self.config.ha_role == crate::config::HaRoleConfig::Leader {
-                    let _ = self.promote_to_leader().await;
+                    let stolen_by_other = active_lease
+                        .as_ref()
+                        .is_some_and(|l| l.holder_id != self.config.node_id);
+                    if stolen_by_other {
+                        let _ = self.promote_to_leader().await;
+                    } else {
+                        let storage = Arc::clone(self.job_store.storage());
+                        let node_id = self.config.node_id.clone();
+                        let ttl_secs = self.config.lease_ttl_seconds;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            storage.try_acquire_or_renew_lease(&node_id, ttl_secs, true)
+                        })
+                        .await;
+                    }
                 } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
                     if let Some(lease) = active_lease {
                         let now_us = Utc::now().timestamp_micros();

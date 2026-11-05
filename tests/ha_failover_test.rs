@@ -941,3 +941,193 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
         "Leader must preserve completed stages"
     );
 }
+
+#[tokio::test]
+async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_with_running_stages() {
+    let shared_storage: Arc<dyn ControllerStorage> = Arc::new(InMemoryStorage::open());
+    let ws_a = tempfile::tempdir().expect("ws_a");
+
+    let state_a = build_controller_state(
+        "node-a",
+        HaRoleConfig::Leader,
+        ws_a.path().to_path_buf(),
+        Arc::clone(&shared_storage),
+    );
+
+    // 1. Job 1 is actively executing in-process (`InFlightJobGuard`) on node-a
+    let job1 = Job {
+        id: "job-active-inflight-1".to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/k3-arch-synthetic".to_string(),
+        clone_url: "https://github.com/LMA1980/k3-arch-synthetic.git".to_string(),
+        commit_sha: "b6873aae52863a3a24a2ef9af4955ac9d19cf135".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now() - chrono::Duration::seconds(60),
+    };
+    state_a
+        .job_store
+        .enqueue_job(
+            job1.clone(),
+            PathBuf::from("logs/LMA1980/k3-arch-synthetic/job-active-inflight-1.log"),
+        )
+        .await;
+    let _ = state_a.job_store.claim_next_queued_job(4).await.unwrap();
+    let _guard = action_runner_controller::job::InFlightJobGuard::new(
+        state_a.job_store.clone(),
+        job1.id.clone(),
+    );
+    state_a
+        .job_store
+        .set_stages(
+            &job1.id,
+            vec![
+                StageRecord {
+                    id: "audit-check".to_string(),
+                    name: "Audit".to_string(),
+                    tags: vec!["audit".to_string()],
+                    threads: 2,
+                    toolchain: None,
+                    depends_on: vec![],
+                    status: StageStatus::Completed {
+                        duration_secs: 1,
+                        exit_code: 0,
+                    },
+                    assigned_node: Some("node-a".to_string()),
+                    exclusive: false,
+                },
+                StageRecord {
+                    id: "miri-check".to_string(),
+                    name: "Miri".to_string(),
+                    tags: vec!["k3".to_string()],
+                    threads: 6,
+                    toolchain: None,
+                    depends_on: vec!["audit-check".to_string()],
+                    status: StageStatus::Running {
+                        node_id: "worker-riscv64".to_string(),
+                        started_at: Utc::now(),
+                        pid: Some(7777),
+                    },
+                    assigned_node: Some("worker-riscv64".to_string()),
+                    exclusive: false,
+                },
+            ],
+        )
+        .await;
+
+    // Simulate a stale remote snapshot where `audit-check` was still Running and `status` was Queued
+    shared_storage.upsert_record(&JobRecord {
+        job: job1.clone(),
+        status: JobStatus::Queued,
+        log_file: PathBuf::from("logs/LMA1980/k3-arch-synthetic/job-active-inflight-1.log"),
+        updated_at: Utc::now() + chrono::Duration::seconds(5),
+        metrics: None,
+        stages: vec![
+            StageRecord {
+                id: "audit-check".to_string(),
+                name: "Audit".to_string(),
+                tags: vec!["audit".to_string()],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Running {
+                    node_id: "node-a".to_string(),
+                    started_at: Utc::now(),
+                    pid: Some(1111),
+                },
+                assigned_node: Some("node-a".to_string()),
+                exclusive: false,
+            },
+            StageRecord {
+                id: "miri-check".to_string(),
+                name: "Miri".to_string(),
+                tags: vec!["k3".to_string()],
+                threads: 6,
+                toolchain: None,
+                depends_on: vec!["audit-check".to_string()],
+                status: StageStatus::Pending,
+                assigned_node: None,
+                exclusive: false,
+            },
+        ],
+    });
+
+    // 2. Job 2 in storage is an orphaned Queued job with Running + Completed stages (not in-flight)
+    let job2 = Job {
+        id: "job-orphan-queued-with-running-stages".to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/MuConsole".to_string(),
+        clone_url: "https://github.com/LMA1980/MuConsole.git".to_string(),
+        commit_sha: "119eb6931e45066576fd62fc9105789def9aaf7f".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now() - chrono::Duration::seconds(45),
+    };
+    shared_storage.upsert_record(&JobRecord {
+        job: job2.clone(),
+        status: JobStatus::Queued,
+        log_file: PathBuf::from("logs/LMA1980/MuConsole/job-orphan.log"),
+        updated_at: Utc::now(),
+        metrics: None,
+        stages: vec![
+            StageRecord {
+                id: "fmt-check".to_string(),
+                name: "Fmt".to_string(),
+                tags: vec!["fmt".to_string()],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec![],
+                status: StageStatus::Completed {
+                    duration_secs: 1,
+                    exit_code: 0,
+                },
+                assigned_node: Some("node-a".to_string()),
+                exclusive: false,
+            },
+            StageRecord {
+                id: "audit-check".to_string(),
+                name: "Audit".to_string(),
+                tags: vec!["audit".to_string()],
+                threads: 2,
+                toolchain: None,
+                depends_on: vec!["fmt-check".to_string()],
+                status: StageStatus::Running {
+                    node_id: "node-a".to_string(),
+                    started_at: Utc::now(),
+                    pid: Some(2222),
+                },
+                assigned_node: Some("node-a".to_string()),
+                exclusive: false,
+            },
+        ],
+    });
+
+    // 3. Even if rehydrate_from_storage(true) is invoked on node-a:
+    //    - Job 1 (in-flight) must stay Running with audit-check Completed and miri-check Running.
+    //    - Job 2 (not in-flight, Queued with orphaned Running stage) must have audit-check reset to Pending
+    //      while preserving fmt-check Completed.
+    let _ = state_a.job_store.rehydrate_from_storage(true).await;
+
+    let j1_after = state_a.job_store.get_job(&job1.id).await.expect("job1");
+    assert!(matches!(j1_after.status, JobStatus::Running { .. }));
+    assert!(matches!(
+        j1_after.stages[0].status,
+        StageStatus::Completed { exit_code: 0, .. }
+    ));
+    assert!(matches!(
+        j1_after.stages[1].status,
+        StageStatus::Running {
+            pid: Some(7777),
+            ..
+        }
+    ));
+
+    let j2_after = state_a.job_store.get_job(&job2.id).await.expect("job2");
+    assert_eq!(j2_after.status, JobStatus::Queued);
+    assert!(matches!(
+        j2_after.stages[0].status,
+        StageStatus::Completed { exit_code: 0, .. }
+    ));
+    assert_eq!(j2_after.stages[1].status, StageStatus::Pending);
+    assert_eq!(j2_after.stages[1].assigned_node, None);
+}

@@ -506,6 +506,15 @@ impl ClusterRegistry {
         })
     }
 
+    /// Checks whether `node_id` currently holds an active stage lease for `(job_id, stage_id)`.
+    pub async fn has_stage_lease(&self, node_id: &str, job_id: &str, stage_id: &str) -> bool {
+        let workers = self.workers.read().await;
+        workers.get(node_id).is_some_and(|w| {
+            w.leased_stages
+                .contains(&(job_id.to_string(), stage_id.to_string()))
+        })
+    }
+
     pub async fn sync_and_try_reserve_for_claim(
         &self,
         active_unleased_job_ids: &HashSet<String>,

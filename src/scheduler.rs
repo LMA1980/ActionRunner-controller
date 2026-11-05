@@ -480,7 +480,7 @@ impl DAGScheduler {
                 None => break,
             };
 
-            // Check if job was cancelled or finished
+            // Check if job was cancelled or finished, or heal Queued -> Running while active
             match &job_record.status {
                 JobStatus::Completed { .. }
                 | JobStatus::Failed { .. }
@@ -494,28 +494,59 @@ impl DAGScheduler {
                     self.job_store.notify_event();
                     break;
                 }
-                _ => {}
+                JobStatus::Queued => {
+                    self.job_store
+                        .update_status(
+                            &job.id,
+                            JobStatus::Running {
+                                started_at: start_time,
+                            },
+                        )
+                        .await;
+                }
+                JobStatus::Running { .. } => {}
             }
 
-            // Watchdog: verify if assigned worker nodes are still online in cluster
+            // Watchdog: verify if assigned worker nodes are still online and hold the stage lease
             for stage in &job_record.stages {
-                if let StageStatus::Assigned { node_id, .. }
-                | StageStatus::Running { node_id, .. } = &stage.status
+                if let StageStatus::Assigned {
+                    node_id,
+                    started_at,
+                }
+                | StageStatus::Running {
+                    node_id,
+                    started_at,
+                    ..
+                } = &stage.status
                 {
                     let is_online = self.cluster.is_node_online(node_id).await;
-                    if !is_online {
-                        warn!(
-                            job_id = %job.id,
-                            stage = %stage.id,
-                            node = %node_id,
-                            "Watchdog detected assigned worker node is offline; returning stage to Pending"
-                        );
+                    let has_lease = self
+                        .cluster
+                        .has_stage_lease(node_id, &job.id, &stage.id)
+                        .await;
+                    let orphan_lease_expired =
+                        !has_lease && (Utc::now() - *started_at).num_seconds() >= 5;
+                    if !is_online || orphan_lease_expired {
+                        if is_online && orphan_lease_expired {
+                            sleep(Duration::from_millis(20)).await;
+                        }
                         self.cluster
                             .release_stage_slot(node_id, &job.id, &stage.id)
                             .await;
-                        self.job_store
-                            .update_stage_status(&job.id, &stage.id, StageStatus::Pending)
-                            .await;
+                        if self
+                            .job_store
+                            .recover_stage_if_active(&job.id, &stage.id)
+                            .await
+                        {
+                            warn!(
+                                job_id = %job.id,
+                                stage = %stage.id,
+                                node = %node_id,
+                                is_online,
+                                has_lease,
+                                "Watchdog detected assigned stage worker is offline or lease was lost; returning stage to Pending"
+                            );
+                        }
                         leased_slots.remove(&stage.id);
                     }
                 }
