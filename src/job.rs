@@ -343,6 +343,8 @@ impl JobStore {
                                             stage.assigned_node = None;
                                         }
                                     }
+                                } else {
+                                    let _ = sanitize_terminal_job_stages(rec);
                                 }
                             }
                             // Upsert oldest-first into storage
@@ -389,6 +391,9 @@ impl JobStore {
                         }
                     }
                     recovered_running.push(rec.clone());
+                } else if sanitize_terminal_job_stages(rec) {
+                    rec.updated_at = Utc::now();
+                    recovered_running.push(rec.clone());
                 }
                 if matches!(rec.status, JobStatus::Queued) {
                     has_queued = true;
@@ -396,6 +401,11 @@ impl JobStore {
             }
             if !recovered_running.is_empty() {
                 db.upsert_records_batch(&recovered_running);
+                if let Some(ref path) = index_file {
+                    if let Ok(json_str) = serde_json::to_string_pretty(&initial_jobs) {
+                        let _ = std::fs::write(path, json_str);
+                    }
+                }
             }
             if has_queued {
                 notify.notify_waiters();
@@ -597,6 +607,9 @@ impl JobStore {
                             }
                         }
                         recovered_for_db.push(rec.clone());
+                    } else if sanitize_terminal_job_stages(rec) {
+                        rec.updated_at = now;
+                        recovered_for_db.push(rec.clone());
                     }
                     if matches!(rec.status, JobStatus::Queued) {
                         has_queued = true;
@@ -614,6 +627,8 @@ impl JobStore {
                             rec.status = JobStatus::Running { started_at };
                             rec.updated_at = now;
                         }
+                    } else {
+                        let _ = sanitize_terminal_job_stages(rec);
                     }
                 }
                 has_queued = merged
@@ -834,6 +849,7 @@ impl JobStore {
                             sha_short, job.id
                         ),
                     };
+                    let _ = sanitize_terminal_job_stages(record);
                     record.updated_at = now;
                     records_to_upsert.push(record.clone());
                 }
@@ -924,6 +940,9 @@ impl JobStore {
                     r.status = JobStatus::Running { started_at: now };
                     r.updated_at = now;
                     healed.push(r.clone());
+                } else if sanitize_terminal_job_stages(r) {
+                    r.updated_at = now;
+                    healed.push(r.clone());
                 }
             }
 
@@ -931,14 +950,7 @@ impl JobStore {
             let mut running_repos = std::collections::HashSet::new();
 
             for r in store.iter() {
-                if matches!(r.status, JobStatus::Running { .. })
-                    || r.stages.iter().any(|s| {
-                        matches!(
-                            s.status,
-                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                        )
-                    })
-                {
+                if matches!(r.status, JobStatus::Running { .. }) {
                     running_count += 1;
                     running_repos.insert(r.job.repo_name.clone());
                 }
@@ -1186,6 +1198,7 @@ impl JobStore {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 record.status = status.clone();
+                let _ = sanitize_terminal_job_stages(record);
                 record.updated_at = Utc::now();
                 Some(record.clone())
             } else {
@@ -1196,6 +1209,7 @@ impl JobStore {
             self.db.upsert_record(&record);
         } else if let Some(mut record) = self.db.get_job(job_id) {
             record.status = status;
+            let _ = sanitize_terminal_job_stages(&mut record);
             record.updated_at = Utc::now();
             self.db.upsert_record(&record);
         }
@@ -1674,6 +1688,61 @@ pub(crate) fn merge_completed_stages(local: &JobRecord, remote: &mut JobRecord) 
             }
         }
     }
+}
+
+/// Ensures terminal jobs (`Completed`, `Failed`, `Skipped`) never retain orphaned
+/// `StageStatus::Assigned` or `StageStatus::Running` stages.
+pub(crate) fn sanitize_terminal_job_stages(rec: &mut JobRecord) -> bool {
+    let mut changed = false;
+    match &rec.status {
+        JobStatus::Completed { exit_code, .. } => {
+            let code = *exit_code;
+            for stage in &mut rec.stages {
+                if matches!(
+                    stage.status,
+                    StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                ) {
+                    stage.status = StageStatus::Completed {
+                        exit_code: code,
+                        duration_secs: 0,
+                    };
+                    changed = true;
+                }
+            }
+        }
+        JobStatus::Failed { error } => {
+            let err_clone = error.clone();
+            for stage in &mut rec.stages {
+                if matches!(
+                    stage.status,
+                    StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                ) {
+                    stage.status = StageStatus::Failed {
+                        error: err_clone.clone(),
+                    };
+                    changed = true;
+                }
+            }
+        }
+        JobStatus::Skipped { reason } => {
+            let reason_clone = reason.clone();
+            for stage in &mut rec.stages {
+                if matches!(
+                    stage.status,
+                    StageStatus::Pending
+                        | StageStatus::Assigned { .. }
+                        | StageStatus::Running { .. }
+                ) {
+                    stage.status = StageStatus::Skipped {
+                        reason: reason_clone.clone(),
+                    };
+                    changed = true;
+                }
+            }
+        }
+        JobStatus::Queued | JobStatus::Running { .. } => {}
+    }
+    changed
 }
 
 /// Determines whether an in-memory `local` [`JobRecord`] should be preserved over
