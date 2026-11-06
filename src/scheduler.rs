@@ -475,7 +475,7 @@ impl DAGScheduler {
         let mut leased_slots: HashMap<String, String> = HashMap::new(); // stage_id -> node_id
 
         loop {
-            let job_record = match self.job_store.get_job(&job.id).await {
+            let mut job_record = match self.job_store.get_job(&job.id).await {
                 Some(r) => r,
                 None => break,
             };
@@ -508,6 +508,7 @@ impl DAGScheduler {
             }
 
             // Watchdog: verify if assigned worker nodes are still online and hold the stage lease
+            let mut stage_state_changed = false;
             for stage in &job_record.stages {
                 if let StageStatus::Assigned {
                     node_id,
@@ -548,8 +549,16 @@ impl DAGScheduler {
                             );
                         }
                         leased_slots.remove(&stage.id);
+                        stage_state_changed = true;
                     }
                 }
+            }
+
+            if stage_state_changed {
+                job_record = match self.job_store.get_job(&job.id).await {
+                    Some(r) => r,
+                    None => break,
+                };
             }
 
             let mut all_completed = true;
@@ -834,6 +843,7 @@ impl DAGScheduler {
                         .await;
                     }
                 }
+                self.job_store.flush_job_log(Some(&job.id));
                 _guard.disarm();
                 break;
             }
@@ -843,6 +853,18 @@ impl DAGScheduler {
             // `JobStatus::Queued` in-place while preserving its original priority (`queued_at`)
             // and completed stages so other queued jobs can execute on idle worker nodes.
             let latest_stages = self.job_store.get_stages(&job.id).await;
+            let all_latest_terminal = !latest_stages.is_empty()
+                && !latest_stages.iter().any(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Pending
+                            | StageStatus::Assigned { .. }
+                            | StageStatus::Running { .. }
+                    )
+                });
+            if all_latest_terminal {
+                continue;
+            }
             let has_active_stages = !leased_slots.is_empty()
                 || self.cluster.has_active_leases_for_job(&job.id).await
                 || latest_stages.iter().any(|s| {
@@ -852,6 +874,7 @@ impl DAGScheduler {
                     )
                 });
             if !has_active_stages && self.job_store.requeue_preserving_priority(&job.id).await {
+                self.job_store.flush_job_log(Some(&job.id));
                 _guard.disarm();
                 let completed_count = latest_stages
                     .iter()

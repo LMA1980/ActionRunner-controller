@@ -236,8 +236,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     };
 
-                                    // Release the stage slot BEFORE updating stage status so any job woken by
-                                    // `update_stage_status` (which calls `notify_waiters()`) sees the freed node slot immediately.
+                                    // Flush any buffered stage logs and release the stage slot so any job woken by
+                                    // `update_stage_status` / `notify_event` sees the freed node slot and completed status.
+                                    state.job_store.flush_job_log(Some(&report.job_id));
                                     state
                                         .cluster
                                         .release_stage_slot(
@@ -326,7 +327,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             let full_path = state.config.workspace_dir.join(&record.log_file);
                                             let _ = append_logs(&full_path, &entries);
                                             let chunk = format_log_entries(&entries);
-                                            state.broadcast_log(&first.job_id, &chunk);
+                                            state.broadcast_log_buffered(&first.job_id, &chunk);
                                         }
                                     }
                                 }
