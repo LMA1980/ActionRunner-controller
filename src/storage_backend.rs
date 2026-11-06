@@ -161,6 +161,16 @@ pub trait ControllerStorage: Send + Sync {
     /// Appends a log chunk for `job_id` into shared persistence (`#83`).
     fn append_job_log(&self, _job_id: &str, _chunk: &str) {}
 
+    /// Appends a streaming log chunk for `job_id` into an in-memory write-behind buffer,
+    /// coalescing remote persistence flushes (`#124`).
+    fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
+        self.append_job_log(job_id, chunk);
+    }
+
+    /// Flushes buffered in-memory log chunks for `job_id` (or all dirty jobs when `None`)
+    /// to shared persistence (`#124`).
+    fn flush_job_log(&self, _job_id: Option<&str>) {}
+
     /// Retrieves the full persisted execution log for `job_id` from shared persistence (`#83`, `#84`).
     fn get_job_log(&self, _job_id: &str) -> Option<String> {
         None
@@ -542,8 +552,13 @@ pub struct MuObserveRemoteStorage {
     tls_client_config: Option<Arc<ClientConfig>>,
     seq: Arc<AtomicU64>,
     log_buffer: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    dirty_log_keys: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    last_log_flush: Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>>,
     auth_store: Arc<CatalogStore>,
 }
+
+const MAX_BUFFERED_JOB_LOGS: usize = 100;
+const BUFFERED_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl MuObserveRemoteStorage {
     /// Creates a new [`MuObserveRemoteStorage`] from `config`.
@@ -568,8 +583,64 @@ impl MuObserveRemoteStorage {
             tls_client_config,
             seq: Arc::new(AtomicU64::new(1)),
             log_buffer: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            dirty_log_keys: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
+            last_log_flush: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             auth_store: Arc::new(CatalogStore::new()),
         })
+    }
+
+    fn append_to_local_log_buffer(&self, key: &str, chunk: &str) -> Option<String> {
+        let existing_remote = {
+            let guard = self.log_buffer.lock().ok();
+            let already_buffered = guard.as_ref().map(|g| g.contains_key(key)).unwrap_or(false);
+            drop(guard);
+            if already_buffered {
+                None
+            } else {
+                self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", key)
+                    .and_then(|s| s.latest_active_json)
+            }
+        };
+
+        let Ok(mut guard) = self.log_buffer.lock() else {
+            return None;
+        };
+        let entry = guard
+            .entry(key.to_string())
+            .or_insert_with(|| existing_remote.unwrap_or_default());
+        entry.push_str(chunk);
+        let accumulated = entry.clone();
+        while guard.len() > MAX_BUFFERED_JOB_LOGS {
+            if let Some(first_key) = guard.keys().find(|k| k.as_str() != key).cloned() {
+                guard.remove(&first_key);
+            } else {
+                break;
+            }
+        }
+        Some(accumulated)
+    }
+
+    fn flush_single_log_key(&self, key: &str, job_id_label: &str, accumulated: String) {
+        let now_us = chrono::Utc::now().timestamp_micros();
+        if self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+            parent_repo_key: INTERNAL_LOG_REPO_KEY.to_string(),
+            branch_key: "log".to_string(),
+            submodule_key: key.to_string(),
+            submodule_path_key: "log".to_string(),
+            latest_active_job_id: Some(job_id_label.to_string()),
+            latest_active_json: Some(accumulated),
+            latest_active_queued_us: Some(now_us),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        }) {
+            if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+                dirty.remove(key);
+            }
+            if let Ok(mut last) = self.last_log_flush.lock() {
+                last.insert(key.to_string(), std::time::Instant::now());
+            }
+        }
     }
 
     fn query_internal_snapshot(
@@ -630,6 +701,7 @@ impl MuObserveRemoteStorage {
         let (resp_hdr, resp_payload) = read_frame(stream)
             .await
             .map_err(|e| format!("Read MUOB frame error: {e}"))?;
+        let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
         if resp_hdr.msg_type != MSG_TYPE_FORY_CONTROL {
             return Err(format!(
                 "Unexpected response frame msg_type: {:#06x}",
@@ -1393,64 +1465,101 @@ impl ControllerStorage for MuObserveRemoteStorage {
             return;
         }
         let key = job_id.to_ascii_lowercase();
-        let existing_remote = {
-            let guard = self.log_buffer.lock().ok();
-            let already_buffered = guard
-                .as_ref()
-                .map(|g| g.contains_key(&key))
+        let Some(accumulated) = self.append_to_local_log_buffer(&key, chunk) else {
+            return;
+        };
+        self.flush_single_log_key(&key, job_id, accumulated);
+    }
+
+    fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let Some(accumulated) = self.append_to_local_log_buffer(&key, chunk) else {
+            return;
+        };
+        if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+            dirty.insert(key.clone());
+        }
+        let should_flush_now = self
+            .last_log_flush
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&key).copied())
+            .map(|t| t.elapsed() >= BUFFERED_LOG_FLUSH_INTERVAL)
+            .unwrap_or(true);
+        if should_flush_now {
+            self.flush_single_log_key(&key, job_id, accumulated);
+        }
+    }
+
+    fn flush_job_log(&self, job_id: Option<&str>) {
+        let keys_to_flush: Vec<String> = match job_id {
+            Some(id) => vec![id.to_ascii_lowercase()],
+            None => self
+                .dirty_log_keys
+                .lock()
+                .ok()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+
+        for key in keys_to_flush {
+            let is_dirty = self
+                .dirty_log_keys
+                .lock()
+                .ok()
+                .map(|g| g.contains(&key))
                 .unwrap_or(false);
-            drop(guard);
-            if already_buffered {
-                None
-            } else {
-                self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key)
-                    .and_then(|s| s.latest_active_json)
+            if !is_dirty {
+                continue;
             }
-        };
-
-        let accumulated = {
-            let Ok(mut guard) = self.log_buffer.lock() else {
-                return;
-            };
-            let entry = guard
-                .entry(key.clone())
-                .or_insert_with(|| existing_remote.unwrap_or_default());
-            entry.push_str(chunk);
-            entry.clone()
-        };
-
-        let now_us = chrono::Utc::now().timestamp_micros();
-        let _ = self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
-            parent_repo_key: INTERNAL_LOG_REPO_KEY.to_string(),
-            branch_key: "log".to_string(),
-            submodule_key: key,
-            submodule_path_key: "log".to_string(),
-            latest_active_job_id: Some(job_id.to_string()),
-            latest_active_json: Some(accumulated),
-            latest_active_queued_us: Some(now_us),
-            latest_completed_job_id: None,
-            latest_completed_json: None,
-            latest_completed_queued_us: None,
-        });
+            let accumulated = self
+                .log_buffer
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&key).cloned());
+            if let Some(acc) = accumulated {
+                self.flush_single_log_key(&key, &key, acc);
+            }
+        }
     }
 
     fn get_job_log(&self, job_id: &str) -> Option<String> {
         let key = job_id.to_ascii_lowercase();
-        if let Some(snap) = self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key) {
-            if let Some(content) = snap.latest_active_json {
-                if !content.is_empty() {
-                    if let Ok(mut guard) = self.log_buffer.lock() {
-                        guard.insert(key, content.clone());
-                    }
-                    return Some(content);
-                }
-            }
-        }
-        self.log_buffer
+        let local_copy = self
+            .log_buffer
             .lock()
             .ok()
             .and_then(|g| g.get(&key).cloned())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty());
+        let is_dirty = self
+            .dirty_log_keys
+            .lock()
+            .ok()
+            .map(|g| g.contains(&key))
+            .unwrap_or(false);
+        if is_dirty {
+            if let Some(local) = local_copy {
+                return Some(local);
+            }
+        }
+        if let Some(snap) = self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key) {
+            if let Some(content) = snap.latest_active_json {
+                if !content.is_empty() {
+                    let chosen = match local_copy {
+                        Some(ref local) if local.len() > content.len() => local.clone(),
+                        _ => content,
+                    };
+                    if let Ok(mut guard) = self.log_buffer.lock() {
+                        guard.insert(key, chosen.clone());
+                    }
+                    return Some(chosen);
+                }
+            }
+        }
+        local_copy
     }
 
     fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {

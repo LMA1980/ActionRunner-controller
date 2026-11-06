@@ -42,6 +42,14 @@ impl AppState {
         });
     }
 
+    pub fn broadcast_log_buffered(&self, job_id: &str, chunk: &str) {
+        self.job_store.append_job_log_buffered(job_id, chunk);
+        let _ = self.log_broadcaster.send(LogBroadcast {
+            job_id: job_id.to_string(),
+            chunk: chunk.to_string(),
+        });
+    }
+
     /// Explicitly promotes this controller instance to `Leader`, acquiring the
     /// single-leader lease in [`crate::storage_backend::ControllerStorage`],
     /// re-hydrating and recovering any interrupted `Running` jobs into `Queued`
