@@ -428,13 +428,14 @@ impl DAGScheduler {
                             existing.status = StageStatus::Pending;
                             existing.assigned_node = None;
                         }
+                        existing.tags = workflow.effective_stage_tags(s);
                         existing.exclusive = s.exclusive;
                         existing
                     } else {
                         StageRecord {
                             id: s.id.clone(),
                             name: s.name.clone(),
-                            tags: s.tags.clone(),
+                            tags: workflow.effective_stage_tags(s),
                             threads: s.threads,
                             toolchain: s.toolchain.clone(),
                             depends_on: s.depends_on.clone(),
@@ -452,7 +453,7 @@ impl DAGScheduler {
                 .map(|s| StageRecord {
                     id: s.id.clone(),
                     name: s.name.clone(),
-                    tags: s.tags.clone(),
+                    tags: workflow.effective_stage_tags(s),
                     threads: s.threads,
                     toolchain: s.toolchain.clone(),
                     depends_on: s.depends_on.clone(),
@@ -595,18 +596,7 @@ impl DAGScheduler {
 
                         if deps_satisfied {
                             let stage_cfg = stages_by_id.get(&stage.id).unwrap();
-                            let requires_sccache = workflow.resolve_stage_sccache(stage_cfg)
-                                == SccacheMode::Mandatory
-                                || stage_cfg.tasks.iter().any(|tid| {
-                                    workflow.tasks.get(tid).is_some_and(|tcfg| {
-                                        workflow.resolve_task_sccache(stage_cfg, tcfg)
-                                            == SccacheMode::Mandatory
-                                    })
-                                });
-                            let mut required_tags = stage_cfg.tags.clone();
-                            if requires_sccache && !required_tags.iter().any(|t| t == "sccache") {
-                                required_tags.push("sccache".to_string());
-                            }
+                            let required_tags = workflow.effective_stage_tags(stage_cfg);
                             // Attempt to lease a slot (respecting node capacity and exclusive stage locks)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
