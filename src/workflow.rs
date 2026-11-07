@@ -277,6 +277,43 @@ impl ActionRunnerWorkflow {
             .or(self.sccache)
             .unwrap_or(SccacheMode::Try)
     }
+
+    /// Return true if a tool invokes Rust/WASM compilation eligible for `sccache`.
+    pub fn is_sccache_eligible_tool(tool_name: &str) -> bool {
+        matches!(
+            tool_name.trim(),
+            "cargo-build" | "cargo-check" | "cargo-test" | "cargo-clippy" | "cargo-bench" | "trunk"
+        )
+    }
+
+    /// Return true if a stage requires the `"sccache"` worker capability tag.
+    pub fn stage_requires_mandatory_sccache(&self, stage: &StageConfig) -> bool {
+        if stage.sccache == Some(SccacheMode::Mandatory) {
+            return true;
+        }
+        if stage.tasks.is_empty() {
+            return self.resolve_stage_sccache(stage) == SccacheMode::Mandatory;
+        }
+        stage.tasks.iter().any(|tid| {
+            self.tasks.get(tid).map_or_else(
+                || self.resolve_stage_sccache(stage) == SccacheMode::Mandatory,
+                |tcfg| {
+                    tcfg.sccache == Some(SccacheMode::Mandatory)
+                        || (self.resolve_task_sccache(stage, tcfg) == SccacheMode::Mandatory
+                            && Self::is_sccache_eligible_tool(&tcfg.tool))
+                },
+            )
+        })
+    }
+
+    /// Resolve effective worker capability tags for a stage, appending `"sccache"` when mandatory.
+    pub fn effective_stage_tags(&self, stage: &StageConfig) -> Vec<String> {
+        let mut tags = stage.tags.clone();
+        if self.stage_requires_mandatory_sccache(stage) && !tags.iter().any(|t| t == "sccache") {
+            tags.push("sccache".to_string());
+        }
+        tags
+    }
 }
 
 fn find_cycle_path(stages: &[StageConfig]) -> Vec<String> {
@@ -779,6 +816,63 @@ on_action:
         assert_eq!(
             wf.resolve_task_sccache(s_mandatory, t_default),
             SccacheMode::Mandatory
+        );
+    }
+
+    #[test]
+    fn test_effective_stage_tags_for_mandatory_sccache() {
+        let yaml = r#"
+version: "3"
+name: "Mandatory Sccache Tag Resolution"
+sccache: mandatory
+tasks:
+  fmt:
+    tool: "cargo-fmt"
+  clippy:
+    tool: "cargo-clippy"
+  build-off:
+    tool: "cargo-build"
+    sccache: false
+stages:
+  - id: fmt-only
+    name: "Fmt Only"
+    tags: ["fmt"]
+    tasks: ["fmt"]
+  - id: clippy-compile
+    name: "Clippy Compile"
+    tags: ["clippy"]
+    tasks: ["clippy"]
+  - id: build-overridden-off
+    name: "Build Overridden Off"
+    tags: ["build"]
+    tasks: ["build-off"]
+  - id: already-tagged
+    name: "Already Tagged"
+    tags: ["build", "sccache"]
+    tasks: ["clippy"]
+on_action:
+  push: ["fmt-only", "clippy-compile", "build-overridden-off", "already-tagged"]
+"#;
+        let wf = ActionRunnerWorkflow::from_yaml(yaml).expect("valid workflow");
+        assert_eq!(
+            wf.effective_stage_tags(&wf.stages[0]),
+            vec!["fmt".to_string()],
+            "Non-compiler hygiene stage should not force sccache tag when inherited from workflow root"
+        );
+        assert_eq!(
+            wf.effective_stage_tags(&wf.stages[1]),
+            vec!["clippy".to_string(), "sccache".to_string()],
+            "Compiler stage with mandatory sccache must append sccache tag"
+        );
+        assert_eq!(
+            wf.effective_stage_tags(&wf.stages[2]),
+            vec!["build".to_string()],
+            "Stage where all tasks override sccache: false must not append sccache tag"
+        );
+        assert_eq!(
+            wf.effective_stage_tags(&wf.stages[3]),
+            vec!["build".to_string(), "sccache".to_string()],
+            "Must not duplicate existing sccache tag"
         );
     }
 }
