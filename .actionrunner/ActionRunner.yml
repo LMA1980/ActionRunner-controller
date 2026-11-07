@@ -1,5 +1,5 @@
 version: "3"
-name: "ActionRunner-controller 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
+name: "mu-ci-controller 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
 sccache: try
 
 env:

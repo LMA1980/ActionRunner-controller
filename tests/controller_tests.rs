@@ -1,4 +1,4 @@
-use action_runner_controller::workflow::ActionRunnerWorkflow;
+use mu_ci_controller::workflow::ActionRunnerWorkflow;
 
 #[test]
 fn test_workflow_dag_validation_valid() {
@@ -83,14 +83,14 @@ on_action:
 
 #[tokio::test]
 async fn test_job_card_svg_route_and_headers() {
-    use action_runner_controller::app::create_router;
-    use action_runner_controller::cluster::ClusterRegistry;
-    use action_runner_controller::config::Config;
-    use action_runner_controller::job::{Job, JobStatus, JobStore};
-    use action_runner_controller::scheduler::DAGScheduler;
-    use action_runner_controller::webhook::AppState;
     use axum::http::{Request, StatusCode};
     use chrono::Utc;
+    use mu_ci_controller::app::create_router;
+    use mu_ci_controller::cluster::ClusterRegistry;
+    use mu_ci_controller::config::Config;
+    use mu_ci_controller::job::{Job, JobStatus, JobStore};
+    use mu_ci_controller::scheduler::DAGScheduler;
+    use mu_ci_controller::webhook::AppState;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -133,7 +133,7 @@ async fn test_job_card_svg_route_and_headers() {
         tx,
         log_broadcaster,
 
-        console: action_runner_controller::console::ConsoleState::default(),
+        console: mu_ci_controller::console::ConsoleState::default(),
     });
 
     let job = Job {
@@ -188,14 +188,14 @@ async fn test_job_card_svg_route_and_headers() {
 
 #[tokio::test]
 async fn test_sse_dashboard_and_job_events_push() {
-    use action_runner_controller::app::create_router;
-    use action_runner_controller::cluster::ClusterRegistry;
-    use action_runner_controller::config::Config;
-    use action_runner_controller::job::{Job, JobStore};
-    use action_runner_controller::webhook::AppState;
     use axum::http::{Request, StatusCode};
     use chrono::Utc;
     use futures_util::StreamExt;
+    use mu_ci_controller::app::create_router;
+    use mu_ci_controller::cluster::ClusterRegistry;
+    use mu_ci_controller::config::Config;
+    use mu_ci_controller::job::{Job, JobStore};
+    use mu_ci_controller::webhook::AppState;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -229,7 +229,7 @@ async fn test_sse_dashboard_and_job_events_push() {
         tx,
         log_broadcaster,
 
-        console: action_runner_controller::console::ConsoleState::default(),
+        console: mu_ci_controller::console::ConsoleState::default(),
     });
 
     let job_id = "job-sse-456".to_string();
@@ -381,7 +381,7 @@ on_action:
 
 #[test]
 fn test_config_resolve_secret_fail_closed_on_missing_path() {
-    use action_runner_controller::config::Config;
+    use mu_ci_controller::config::Config;
 
     // 1. Nonexistent absolute path must fail closed to None
     let missing_path = "/tmp/actionrunner_missing_secret_test.key";

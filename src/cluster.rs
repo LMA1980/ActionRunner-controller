@@ -1,5 +1,5 @@
-use action_runner_ipc::{StageCancelTask, StageDispatchTask, WorkerHeartbeat, WorkerRegistration};
 use chrono::{DateTime, Utc};
+use mu_ci_ipc::{StageCancelTask, StageDispatchTask, WorkerHeartbeat, WorkerRegistration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -162,7 +162,7 @@ impl ClusterRegistry {
         //    so native silicon remains available for hardware verification/benchmarks unless all
         //    x86_64 workers are busy.
         // 3. Round-robin (`last_dispatched_seq`) and CPU load (`load_int`) so all eligible nodes
-        //    (e.g. `node-a` / `entrance` and `node-b` / `rubicon`) share compilation evenly
+        //    (e.g. `node-a` and `node-b`) share compilation evenly
         //    without penalizing nodes that advertise extra hygiene tags (`fmt`, `audit`, `docs`).
         const HW_EXCLUSIVE_TAGS: &[&str] = &[
             "k3",

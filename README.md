@@ -1,21 +1,21 @@
-# ActionRunner-controller
+# mu-ci-controller
 
 <p align="center">
   <a href="https://hook.lma1980.duckdns.org/jobs">
-    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/ActionRunner-controller/card.svg" alt="ActionRunner-controller Factory Scorecard" width="520"/>
+    <img src="https://hook.lma1980.duckdns.org/cards/LMA1980/mu-ci-controller/card.svg" alt="mu-ci-controller Factory Scorecard" width="520"/>
   </a>
 </p>
 
 <p align="center">
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/ActionRunner-controller/status.svg" alt="CI Status"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/ActionRunner-controller/score.svg" alt="Quality Score"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/ActionRunner-controller/coverage.svg" alt="Coverage"/></a>
-  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/ActionRunner-controller/benchmark.svg" alt="Benchmark"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-controller/status.svg" alt="CI Status"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-controller/score.svg" alt="Quality Score"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-controller/coverage.svg" alt="Coverage"/></a>
+  <a href="https://hook.lma1980.duckdns.org/jobs"><img src="https://hook.lma1980.duckdns.org/badges/LMA1980/mu-ci-controller/benchmark.svg" alt="Benchmark"/></a>
 </p>
 
 ---
 
-WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for the Distributed **ActionRunner** Platform.
+WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for the Distributed **Mu-CI** Platform.
 
 ## Architecture
 
@@ -28,9 +28,9 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 
 - **Read-only Console API**: `GET /api/repos` (with the `.gitmodules` submodule/parent graph), `GET /api/repos/{owner}/{repo}/summary`, `GET /api/repos/{owner}/{repo}/topology` (branches, stations, trains, `fabric_rev`), and additive SSE kinds on `/api/events` for MuConsole. Private repositories are only served to requests that present the API key. See [docs/console-api.md](docs/console-api.md).
 
-## Declarative `sccache` Compiler Cache Configuration (`.actionrunner/ActionRunner.yml`)
+## Declarative `sccache` Compiler Cache Configuration (`.muci/mu-ci.yml` / `.actionrunner/ActionRunner.yml`)
 
-`ActionRunner-controller` supports declarative [`sccache`](https://github.com/mozilla/sccache) compiler cache policies at the **workflow**, **stage**, and **task** levels inside `.actionrunner/ActionRunner.yml`.
+`mu-ci-controller` supports declarative [`sccache`](https://github.com/mozilla/sccache) compiler cache policies at the **workflow**, **stage**, and **task** levels inside `.muci/mu-ci.yml` (and backward-compatible `.actionrunner/ActionRunner.yml`).
 
 > **Complete Operator & Workflow Portal Guide**: See [**Operator & Workflow Guide: Distributed `sccache` Compilation Caching**](https://github.com/LMA1980/lma1980.github.io/blob/main/content/docs/sccache-guide.md) for a complete walkthrough of how `sccache` influences build timings (cold Build #1 vs. warm Build #2+), `CARGO_INCREMENTAL=0`, cross-node toolchain alignment, and worker setup.
 
@@ -49,7 +49,7 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 - **Eligible Compiler Tools**: `cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, and `trunk`.
 - **Excluded Tools**: `cargo-fmt`, `cargo-audit`, `mdformat`, `cargo-llvm-cov`, and `cargo-miri` automatically bypass `sccache` so Miri's wrapper and LLVM coverage instrumentation are never clobbered. When `sccache: mandatory` is set at the workflow root, pure hygiene stages containing only non-compiler tasks (e.g., `cargo-fmt`, `mdformat`, `cargo-audit`) do not force the `"sccache"` worker tag requirement.
 
-### 3. Example `.actionrunner/ActionRunner.yml`
+### 3. Example `.muci/mu-ci.yml`
 
 ```yaml
 version: "3"
@@ -105,7 +105,7 @@ on_action:
   pull_request: ["fmt-check", "clippy-check", "build-release", "test-suite"]
 ```
 
-For worker-side `sccache` binary installation and `/etc/action-runner/sccache.env` S3/Garage configuration, see the Operator Guide in [`ActionRunner-rs/README.md`](https://github.com/LMA1980/ActionRunner-rs#operator-guide-shared-sccache-compiler-cache-integration).
+For worker-side `sccache` binary installation and `/etc/action-runner/sccache.env` S3/Garage configuration, see the Operator Guide in [`mu-ci-worker/README.md`](https://github.com/LMA1980/mu-ci-worker#operator-guide-shared-sccache-compiler-cache-integration).
 
 ## License
 

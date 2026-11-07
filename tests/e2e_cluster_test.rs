@@ -1,12 +1,12 @@
-use action_runner::config::{IsolationMode, WorkerConfig};
-use action_runner::worker::WorkerAgent;
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::Config;
-use action_runner_controller::job::{Job, JobStatus, JobStore, StageStatus};
-use action_runner_controller::scheduler::DAGScheduler;
-use action_runner_controller::webhook::AppState;
 use chrono::Utc;
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::Config;
+use mu_ci_controller::job::{Job, JobStatus, JobStore, StageStatus};
+use mu_ci_controller::scheduler::DAGScheduler;
+use mu_ci_controller::webhook::AppState;
+use mu_ci_worker::config::{IsolationMode, WorkerConfig};
+use mu_ci_worker::worker::WorkerAgent;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,9 +17,7 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn test_end_to_end_distributed_dag_execution() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            "action_runner=debug,action_runner_controller=debug,action_runner_ipc=debug",
-        )
+        .with_env_filter("mu_ci_worker=debug,mu_ci_controller=debug,mu_ci_ipc=debug")
         .try_init();
 
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -158,7 +156,7 @@ on_action:
         tx,
         log_broadcaster,
 
-        console: action_runner_controller::console::ConsoleState::default(),
+        console: mu_ci_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state.clone());
@@ -463,7 +461,7 @@ edition = "2021"
         tx,
         log_broadcaster,
 
-        console: action_runner_controller::console::ConsoleState::default(),
+        console: mu_ci_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state);
@@ -817,7 +815,7 @@ edition = "2021"
         tx,
         log_broadcaster,
 
-        console: action_runner_controller::console::ConsoleState::default(),
+        console: mu_ci_controller::console::ConsoleState::default(),
     });
 
     let app = create_router(state);

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use muobserve_ipc::{CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot};
+use mu_observable_ipc::{CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

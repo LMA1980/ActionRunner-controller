@@ -1,6 +1,6 @@
 use crate::job::{JobMetrics, SubmoduleMetrics};
-use action_runner_ipc::{LogEntry, MetricEntry};
 use chrono::{DateTime, Utc};
+use mu_ci_ipc::{LogEntry, MetricEntry};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;

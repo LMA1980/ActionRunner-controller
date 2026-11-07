@@ -1,5 +1,5 @@
-use action_runner_controller::cluster::{ClusterRegistry, WorkerCommand};
-use action_runner_ipc::{WorkerHeartbeat, WorkerRegistration};
+use mu_ci_controller::cluster::{ClusterRegistry, WorkerCommand};
+use mu_ci_ipc::{WorkerHeartbeat, WorkerRegistration};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

@@ -6,19 +6,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::{Config, HaRole, HaRoleConfig};
-use action_runner_controller::console::{ConsoleConfig, ConsoleState};
-use action_runner_controller::job::JobStore;
-use action_runner_controller::storage_backend::{ControllerStorage, InMemoryStorage};
-use action_runner_controller::webhook::AppState;
-use action_runner_ipc::{
+use axum::http::StatusCode;
+use futures_util::{SinkExt, StreamExt};
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::{Config, HaRole, HaRoleConfig};
+use mu_ci_controller::console::{ConsoleConfig, ConsoleState};
+use mu_ci_controller::job::JobStore;
+use mu_ci_controller::storage_backend::{ControllerStorage, InMemoryStorage};
+use mu_ci_controller::webhook::AppState;
+use mu_ci_ipc::{
     create_fory_runtime, IpcHeader, WorkerHeartbeat, WorkerRegistration, MSG_TYPE_WORKER_HEARTBEAT,
     MSG_TYPE_WORKER_REGISTRATION,
 };
-use axum::http::StatusCode;
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::connect_async;
@@ -184,7 +184,7 @@ async fn test_adversarial_leader_demotion_evicts_concurrent_workers_within_500ms
         };
         let payload = fory.serialize(&reg).unwrap();
         let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
-        let mut frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
+        let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
         frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
         frame.extend_from_slice(&payload);
         stream.send(WsMessage::Binary(frame.into())).await.unwrap();
@@ -547,8 +547,8 @@ async fn test_adversarial_disconnect_flood_no_leaks() {
 /// Tests that `disconnect_all()` async send fallback reliably delivers CloseFrame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_adversarial_demotion_eviction_under_channel_backpressure() {
-    use action_runner_controller::cluster::WorkerCommand;
-    use action_runner_ipc::StageCancelTask;
+    use mu_ci_controller::cluster::WorkerCommand;
+    use mu_ci_ipc::StageCancelTask;
 
     let ws = tempfile::tempdir().expect("ws");
     let storage: Arc<dyn ControllerStorage> = Arc::new(InMemoryStorage::open());

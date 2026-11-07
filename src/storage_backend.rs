@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use muobserve_ipc::{
+use mu_observable_ipc::{
     decode_control_envelope, encode_control_envelope, read_frame, write_frame,
     CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot, ControlRpcEnvelope,
     IpcHeader, QueryBranchSnapshotsRequest, QueryJobsHistoryRequest,
@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 use crate::db::{AuthInviteRecord, AuthUserRecord, CatalogStore, RedeemInviteError};
 use crate::job::{extract_submodule_job, normalize_ref, Job, JobMetrics, JobRecord, JobStatus};
 
-/// Storage backend mode for `ActionRunner-controller` after Phase 3 local DuckDB decommissioning (`#45`–`#47`).
+/// Storage backend mode for `mu-ci-controller` after Phase 3 local DuckDB decommissioning (`#45`–`#47`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StorageBackendMode {
     /// Remote `MuObserve` control-plane storage via Apache Fory RPC over `MUOB` framing.
@@ -88,7 +88,7 @@ const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
 const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
 const INTERNAL_CONSOLE_REPO_KEY: &str = "__ar_console_registry__";
 
-/// Abstract persistence interface for `ActionRunner-controller` job records, branch snapshots,
+/// Abstract persistence interface for `mu-ci-controller` job records, branch snapshots,
 /// submodule snapshots, shared job logs, single-leader leases, and hardware-stratified regression gate queries (`#43`, `#78`–`#84`).
 pub trait ControllerStorage: Send + Sync {
     /// Upserts a single [`JobRecord`] and synchronizes its branch and submodule snapshots.
@@ -1742,7 +1742,7 @@ pub fn job_root_traceparent(job_id: &str, commit_sha: &str) -> String {
     job_root_trace_context(job_id, commit_sha).to_traceparent()
 }
 
-/// Maps a numeric quality score (`0..=100`) to `ActionRunner-controller`'s letter grade scale.
+/// Maps a numeric quality score (`0..=100`) to `mu-ci-controller`'s letter grade scale.
 #[must_use]
 pub fn compute_letter_grade(score: u32) -> String {
     match score {

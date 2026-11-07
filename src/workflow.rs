@@ -1,4 +1,4 @@
-use action_runner_ipc::SccacheMode;
+use mu_ci_ipc::SccacheMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 

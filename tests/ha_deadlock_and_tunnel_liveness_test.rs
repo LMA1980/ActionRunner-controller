@@ -9,22 +9,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::{Config, HaRole, HaRoleConfig};
-use action_runner_controller::console::{ConsoleConfig, ConsoleState};
-use action_runner_controller::job::{Job, JobRecord, JobStore};
-use action_runner_controller::storage_backend::{ControllerStorage, InMemoryStorage, LeaderLease};
-use action_runner_controller::webhook::AppState;
-use action_runner_ipc::{
-    create_fory_runtime, IpcHeader, WorkerHeartbeat, WorkerRegistration, MSG_TYPE_WORKER_HEARTBEAT,
-    MSG_TYPE_WORKER_REGISTRATION,
-};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use muobserve_ipc::{
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::{Config, HaRole, HaRoleConfig};
+use mu_ci_controller::console::{ConsoleConfig, ConsoleState};
+use mu_ci_controller::job::{Job, JobRecord, JobStore};
+use mu_ci_controller::storage_backend::{ControllerStorage, InMemoryStorage, LeaderLease};
+use mu_ci_controller::webhook::AppState;
+use mu_ci_ipc::{
+    create_fory_runtime, IpcHeader, WorkerHeartbeat, WorkerRegistration, MSG_TYPE_WORKER_HEARTBEAT,
+    MSG_TYPE_WORKER_REGISTRATION,
+};
+use mu_observable_ipc::{
     CentralBranchSnapshot, CentralSubmoduleSnapshot, RegressionGateReport, RegressionGateRequest,
 };
 use tokio::net::TcpListener;
@@ -515,7 +515,7 @@ async fn test_standby_tunnel_rejection_and_demotion_eviction() {
     };
     let payload = fory.serialize(&reg).expect("serialize reg");
     let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
-    let mut reg_frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
+    let mut reg_frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
     reg_frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
     reg_frame.extend_from_slice(&payload);
     ws_stream
@@ -544,7 +544,7 @@ async fn test_standby_tunnel_rejection_and_demotion_eviction() {
     };
     let hb_payload = fory.serialize(&hb).expect("serialize hb");
     let hb_header = IpcHeader::new(MSG_TYPE_WORKER_HEARTBEAT, hb_payload.len() as u32, 0, 2);
-    let mut hb_frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + hb_payload.len());
+    let mut hb_frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + hb_payload.len());
     hb_frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&hb_header));
     hb_frame.extend_from_slice(&hb_payload);
     ws_stream

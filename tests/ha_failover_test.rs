@@ -5,21 +5,19 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::{Config, HaRole, HaRoleConfig};
-use action_runner_controller::console::{ConsoleConfig, ConsoleState};
-use action_runner_controller::job::{
-    Job, JobRecord, JobStatus, JobStore, StageRecord, StageStatus,
-};
-use action_runner_controller::storage_backend::{
-    ControllerStorage, InMemoryStorage, MuObserveRemoteConfig, MuObserveRemoteStorage,
-};
-use action_runner_controller::webhook::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use muobserve_ipc::{
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::{Config, HaRole, HaRoleConfig};
+use mu_ci_controller::console::{ConsoleConfig, ConsoleState};
+use mu_ci_controller::job::{Job, JobRecord, JobStatus, JobStore, StageRecord, StageStatus};
+use mu_ci_controller::storage_backend::{
+    ControllerStorage, InMemoryStorage, MuObserveRemoteConfig, MuObserveRemoteStorage,
+};
+use mu_ci_controller::webhook::AppState;
+use mu_observable_ipc::{
     decode_control_envelope, encode_control_envelope, read_frame, write_frame,
     CentralSubmoduleSnapshot, ControlRpcEnvelope, IpcHeader, QuerySubmoduleSnapshotsResponse,
     UpsertJobRecordResponse, MSG_TYPE_FORY_CONTROL,
@@ -641,7 +639,7 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
     state_a
         .cluster
         .register(
-            action_runner_ipc::WorkerRegistration {
+            mu_ci_ipc::WorkerRegistration {
                 node_id: "worker-riscv64".to_string(),
                 arch: "riscv64".to_string(),
                 tags: vec!["riscv64".to_string(), "k3".to_string()],
@@ -660,7 +658,7 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
     state_b
         .cluster
         .register(
-            action_runner_ipc::WorkerRegistration {
+            mu_ci_ipc::WorkerRegistration {
                 node_id: "worker-stale-standby".to_string(),
                 arch: "x86_64".to_string(),
                 tags: vec!["default".to_string()],
@@ -687,7 +685,7 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
     );
     assert!(matches!(
         cmd_rx_b.try_recv(),
-        Ok(action_runner_controller::cluster::WorkerCommand::Disconnect)
+        Ok(mu_ci_controller::cluster::WorkerCommand::Disconnect)
     ));
 
     // A subsequent tick on node-b must stay Standby (no ping-pong) now that stale workers were disconnected
@@ -973,10 +971,8 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
         )
         .await;
     let _ = state_a.job_store.claim_next_queued_job(4).await.unwrap();
-    let _guard = action_runner_controller::job::InFlightJobGuard::new(
-        state_a.job_store.clone(),
-        job1.id.clone(),
-    );
+    let _guard =
+        mu_ci_controller::job::InFlightJobGuard::new(state_a.job_store.clone(), job1.id.clone());
     state_a
         .job_store
         .set_stages(

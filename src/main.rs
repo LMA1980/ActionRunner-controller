@@ -3,27 +3,27 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::Config;
-use action_runner_controller::console::{spawn_reconciler, ConsoleConfig, ConsoleState};
-use action_runner_controller::job::JobStore;
-use action_runner_controller::scheduler::DAGScheduler;
-use action_runner_controller::webhook::AppState;
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::Config;
+use mu_ci_controller::console::{spawn_reconciler, ConsoleConfig, ConsoleState};
+use mu_ci_controller::job::JobStore;
+use mu_ci_controller::scheduler::DAGScheduler;
+use mu_ci_controller::webhook::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "action_runner_controller=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "mu_ci_controller=info,tower_http=info".into()),
         )
         .init();
 
     let config = Config::load();
     let bind_addr: SocketAddr = config.bind_addr.parse()?;
 
-    info!("Starting ActionRunner-controller on {}", bind_addr);
+    info!("Starting mu-ci-controller on {}", bind_addr);
     info!("Allowed repositories: {:?}", config.allowed_repositories);
     info!("Workspace directory:  {}", config.workspace_dir.display());
 
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_broadcaster,
         console,
     });
-    action_runner_controller::webhook::spawn_ha_coordinator(state.clone());
+    mu_ci_controller::webhook::spawn_ha_coordinator(state.clone());
 
     let app = create_router(state);
 

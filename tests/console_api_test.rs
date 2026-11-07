@@ -1,20 +1,18 @@
 //! Integration tests for the read-only console API (`/api/repos`, `/summary`,
 //! `/topology`) and the additive SSE kinds on `/api/events` (#50).
 
-use action_runner_controller::app::create_router;
-use action_runner_controller::cluster::ClusterRegistry;
-use action_runner_controller::config::Config;
-use action_runner_controller::console::{ConsoleConfig, ConsoleState};
-use action_runner_controller::job::{
-    Job, JobMetrics, JobStatus, JobStore, StageRecord, StageStatus,
-};
-use action_runner_controller::webhook::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
+use mu_ci_controller::app::create_router;
+use mu_ci_controller::cluster::ClusterRegistry;
+use mu_ci_controller::config::Config;
+use mu_ci_controller::console::{ConsoleConfig, ConsoleState};
+use mu_ci_controller::job::{Job, JobMetrics, JobStatus, JobStore, StageRecord, StageStatus};
+use mu_ci_controller::webhook::AppState;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -826,7 +824,7 @@ async fn sse_emits_additive_console_kinds_and_filters_private() {
     state
         .cluster
         .register(
-            action_runner_ipc::WorkerRegistration {
+            mu_ci_ipc::WorkerRegistration {
                 node_id: "worker-riscv64".to_string(),
                 arch: "riscv64".to_string(),
                 tags: vec!["k3".to_string()],
