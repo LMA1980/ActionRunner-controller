@@ -28,6 +28,83 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 
 - **Read-only Console API**: `GET /api/repos` (with the `.gitmodules` submodule/parent graph), `GET /api/repos/{owner}/{repo}/summary`, `GET /api/repos/{owner}/{repo}/topology` (branches, stations, trains, `fabric_rev`), and additive SSE kinds on `/api/events` for MuConsole. Private repositories are only served to requests that present the API key. See [docs/console-api.md](docs/console-api.md).
 
+## Declarative `sccache` Compiler Cache Configuration (`.actionrunner/ActionRunner.yml`)
+
+`ActionRunner-controller` supports declarative [`sccache`](https://github.com/mozilla/sccache) compiler cache policies at the **workflow**, **stage**, and **task** levels inside `.actionrunner/ActionRunner.yml`.
+
+### 1. Policy Modes (`SccacheMode`)
+
+| Policy Value | Accepted YAML Literals | Behavior |
+| :--- | :--- | :--- |
+| **`try`** *(default)* | `try`, `true`, `auto`, `yes`, `1` | Uses `sccache` (`RUSTC_WRAPPER` + `CARGO_INCREMENTAL=0`) on eligible compiler tasks when `sccache` is installed and healthy on the assigned worker; falls back cleanly to uncached `rustc` compilation if unavailable or if the S3 backend is unreachable. |
+| **`mandatory`** | `mandatory`, `required`, `strict` | Requires `sccache` for compilation. The DAG scheduler automatically appends `"sccache"` to the stage's required worker capability tags (both during pre-claim slot reservation and `lease_slot`), and the worker fails closed (`exit_code = 126`) if `sccache` is missing or fails its pre-flight `--show-stats` health check. |
+| **`false`** | `false`, `off`, `disabled`, `no`, `0` | Disables `sccache` and strips `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER` from the task environment. |
+
+### 2. Hierarchical Inheritance & Tool Eligibility
+
+- **Resolution Precedence**:
+  $$\text{tasks.\<id\>.sccache} \longrightarrow \text{stages}[i]\text{.sccache} \longrightarrow \text{workflow.sccache} \longrightarrow \text{try}$$
+- **Eligible Compiler Tools**: `cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, and `trunk`.
+- **Excluded Tools**: `cargo-fmt`, `cargo-audit`, `mdformat`, `cargo-llvm-cov`, and `cargo-miri` automatically bypass `sccache` so Miri's wrapper and LLVM coverage instrumentation are never clobbered. When `sccache: mandatory` is set at the workflow root, pure hygiene stages containing only non-compiler tasks (e.g., `cargo-fmt`, `mdformat`, `cargo-audit`) do not force the `"sccache"` worker tag requirement.
+
+### 3. Example `.actionrunner/ActionRunner.yml`
+
+```yaml
+version: "3"
+name: "Distributed Pipeline with Shared sccache"
+sccache: try # Workflow-wide default (try | mandatory | false)
+
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--all", "--", "--check"]
+
+  clippy-task:
+    tool: "cargo-clippy"
+    args: ["--workspace", "--all-targets", "--", "-D", "warnings"]
+
+  release-build-task:
+    tool: "cargo-build"
+    args: ["--workspace", "--release"]
+    sccache: mandatory # Task-level override requiring sccache
+
+  uncached-test-task:
+    tool: "cargo-test"
+    args: ["--workspace"]
+    sccache: false # Task-level override disabling sccache
+
+stages:
+  - id: fmt-check
+    name: "Verify Formatting"
+    tasks: ["fmt-task"]
+    tags: ["fmt"]
+
+  - id: clippy-check
+    name: "Verify Linter Hygiene"
+    tasks: ["clippy-task"]
+    depends_on: ["fmt-check"]
+    tags: ["clippy"]
+
+  - id: build-release
+    name: "Build Release Binaries"
+    tasks: ["release-build-task"]
+    depends_on: ["clippy-check"]
+    tags: ["build"] # Controller automatically appends "sccache" tag due to mandatory task
+
+  - id: test-suite
+    name: "Run Uncached Tests"
+    tasks: ["uncached-test-task"]
+    depends_on: ["build-release"]
+    tags: ["test"]
+    sccache: false # Stage-level override
+
+on_action:
+  push: ["fmt-check", "clippy-check", "build-release", "test-suite"]
+  pull_request: ["fmt-check", "clippy-check", "build-release", "test-suite"]
+```
+
+For worker-side `sccache` binary installation and `/etc/action-runner/sccache.env` S3/Garage configuration, see the Operator Guide in [`ActionRunner-rs/README.md`](https://github.com/LMA1980/ActionRunner-rs#operator-guide-shared-sccache-compiler-cache-integration).
+
 ## License
 
 Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0-only). See LICENSE for details.
