@@ -32,12 +32,14 @@ WebAPI, Ingress Gateway, DAG Stage Scheduler, and SVG Scorecard Controller for t
 
 `ActionRunner-controller` supports declarative [`sccache`](https://github.com/mozilla/sccache) compiler cache policies at the **workflow**, **stage**, and **task** levels inside `.actionrunner/ActionRunner.yml`.
 
-### 1. Policy Modes (`SccacheMode`)
+> **Complete Operator & Workflow Portal Guide**: See [**Operator & Workflow Guide: Distributed `sccache` Compilation Caching**](https://github.com/LMA1980/lma1980.github.io/blob/main/content/docs/sccache-guide.md) for a complete walkthrough of how `sccache` influences build timings (cold Build #1 vs. warm Build #2+), `CARGO_INCREMENTAL=0`, cross-node toolchain alignment, and worker setup.
 
-| Policy Value | Accepted YAML Literals | Behavior |
+### 1. Policy Modes (`SccacheMode`) & How They Influence Scheduling & Reliability
+
+| Policy Value | Accepted YAML Literals | Scheduling & Runtime Experience |
 | :--- | :--- | :--- |
-| **`try`** *(default)* | `try`, `true`, `auto`, `yes`, `1` | Uses `sccache` (`RUSTC_WRAPPER` + `CARGO_INCREMENTAL=0`) on eligible compiler tasks when `sccache` is installed and healthy on the assigned worker; falls back cleanly to uncached `rustc` compilation if unavailable or if the S3 backend is unreachable. |
-| **`mandatory`** | `mandatory`, `required`, `strict` | Requires `sccache` for compilation. The DAG scheduler automatically appends `"sccache"` to the stage's required worker capability tags (both during pre-claim slot reservation and `lease_slot`), and the worker fails closed (`exit_code = 126`) if `sccache` is missing or fails its pre-flight `--show-stats` health check. |
+| **`try`** *(default)* | `try`, `true`, `auto`, `yes`, `1` | **Default when `sccache:` is omitted.** Dispatches to any worker matching the stage's `tags`. Uses `sccache` (`RUSTC_WRAPPER` + `CARGO_INCREMENTAL=0` + `SCCACHE_IDLE_TIMEOUT=0`) on eligible compiler tasks when `sccache` is installed and healthy on the assigned worker; **never breaks your build**—falls back cleanly to uncached `rustc` compilation if `sccache` is not installed or if the S3 backend is temporarily unreachable. |
+| **`mandatory`** | `mandatory`, `required`, `strict` | Strictly requires `sccache` for compilation. The DAG scheduler automatically appends `"sccache"` to the stage's required worker capability tags (both during pre-claim slot reservation and `lease_slot`—if no matching online worker advertises `"sccache"`, the stage remains `Queued`), and the worker fails closed (`exit_code = 126`) if `sccache` is missing or fails its pre-flight `--show-stats` health check. |
 | **`false`** | `false`, `off`, `disabled`, `no`, `0` | Disables `sccache` and strips `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER` from the task environment. |
 
 ### 2. Hierarchical Inheritance & Tool Eligibility
