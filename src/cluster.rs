@@ -45,6 +45,16 @@ pub struct ActiveWorker {
     pub command_tx: mpsc::Sender<WorkerCommand>,
 }
 
+/// Returns `true` if a worker has critically low available RAM (`< 256 MiB` free
+/// and `>= 90%` utilized), preventing new stage dispatches from triggering OOM.
+pub fn is_worker_memory_exhausted(ram_total_mb: u64, ram_used_mb: u64) -> bool {
+    if ram_total_mb == 0 || ram_used_mb == 0 {
+        return false;
+    }
+    let avail_mb = ram_total_mb.saturating_sub(ram_used_mb);
+    avail_mb < 256 && ram_used_mb.saturating_mul(100) >= ram_total_mb.saturating_mul(90)
+}
+
 #[derive(Clone, Default)]
 pub struct ClusterRegistry {
     workers: Arc<RwLock<HashMap<String, ActiveWorker>>>,
@@ -167,8 +177,11 @@ impl ClusterRegistry {
         let stage_requests_hw = required_tags
             .iter()
             .any(|req| HW_EXCLUSIVE_TAGS.contains(&req.as_str()));
+        let stage_is_untagged_default =
+            required_tags.is_empty() || required_tags.iter().all(|req| req == "default");
 
-        let mut best_node: Option<(String, (usize, u8, u64, i32))> = None;
+        type NodeDispatchScore = (usize, u8, u8, u64, i32);
+        let mut best_node: Option<(String, NodeDispatchScore)> = None;
 
         for (node_id, worker) in workers.iter() {
             // Heartbeat timeout check: 15 seconds (default) or configurable
@@ -178,6 +191,10 @@ impl ClusterRegistry {
                 .unwrap_or(15);
             let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
             if secs_since_seen > timeout_secs {
+                continue;
+            }
+
+            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
                 continue;
             }
 
@@ -226,9 +243,18 @@ impl ClusterRegistry {
             if matches_tags {
                 let node_is_hw = HW_EXCLUSIVE_TAGS.iter().any(|t| node_tags.contains(t));
                 let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
+                let node_is_low_ram =
+                    worker.registration.ram_total_mb > 0 && worker.registration.ram_total_mb < 8192;
+                let low_ram_tier = u8::from(stage_is_untagged_default && node_is_low_ram);
                 let active_leases = worker.leased_stages.len();
                 let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let score = (active_leases, hw_tier, worker.last_dispatched_seq, load_int);
+                let score = (
+                    active_leases,
+                    hw_tier,
+                    low_ram_tier,
+                    worker.last_dispatched_seq,
+                    load_int,
+                );
                 if match &best_node {
                     None => true,
                     Some((best_id, best_score)) => {
@@ -447,6 +473,9 @@ impl ClusterRegistry {
             if secs_since_seen > timeout_secs {
                 continue;
             }
+            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
+                continue;
+            }
             if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
                 continue;
             }
@@ -493,6 +522,9 @@ impl ClusterRegistry {
         for worker in workers.values() {
             let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
             if secs_since_seen > timeout_secs {
+                continue;
+            }
+            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
                 continue;
             }
             if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
@@ -564,6 +596,10 @@ impl ClusterRegistry {
                 if secs_since_seen > 15 {
                     continue;
                 }
+                if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb)
+                {
+                    continue;
+                }
                 if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
                     continue;
                 }
@@ -618,6 +654,10 @@ impl ClusterRegistry {
             for (node_id, worker) in workers.iter() {
                 let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
                 if secs_since_seen > 15 {
+                    continue;
+                }
+                if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb)
+                {
                     continue;
                 }
                 if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
@@ -1310,5 +1350,85 @@ mod tests {
             .release_stage_slot("node-1", "job-2", "stage-2")
             .await;
         assert!(!cluster.has_active_leases_for_job("job-2").await);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_oom_admission_guard_and_low_ram_tiering() {
+        let cluster = ClusterRegistry::new();
+        let (tx_low, _rx_low) = mpsc::channel(10);
+        let (tx_high, _rx_high) = mpsc::channel(10);
+
+        let mut reg_low = make_reg("worker-aarch64", &["aarch64", "fmt", "docs", "audit"], 1);
+        reg_low.arch = "aarch64".to_string();
+        reg_low.ram_total_mb = 3793; // ~3.7 GiB usable on 4 GiB board
+        cluster.register(reg_low, tx_low).await;
+
+        let mut reg_high = make_reg("node-a", &["x86_64", "fmt", "docs", "audit", "build"], 1);
+        reg_high.ram_total_mb = 16384; // 16 GiB
+        cluster.register(reg_high, tx_high).await;
+
+        // 1. Untagged ("default") stage prefers >= 8 GiB worker ("node-a") over < 8 GiB auxiliary worker
+        let l1 = cluster
+            .lease_slot(
+                "job-1",
+                "default-build",
+                &["default".to_string()],
+                None,
+                false,
+            )
+            .await
+            .expect("should lease node-a");
+        assert_eq!(l1.0, "node-a");
+        cluster
+            .release_stage_slot("node-a", "job-1", "default-build")
+            .await;
+
+        // 2. Explicitly tagged hygiene stage ("fmt") treats both workers as tier 0
+        let l2 = cluster
+            .lease_slot("job-2", "fmt-1", &["fmt".to_string()], None, false)
+            .await
+            .expect("should leaseworker-aarch64 (seq 0 < seq 1)");
+        assert_eq!(l2.0, "worker-aarch64");
+        cluster
+            .release_stage_slot("worker-aarch64", "job-2", "fmt-1")
+            .await;
+
+        // 3. When 4 GiB worker reports >= 90% memory used and < 256 MiB free, OOM guard blocks dispatch
+        cluster
+            .heartbeat(WorkerHeartbeat {
+                node_id: "worker-aarch64".to_string(),
+                active_slots: 0,
+                cpu_load_pct: 10.0,
+                ram_used_mb: 3650, // 143 MiB free (< 256 MiB), 96.2% used
+                timestamp_epoch_ms: 1000,
+            })
+            .await;
+        assert!(is_worker_memory_exhausted(3793, 3650));
+
+        // Requesting "aarch64" must return None while worker-aarch64 is in OOM exhaustion
+        let blocked = cluster
+            .lease_slot("job-3", "arm-stage", &["aarch64".to_string()], None, false)
+            .await;
+        assert!(
+            blocked.is_none(),
+            "Worker under OOM memory exhaustion must not receive new stage leases"
+        );
+
+        // Once memory frees up, dispatch succeeds again
+        cluster
+            .heartbeat(WorkerHeartbeat {
+                node_id: "worker-aarch64".to_string(),
+                active_slots: 0,
+                cpu_load_pct: 5.0,
+                ram_used_mb: 600,
+                timestamp_epoch_ms: 2000,
+            })
+            .await;
+        let recovered = cluster
+            .lease_slot("job-3", "arm-stage", &["aarch64".to_string()], None, false)
+            .await
+            .expect("should lease after memory pressure subsides");
+        assert_eq!(recovered.0, "worker-aarch64");
     }
 }
