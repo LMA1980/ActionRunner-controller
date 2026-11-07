@@ -27,3 +27,8 @@ description: "Develop and maintain the ActionRunner-controller webhook ingress, 
 - **Pending Slot Reservation & Exclusive Stage Probe (`#109`)**:
   - `ClusterRegistry::sync_and_try_reserve_for_claim` atomically reserves a worker slot (`pending_claims` / `pending_exclusive_claim`) when `claim_next_queued_job_for_cluster` claims a job, preventing `DAGScheduler::run_loop` from over-claiming multiple queued jobs against the same single idle worker slot before `execute_job` finishes `git fetch` and calls `lease_slot`.
   - `StageRecord` persists `#[serde(default)] pub exclusive: bool` and `has_available_slot_for_stage` enforces "Drain Before Dispatch" (`worker.leased_stages.is_empty() && worker.pending_claims.is_empty()`) when `exclusive: true`.
+
+## 4. Declarative `sccache` Policy & Tag Routing (`#105`, `#128`)
+
+- `.actionrunner/ActionRunner.yml` supports `sccache: try | mandatory | false` at workflow, stage, and task levels (`resolve_task_sccache`: `task.sccache -> stage.sccache -> workflow.sccache -> SccacheMode::Try`).
+- `ActionRunnerWorkflow::effective_stage_tags` appends `"sccache"` to a stage's required worker capability tags (used in both `StageRecord.tags` for pre-claim slot reservation and `lease_slot` at dispatch time) whenever the stage or any of its eligible compiler tasks (`cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, `trunk`) resolves to `SccacheMode::Mandatory`.
