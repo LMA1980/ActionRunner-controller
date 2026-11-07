@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{TimeZone, Utc};
-use muobserve_ipc::{
+use mu_observable_ipc::{
     decode_control_envelope, encode_control_envelope, read_frame, write_frame,
     BenchmarkRegressionItem, CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot,
     ControlRpcEnvelope, IpcHeader, QueryBranchSnapshotsResponse, QueryJobsHistoryResponse,
@@ -19,14 +19,14 @@ use muobserve_ipc::{
 };
 use tokio::net::TcpListener;
 
-use action_runner_controller::job::{Job, JobMetrics, JobRecord, JobStatus, SubmoduleMetrics};
-use action_runner_controller::scheduler::build_v3_stage_dispatch_task;
-use action_runner_controller::storage_backend::{
+use mu_ci_controller::job::{Job, JobMetrics, JobRecord, JobStatus, SubmoduleMetrics};
+use mu_ci_controller::scheduler::build_v3_stage_dispatch_task;
+use mu_ci_controller::storage_backend::{
     apply_regression_gate_to_job, compute_letter_grade, job_root_trace_context,
     job_root_traceparent, ControllerStorage, InMemoryStorage, MuObserveRemoteConfig,
     MuObserveRemoteStorage,
 };
-use action_runner_controller::workflow::{ActionRunnerWorkflow, StageConfig, TaskConfig};
+use mu_ci_controller::workflow::{ActionRunnerWorkflow, StageConfig, TaskConfig};
 
 #[derive(Default)]
 struct MockMuObserveState {

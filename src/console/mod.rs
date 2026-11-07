@@ -721,13 +721,20 @@ impl ConsoleState {
         };
 
         let mut stations: Option<Option<Vec<Station>>> = None;
-        for name in ["ActionRunner.yml", "ActionRunner.yaml"] {
-            let path = format!(".actionrunner/{name}");
+        let candidates = [
+            ".muci/mu-ci.yml",
+            ".muci/mu-ci.yaml",
+            ".muci/ActionRunner.yml",
+            ".muci/ActionRunner.yaml",
+            ".actionrunner/ActionRunner.yml",
+            ".actionrunner/ActionRunner.yaml",
+        ];
+        for path in candidates {
             match self
                 .fetch_file(
                     owner,
                     repo,
-                    &path,
+                    path,
                     &git_ref,
                     &default_ref,
                     repo_visible_via_api,
@@ -1156,6 +1163,7 @@ fn push_touches_topology(payload: &Value, submodules: &[SubmoduleRef]) -> bool {
     let touches = |p: &str| {
         p == ".gitmodules"
             || p.starts_with(".actionrunner/")
+            || p.starts_with(".muci/")
             || submodules.iter().any(|s| s.path == p)
     };
     commits.iter().any(|c| {

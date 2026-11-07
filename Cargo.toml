@@ -1,19 +1,19 @@
 [package]
-name = "action-runner-controller"
+name = "mu-ci-controller"
 version = "0.1.0"
 edition = "2021"
-description = "WebAPI, Ingress, DAG Stage Scheduler, and SVG Scorecard Controller for the Distributed ActionRunner Platform"
+description = "WebAPI, Ingress, DAG Stage Scheduler, and SVG Scorecard Controller for the Distributed Mu-CI Platform"
 license = "AGPL-3.0-only"
-repository = "https://github.com/LMA1980/ActionRunner-controller"
+repository = "https://github.com/LMA1980/mu-ci-controller"
 
 [features]
 default = []
 bundled-duckdb = []
 
 [dependencies]
-action-runner-ipc = { git = "https://github.com/LMA1980/ActionRunner-ipc.git", branch = "main" }
-action-runner-tools = { git = "https://github.com/LMA1980/ActionRunner-tools.git", branch = "main" }
-muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git", branch = "main" }
+mu-ci-ipc = { git = "https://github.com/LMA1980/mu-ci-ipc.git", branch = "feat/m8-naming-alignment" }
+mu-ci-tools = { git = "https://github.com/LMA1980/mu-ci-tools.git", branch = "feat/m8-naming-alignment" }
+mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "feat/m8-naming-alignment" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -44,7 +44,7 @@ arc-swap = "1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
-action-runner = { git = "https://github.com/LMA1980/ActionRunner-rs.git", branch = "main" }
+mu-ci-worker = { git = "https://github.com/LMA1980/mu-ci-worker.git", branch = "feat/m8-naming-alignment" }
 tempfile = "3"
 rcgen = "0.14"
 

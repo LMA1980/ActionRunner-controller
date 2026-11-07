@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use action_runner_ipc::{
+use mu_ci_ipc::{
     create_fory_runtime, decode_log_batch, decode_metric_batch, IpcHeader, StageCompletionReport,
     StageStarted, WorkerHeartbeat, WorkerRegistration, WorkerShutdown, MSG_TYPE_ARROW_LOG,
     MSG_TYPE_ARROW_METRIC, MSG_TYPE_STAGE_CANCEL, MSG_TYPE_STAGE_COMPLETION,
@@ -125,7 +125,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         match fory.serialize(&task) {
                             Ok(payload) => {
                                 let header = IpcHeader::new(MSG_TYPE_STAGE_DISPATCH, payload.len() as u32, 0, seq);
-                                let mut frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
+                                let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
                                 frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
                                 frame.extend_from_slice(&payload);
                                 if let Err(e) = ws_sender.send(Message::Binary(frame.into())).await {
@@ -142,7 +142,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     WorkerCommand::Cancel(cancel) => {
                         if let Ok(payload) = fory.serialize(&cancel) {
                             let header = IpcHeader::new(MSG_TYPE_STAGE_CANCEL, payload.len() as u32, 0, seq);
-                            let mut frame = Vec::with_capacity(action_runner_ipc::HEADER_SIZE + payload.len());
+                            let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
                             frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
                             frame.extend_from_slice(&payload);
                             let _ = ws_sender.send(Message::Binary(frame.into())).await;

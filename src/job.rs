@@ -678,8 +678,8 @@ impl JobStore {
 
     pub fn evaluate_regression_gate(
         &self,
-        req: &muobserve_ipc::RegressionGateRequest,
-    ) -> Option<muobserve_ipc::RegressionGateReport> {
+        req: &mu_observable_ipc::RegressionGateRequest,
+    ) -> Option<mu_observable_ipc::RegressionGateReport> {
         self.db.evaluate_regression_gate(req)
     }
 
@@ -2893,7 +2893,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     async fn test_food_sample_requeue_preserves_priority_and_claims_ready_stages() {
         use crate::cluster::ClusterRegistry;
-        use action_runner_ipc::WorkerRegistration;
+        use mu_ci_ipc::WorkerRegistration;
         use tokio::sync::mpsc;
 
         let store = JobStore::new(10, None);
@@ -3080,7 +3080,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_no_overclaiming_when_multiple_queued_jobs_await_single_worker_slot() {
-        use action_runner_ipc::WorkerRegistration;
+        use mu_ci_ipc::WorkerRegistration;
         use tokio::sync::mpsc;
 
         let store = JobStore::new(10, None);
@@ -3186,7 +3186,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
     async fn test_exclusive_stage_blocks_claim_until_worker_drains() {
-        use action_runner_ipc::WorkerRegistration;
+        use mu_ci_ipc::WorkerRegistration;
         use tokio::sync::mpsc;
 
         let store = JobStore::new(10, None);

@@ -10,11 +10,11 @@ use crate::cluster::{ClusterRegistry, WorkerCommand};
 use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
 use crate::workflow::{ActionRunnerWorkflow, StageConfig};
-use action_runner_ipc::{
+use mu_ci_ipc::{
     NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, SccacheMode, StageDispatchTask,
     TypedTaskInvocation,
 };
-use action_runner_tools::{SandboxProfileRequirement, ToolInvocation, ToolRegistry};
+use mu_ci_tools::{SandboxProfileRequirement, ToolInvocation, ToolRegistry};
 
 // ============================================================================
 // Sub-tasks #37 & #38: ToolAdapter Dispatch & Security Validation
@@ -96,7 +96,7 @@ pub fn build_v3_stage_dispatch_task(
             .ok_or_else(|| DispatchError::TaskNotFound(task_id.clone()))?;
 
         // Immediately reject prohibited shell wrappers
-        if action_runner_tools::sanitize::is_prohibited_shell_wrapper(&task_cfg.tool) {
+        if mu_ci_tools::sanitize::is_prohibited_shell_wrapper(&task_cfg.tool) {
             return Err(DispatchError::UnapprovedTool(format!(
                 "Tool '{}' in task '{}' is a prohibited shell wrapper",
                 task_cfg.tool, task_id
@@ -228,16 +228,48 @@ pub enum WorkflowResolveError {
     Io(String),
 }
 
+pub const WORKFLOW_CONFIG_CANDIDATES: &[&str] = &[
+    ".muci/mu-ci.yml",
+    ".muci/mu-ci.yaml",
+    ".muci/ActionRunner.yml",
+    ".muci/ActionRunner.yaml",
+    ".actionrunner/ActionRunner.yml",
+    ".actionrunner/ActionRunner.yaml",
+];
+
+pub const SECURITY_CONFIG_CANDIDATES: &[&str] = &[
+    ".muci/security.yml",
+    ".muci/security.yaml",
+    ".actionrunner/security.yml",
+    ".actionrunner/security.yaml",
+];
+
+pub fn resolve_security_path(repo_path: &Path) -> Option<std::path::PathBuf> {
+    for rel in SECURITY_CONFIG_CANDIDATES {
+        let p = repo_path.join(rel);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn resolve_workflow_from_repo(
+    repo_path: &Path,
+    event: &str,
+    max_timeout: u64,
+) -> Result<ResolvedWorkflow, WorkflowResolveError> {
+    resolve_workflow_for_event(repo_path, event, max_timeout)
+}
+
 pub fn resolve_workflow_for_event(
     repo_path: &Path,
     event: &str,
     _max_timeout: u64,
 ) -> Result<ResolvedWorkflow, WorkflowResolveError> {
-    let actionrunner_dir = repo_path.join(".actionrunner");
-
-    // 1. Check for ActionRunner.yml / ActionRunner.yaml first
-    for name in ["ActionRunner.yml", "ActionRunner.yaml"] {
-        let v3_path = actionrunner_dir.join(name);
+    // 1. Check for .muci/ candidates first, falling back to .actionrunner/ candidates
+    for rel in WORKFLOW_CONFIG_CANDIDATES {
+        let v3_path = repo_path.join(rel);
         if v3_path.exists() {
             let content = std::fs::read_to_string(&v3_path)
                 .map_err(|e| WorkflowResolveError::Io(e.to_string()))?;
@@ -250,8 +282,10 @@ pub fn resolve_workflow_for_event(
         }
     }
 
-    // 2. If ActionRunner.yml is absent, check if legacy workflows are disabled
-    if std::env::var("ACTIONRUNNER_DISABLE_LEGACY").as_deref() == Ok("1") {
+    // 2. If workflow configuration is absent, check if legacy workflows are disabled
+    if std::env::var("ACTIONRUNNER_DISABLE_LEGACY").as_deref() == Ok("1")
+        || std::env::var("MUCI_DISABLE_LEGACY").as_deref() == Ok("1")
+    {
         return Err(WorkflowResolveError::LegacyDisabled);
     }
 
@@ -775,7 +809,7 @@ impl DAGScheduler {
                     exit_code: 0,
                 };
 
-                let gate_req = muobserve_ipc::RegressionGateRequest {
+                let gate_req = mu_observable_ipc::RegressionGateRequest {
                     request_id: format!("reg-{}", job.id),
                     repo_key: job.repo_name.to_ascii_lowercase(),
                     candidate_commit: job.commit_sha.clone(),
@@ -951,10 +985,9 @@ impl DAGScheduler {
                     .output()
                     .await;
 
-                // Check ActionRunner.yml / ActionRunner.yaml in git tree
-                let v3_candidates = ["ActionRunner.yml", "ActionRunner.yaml"];
-                for cand in &v3_candidates {
-                    let git_spec = format!("{}:.actionrunner/{}", job.commit_sha, cand);
+                // Check .muci/ + .actionrunner/ candidates in git tree
+                for cand in WORKFLOW_CONFIG_CANDIDATES {
+                    let git_spec = format!("{}:{}", job.commit_sha, cand);
                     let show_res = tokio::process::Command::new("git")
                         .arg("-C")
                         .arg(repo_workspace)
@@ -972,7 +1005,7 @@ impl DAGScheduler {
                                             job_id = %job.id,
                                             commit = %job.commit_sha,
                                             candidate = %cand,
-                                            "Resolved declarative ActionRunner.yml workflow from commit tree via git show"
+                                            "Resolved declarative workflow from commit tree via git show"
                                         );
                                         return Ok(sub);
                                     }
@@ -1154,7 +1187,7 @@ pub async fn report_github_commit_status_with_base_url(
 mod tests {
     use super::*;
     use crate::workflow::{ActionRunnerWorkflow, StageConfig, TaskConfig};
-    use action_runner_ipc::SandboxBackendKind;
+    use mu_ci_ipc::SandboxBackendKind;
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -1481,6 +1514,103 @@ on_action:
             Err(WorkflowResolveError::LegacyDisabled) => {}
             other => panic!("Expected LegacyDisabled error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_muci_workflow_resolution_and_precedence() {
+        let dir = tempdir().unwrap();
+        let muci_dir = dir.path().join(".muci");
+        let ar_dir = dir.path().join(".actionrunner");
+        std::fs::create_dir_all(&muci_dir).unwrap();
+        std::fs::create_dir_all(&ar_dir).unwrap();
+
+        let muci_content = r#"
+version: "3"
+name: "MuCI Pipeline"
+tasks:
+  muci-task:
+    tool: "cargo-check"
+stages:
+  - id: muci-stage
+    name: "MuCI Stage"
+    tasks: ["muci-task"]
+on_action:
+  push: ["muci-stage"]
+"#;
+
+        let ar_content = r#"
+version: "3"
+name: "ActionRunner Pipeline"
+tasks:
+  ar-task:
+    tool: "cargo-build"
+stages:
+  - id: ar-stage
+    name: "AR Stage"
+    tasks: ["ar-task"]
+on_action:
+  push: ["ar-stage"]
+"#;
+
+        // 1. .muci/mu-ci.yml is resolved when present.
+        let muci_path = muci_dir.join("mu-ci.yml");
+        std::fs::write(&muci_path, muci_content).unwrap();
+
+        let res =
+            resolve_workflow_for_event(dir.path(), "push", 600).expect("should resolve mu-ci.yml");
+        match res {
+            ResolvedWorkflow::V3(wf) => {
+                assert_eq!(wf.name, "MuCI Pipeline");
+                assert_eq!(wf.stages[0].id, "muci-stage");
+            }
+        }
+
+        // 2. .muci/mu-ci.yml takes precedence when both .muci/mu-ci.yml and .actionrunner/ActionRunner.yml exist.
+        let ar_path = ar_dir.join("ActionRunner.yml");
+        std::fs::write(&ar_path, ar_content).unwrap();
+
+        let res_prec = resolve_workflow_for_event(dir.path(), "push", 600)
+            .expect("should resolve mu-ci.yml with precedence");
+        match res_prec {
+            ResolvedWorkflow::V3(wf) => {
+                assert_eq!(wf.name, "MuCI Pipeline");
+                assert_eq!(wf.stages[0].id, "muci-stage");
+            }
+        }
+
+        // 3. .actionrunner/ActionRunner.yml is resolved as a fallback when .muci/ is absent.
+        std::fs::remove_file(&muci_path).unwrap();
+        let res_fallback = resolve_workflow_for_event(dir.path(), "push", 600)
+            .expect("should resolve ActionRunner.yml as fallback");
+        match res_fallback {
+            ResolvedWorkflow::V3(wf) => {
+                assert_eq!(wf.name, "ActionRunner Pipeline");
+                assert_eq!(wf.stages[0].id, "ar-stage");
+            }
+        }
+    }
+
+    #[test]
+    fn test_muci_security_resolution_and_precedence() {
+        let dir = tempdir().unwrap();
+        let muci_dir = dir.path().join(".muci");
+        let ar_dir = dir.path().join(".actionrunner");
+        std::fs::create_dir_all(&muci_dir).unwrap();
+        std::fs::create_dir_all(&ar_dir).unwrap();
+
+        let muci_sec = muci_dir.join("security.yml");
+        let ar_sec = ar_dir.join("security.yml");
+
+        // 1. None present
+        assert_eq!(resolve_security_path(dir.path()), None);
+
+        // 2. .actionrunner/security.yml fallback
+        std::fs::write(&ar_sec, "default_profile: ar\n").unwrap();
+        assert_eq!(resolve_security_path(dir.path()), Some(ar_sec.clone()));
+
+        // 3. .muci/security.yml takes precedence
+        std::fs::write(&muci_sec, "default_profile: muci\n").unwrap();
+        assert_eq!(resolve_security_path(dir.path()), Some(muci_sec));
     }
 
     #[test]

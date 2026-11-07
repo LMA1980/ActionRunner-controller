@@ -1,9 +1,9 @@
 ---
-name: action-runner-controller-dag
-description: "Develop and maintain the ActionRunner-controller webhook ingress, DAG stage scheduler, secret resolution, and 3-phase workflow configuration parser."
+name: mu-ci-controller
+description: "Develop and maintain the mu-ci-controller webhook ingress, DAG stage scheduler, secret resolution, and dual-stack workflow configuration parser."
 ---
 
-# `action-runner-controller` Ingress, DAG Scheduler & Security Invariants
+# `mu-ci-controller` Ingress, DAG Scheduler & Security Invariants
 
 ## 1. Secret Path vs. Literal Value Resolution
 
@@ -11,7 +11,7 @@ description: "Develop and maintain the ActionRunner-controller webhook ingress, 
 
 ## 2. Three-Phase Configuration Migration
 
-- When evolving workflow configuration schemas (`.actionrunner/ActionRunner.yml` and `.actionrunner/security.yml`), enforce a strict 3-phase transition:
+- When evolving workflow configuration schemas (`.muci/mu-ci.yml`, `.actionrunner/ActionRunner.yml`, and security profiles), enforce a strict 3-phase transition:
   1. Side-by-side introduction with backward-compatible fallback.
   2. Production deployment and verification of the updated controller/worker.
   3. Post-deployment removal of legacy configuration files and fallback code.
@@ -30,5 +30,5 @@ description: "Develop and maintain the ActionRunner-controller webhook ingress, 
 
 ## 4. Declarative `sccache` Policy & Tag Routing (`#105`, `#128`)
 
-- `.actionrunner/ActionRunner.yml` supports `sccache: try | mandatory | false` at workflow, stage, and task levels (`resolve_task_sccache`: `task.sccache -> stage.sccache -> workflow.sccache -> SccacheMode::Try`).
+- `.muci/mu-ci.yml` and `.actionrunner/ActionRunner.yml` support `sccache: try | mandatory | false` at workflow, stage, and task levels (`resolve_task_sccache`: `task.sccache -> stage.sccache -> workflow.sccache -> SccacheMode::Try`).
 - `ActionRunnerWorkflow::effective_stage_tags` appends `"sccache"` to a stage's required worker capability tags (used in both `StageRecord.tags` for pre-claim slot reservation and `lease_slot` at dispatch time) whenever the stage or any of its eligible compiler tasks (`cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, `trunk`) resolves to `SccacheMode::Mandatory`.
