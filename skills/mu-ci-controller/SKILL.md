@@ -32,3 +32,9 @@ description: "Develop and maintain the mu-ci-controller webhook ingress, DAG sta
 
 - `.muci/mu-ci.yml` and `.actionrunner/ActionRunner.yml` support `sccache: try | mandatory | false` at workflow, stage, and task levels (`resolve_task_sccache`: `task.sccache -> stage.sccache -> workflow.sccache -> SccacheMode::Try`).
 - `ActionRunnerWorkflow::effective_stage_tags` appends `"sccache"` to a stage's required worker capability tags (used in both `StageRecord.tags` for pre-claim slot reservation and `lease_slot` at dispatch time) whenever the stage or any of its eligible compiler tasks (`cargo-build`, `cargo-check`, `cargo-test`, `cargo-clippy`, `cargo-bench`, `trunk`) resolves to `SccacheMode::Mandatory`.
+
+## 5. Gray-Failure Health Probe, Bounded Tunnel I/O & Delta Line Streaming (`specs/gray-failure-health-and-delta-log-streaming.md`)
+
+- **Fail-Closed `GET /health` (`src/app.rs`)**: Probes `workspace_dir` metadata with a 2-second timeout and checks HA leadership (`HaRoleConfig::Leader` demoted to `HaRole::Standby` returns `503 Service Unavailable`), triggering immediate HAProxy failover on storage gray failure or lease loss.
+- **Bounded Tunnel & Persistence I/O (`src/tunnel.rs`, `src/job.rs`)**: Runs `append_logs` inside `tokio::task::spawn_blocking` with a 5s timeout, bounds `ws_sender.send` with a 10s timeout, and bounds `JobStore::persist` disk writes with a 5s timeout.
+- **Delta `MSG_TYPE_ARROW_OTEL_LOGS` Streaming (`src/storage_backend.rs`)**: Streams each worker and controller log line once as a single-line `OtelLogEntry` (`line_no`, `stream`, `node_id`, `job_id`, `stage_id`) instead of re-flushing full-file `__ar_job_logs__` blobs.
