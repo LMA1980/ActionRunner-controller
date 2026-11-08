@@ -35,7 +35,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn broadcast_log(&self, job_id: &str, chunk: &str) {
-        self.job_store.append_job_log(job_id, chunk);
+        self.job_store.append_log_lines(job_id, chunk);
+        self.job_store.flush_job_log(Some(job_id));
         let _ = self.log_broadcaster.send(LogBroadcast {
             job_id: job_id.to_string(),
             chunk: chunk.to_string(),
@@ -43,7 +44,7 @@ impl AppState {
     }
 
     pub fn broadcast_log_buffered(&self, job_id: &str, chunk: &str) {
-        self.job_store.append_job_log_buffered(job_id, chunk);
+        self.job_store.append_log_lines(job_id, chunk);
         let _ = self.log_broadcaster.send(LogBroadcast {
             job_id: job_id.to_string(),
             chunk: chunk.to_string(),

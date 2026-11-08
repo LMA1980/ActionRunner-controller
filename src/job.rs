@@ -475,12 +475,28 @@ impl JobStore {
         }
     }
 
+    pub async fn append_structured_log_entries(
+        &self,
+        job_id: &str,
+        entries: &[mu_ci_ipc::LogEntry],
+    ) {
+        self.db.append_structured_log_entries(job_id, entries);
+    }
+
+    pub fn append_log_lines(&self, job_id: &str, chunk: &str) {
+        self.db.append_log_lines(job_id, chunk);
+    }
+
     pub fn append_job_log(&self, job_id: &str, chunk: &str) {
         self.db.append_job_log(job_id, chunk);
     }
 
     pub fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
         self.db.append_job_log_buffered(job_id, chunk);
+    }
+
+    pub fn flush_dirty_logs(&self) {
+        self.db.flush_dirty_logs();
     }
 
     pub fn flush_job_log(&self, job_id: Option<&str>) {
@@ -691,10 +707,25 @@ impl JobStore {
             };
             if let Some(json_str) = json_str {
                 if let Some(parent) = path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::fs::create_dir_all(parent),
+                    )
+                    .await;
                 }
-                if let Err(e) = tokio::fs::write(path, json_str).await {
-                    warn!("Failed to persist jobs_index.json: {}", e);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::fs::write(path, json_str),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("Failed to persist jobs_index.json: {}", e);
+                    }
+                    Err(_) => {
+                        warn!("Timed out (5s) persisting jobs_index.json to {:?}", path);
+                    }
                 }
             }
         }

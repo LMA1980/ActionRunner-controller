@@ -10,11 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mu_observable_ipc::{
-    decode_control_envelope, encode_control_envelope, read_frame, write_frame,
-    CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot, ControlRpcEnvelope,
-    IpcHeader, QueryBranchSnapshotsRequest, QueryJobsHistoryRequest,
+    decode_control_envelope, encode_control_envelope, encode_hex,
+    encode_log_batch as encode_otel_logs_ipc, read_frame, write_frame, CentralBranchSnapshot,
+    CentralJobRecord, CentralSubmoduleSnapshot, ControlRpcEnvelope, DeterministicSecretRedactor,
+    IpcHeader, OtelLogEntry, QueryBranchSnapshotsRequest, QueryJobsHistoryRequest,
     QuerySubmoduleSnapshotsRequest, RegressionGateReport, RegressionGateRequest, RegressionVerdict,
-    TraceContext, UpsertJobBatchRequest, UpsertJobRecordRequest, MSG_TYPE_FORY_CONTROL,
+    SecretRedactor, TraceContext, UpsertJobBatchRequest, UpsertJobRecordRequest,
+    FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK,
     TRACE_FLAG_SAMPLED, W3C_TRACEPARENT_VERSION,
 };
 use rustls::pki_types::pem::PemObject;
@@ -84,7 +86,6 @@ impl LeaderLease {
     }
 }
 
-const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
 const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
 const INTERNAL_CONSOLE_REPO_KEY: &str = "__ar_console_registry__";
 
@@ -158,6 +159,20 @@ pub trait ControllerStorage: Send + Sync {
         None
     }
 
+    /// Appends structured worker [`mu_ci_ipc::LogEntry`] records for `job_id` as single-line
+    /// deduplicated [`OtelLogEntry`] deltas.
+    fn append_structured_log_entries(&self, job_id: &str, entries: &[mu_ci_ipc::LogEntry]) {
+        let chunk = crate::aggregator::format_log_entries(entries);
+        if !chunk.is_empty() {
+            self.append_job_log_buffered(job_id, &chunk);
+        }
+    }
+
+    /// Appends controller status/note lines for `job_id` as single-line [`OtelLogEntry`] deltas.
+    fn append_log_lines(&self, job_id: &str, chunk: &str) {
+        self.append_job_log(job_id, chunk);
+    }
+
     /// Appends a log chunk for `job_id` into shared persistence (`#83`).
     fn append_job_log(&self, _job_id: &str, _chunk: &str) {}
 
@@ -165,6 +180,11 @@ pub trait ControllerStorage: Send + Sync {
     /// coalescing remote persistence flushes (`#124`).
     fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
         self.append_job_log(job_id, chunk);
+    }
+
+    /// Flushes all pending dirty log deltas across active jobs.
+    fn flush_dirty_logs(&self) {
+        self.flush_job_log(None);
     }
 
     /// Flushes buffered in-memory log chunks for `job_id` (or all dirty jobs when `None`)
@@ -335,6 +355,17 @@ impl ControllerStorage for InMemoryStorage {
     ) -> (Option<JobRecord>, Option<JobRecord>) {
         self.store
             .find_submodule_card_context(parent_repo, submodule, branch)
+    }
+
+    fn append_structured_log_entries(&self, job_id: &str, entries: &[mu_ci_ipc::LogEntry]) {
+        let chunk = crate::aggregator::format_log_entries(entries);
+        if !chunk.is_empty() {
+            self.store.append_job_log(job_id, &chunk);
+        }
+    }
+
+    fn append_log_lines(&self, job_id: &str, chunk: &str) {
+        self.store.append_job_log(job_id, chunk);
     }
 
     fn append_job_log(&self, job_id: &str, chunk: &str) {
@@ -544,20 +575,29 @@ fn build_mtls_client_config(
     Ok(Arc::new(client_config))
 }
 
+type DedupLineKey = (String, i8, u32);
+type JobDedupMap = BTreeMap<String, std::collections::BTreeSet<DedupLineKey>>;
+
 /// Remote `MuObserve` implementation of [`ControllerStorage`] communicating via
-/// `MUOB`-framed Apache Fory [`ControlRpcEnvelope`] messages over `step-ca` mTLS or TCP.
+/// `MUOB`-framed Apache Fory [`ControlRpcEnvelope`] messages and Arrow IPC [`OtelLogEntry`]
+/// streams over `step-ca` mTLS or TCP.
 #[derive(Clone)]
 pub struct MuObserveRemoteStorage {
     config: MuObserveRemoteConfig,
     tls_client_config: Option<Arc<ClientConfig>>,
     seq: Arc<AtomicU64>,
-    log_buffer: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
+    pending_log_lines: Arc<std::sync::RwLock<Vec<OtelLogEntry>>>,
+    seen_log_lines: Arc<std::sync::RwLock<JobDedupMap>>,
+    controller_line_counters: Arc<std::sync::RwLock<BTreeMap<String, u32>>>,
+    log_buffer: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
     dirty_log_keys: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     last_log_flush: Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>>,
     auth_store: Arc<CatalogStore>,
 }
 
 const MAX_BUFFERED_JOB_LOGS: usize = 100;
+const MAX_LOG_BUFFER_BYTES_PER_JOB: usize = 256 * 1024;
+const MAX_SEEN_LINES_PER_JOB: usize = 50_000;
 const BUFFERED_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl MuObserveRemoteStorage {
@@ -582,34 +622,38 @@ impl MuObserveRemoteStorage {
             config,
             tls_client_config,
             seq: Arc::new(AtomicU64::new(1)),
-            log_buffer: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            pending_log_lines: Arc::new(std::sync::RwLock::new(Vec::new())),
+            seen_log_lines: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            controller_line_counters: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            log_buffer: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             dirty_log_keys: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             last_log_flush: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             auth_store: Arc::new(CatalogStore::new()),
         })
     }
 
-    fn append_to_local_log_buffer(&self, key: &str, chunk: &str) -> Option<String> {
-        let existing_remote = {
-            let guard = self.log_buffer.lock().ok();
-            let already_buffered = guard.as_ref().map(|g| g.contains_key(key)).unwrap_or(false);
-            drop(guard);
-            if already_buffered {
-                None
-            } else {
-                self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", key)
-                    .and_then(|s| s.latest_active_json)
+    fn append_to_local_log_buffer(&self, key: &str, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let redactor = DeterministicSecretRedactor::new();
+        let scrubbed = redactor.redact(chunk);
+        let Ok(mut guard) = self.log_buffer.write() else {
+            return;
+        };
+        let entry = guard.entry(key.to_string()).or_default();
+        entry.push_str(&scrubbed);
+        if entry.len() > MAX_LOG_BUFFER_BYTES_PER_JOB {
+            let overflow = entry.len() - MAX_LOG_BUFFER_BYTES_PER_JOB;
+            let mut cut = overflow;
+            while cut < entry.len() && !entry.is_char_boundary(cut) {
+                cut += 1;
             }
-        };
-
-        let Ok(mut guard) = self.log_buffer.lock() else {
-            return None;
-        };
-        let entry = guard
-            .entry(key.to_string())
-            .or_insert_with(|| existing_remote.unwrap_or_default());
-        entry.push_str(chunk);
-        let accumulated = entry.clone();
+            if let Some(rel_nl) = entry[cut..].find('\n') {
+                cut += rel_nl + 1;
+            }
+            entry.drain(..cut.min(entry.len()));
+        }
         while guard.len() > MAX_BUFFERED_JOB_LOGS {
             if let Some(first_key) = guard.keys().find(|k| k.as_str() != key).cloned() {
                 guard.remove(&first_key);
@@ -617,30 +661,386 @@ impl MuObserveRemoteStorage {
                 break;
             }
         }
-        Some(accumulated)
     }
 
-    fn flush_single_log_key(&self, key: &str, job_id_label: &str, accumulated: String) {
-        let now_us = chrono::Utc::now().timestamp_micros();
-        if self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
-            parent_repo_key: INTERNAL_LOG_REPO_KEY.to_string(),
-            branch_key: "log".to_string(),
-            submodule_key: key.to_string(),
-            submodule_path_key: "log".to_string(),
-            latest_active_job_id: Some(job_id_label.to_string()),
-            latest_active_json: Some(accumulated),
-            latest_active_queued_us: Some(now_us),
-            latest_completed_job_id: None,
-            latest_completed_json: None,
-            latest_completed_queued_us: None,
-        }) {
-            if let Ok(mut dirty) = self.dirty_log_keys.lock() {
-                dirty.remove(key);
-            }
-            if let Ok(mut last) = self.last_log_flush.lock() {
-                last.insert(key.to_string(), std::time::Instant::now());
+    fn record_dedup_line(&self, job_key: &str, stage_id: &str, stream: i8, line_no: u32) -> bool {
+        let Ok(mut guard) = self.seen_log_lines.write() else {
+            return true;
+        };
+        let set = guard.entry(job_key.to_string()).or_default();
+        if set.len() >= MAX_SEEN_LINES_PER_JOB
+            && !set.contains(&(stage_id.to_string(), stream, line_no))
+        {
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
             }
         }
+        let inserted = set.insert((stage_id.to_string(), stream, line_no));
+        while guard.len() > MAX_BUFFERED_JOB_LOGS {
+            if let Some(first_key) = guard.keys().find(|k| k.as_str() != job_key).cloned() {
+                guard.remove(&first_key);
+            } else {
+                break;
+            }
+        }
+        inserted
+    }
+
+    fn next_controller_line_no(&self, job_key: &str) -> u32 {
+        let Ok(mut guard) = self.controller_line_counters.write() else {
+            return 1;
+        };
+        let counter = guard.entry(job_key.to_string()).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let next = *counter;
+        while guard.len() > MAX_BUFFERED_JOB_LOGS {
+            if let Some(first_key) = guard.keys().find(|k| k.as_str() != job_key).cloned() {
+                guard.remove(&first_key);
+            } else {
+                break;
+            }
+        }
+        next
+    }
+
+    /// Synchronously converts structured worker [`mu_ci_ipc::LogEntry`] records into deduplicated,
+    /// secret-redacted [`OtelLogEntry`] records queued in `pending_log_lines`, and updates the
+    /// bounded local `log_buffer` fallback.
+    pub fn append_structured_log_entries_sync(
+        &self,
+        job_id: &str,
+        entries: &[mu_ci_ipc::LogEntry],
+    ) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let redactor = DeterministicSecretRedactor::new();
+        let mut new_otel = Vec::with_capacity(entries.len());
+        let mut new_raw = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            if !self.record_dedup_line(&key, &entry.stage_id, entry.stream, entry.line_no) {
+                continue;
+            }
+            new_raw.push(entry.clone());
+            let ts_ns = if entry.timestamp_us > 0 {
+                entry.timestamp_us.saturating_mul(1_000)
+            } else {
+                chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_micros().saturating_mul(1_000))
+            };
+            let trace_ctx = job_root_trace_context(job_id, &entry.stage_id);
+            let trace_id = encode_hex(&trace_ctx.trace_id);
+            let span_id = encode_hex(&trace_ctx.span_id);
+            let (severity_number, severity_text, stream_name) = if entry.stream == 2 {
+                (13, "WARN".to_string(), "stderr")
+            } else {
+                (9, "INFO".to_string(), "stdout")
+            };
+            let mut otel_entry = OtelLogEntry {
+                timestamp_unix_nano: ts_ns,
+                trace_id,
+                span_id,
+                severity_number,
+                severity_text,
+                service_name: "action-runner-worker".to_string(),
+                node_id: entry.node_id.clone(),
+                body: entry.content.clone(),
+                attributes_json: serde_json::json!({
+                    "stream": stream_name,
+                    "line_no": entry.line_no,
+                })
+                .to_string(),
+                job_id: Some(job_id.to_string()),
+                stage_id: Some(entry.stage_id.clone()),
+            };
+            otel_entry.redact_in_place(&redactor);
+            new_otel.push(otel_entry);
+        }
+
+        if new_otel.is_empty() {
+            return 0;
+        }
+
+        let formatted = crate::aggregator::format_log_entries(&new_raw);
+        self.append_to_local_log_buffer(&key, &formatted);
+
+        let count = new_otel.len();
+        if let Ok(mut pending) = self.pending_log_lines.write() {
+            pending.extend(new_otel);
+        }
+        if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+            dirty.insert(key.clone());
+        }
+        if let Ok(mut last) = self.last_log_flush.lock() {
+            last.entry(key).or_insert_with(std::time::Instant::now);
+        }
+        count
+    }
+
+    /// Asynchronously appends structured worker [`mu_ci_ipc::LogEntry`] records into `pending_log_lines`
+    /// and flushes dirty delta lines if the periodic flush interval has elapsed.
+    pub async fn append_structured_log_entries(
+        &self,
+        job_id: &str,
+        entries: &[mu_ci_ipc::LogEntry],
+    ) {
+        let added = self.append_structured_log_entries_sync(job_id, entries);
+        if added == 0 {
+            return;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let should_flush = self
+            .last_log_flush
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&key).copied())
+            .map(|t| t.elapsed() >= BUFFERED_LOG_FLUSH_INTERVAL)
+            .unwrap_or(false);
+        if should_flush {
+            let _ = self.flush_dirty_logs().await;
+        }
+    }
+
+    /// Splits controller log `chunk` into individual lines, converts each line into a redacted
+    /// [`OtelLogEntry`] with `service_name = "action-runner-controller"`, updates the bounded
+    /// local `log_buffer`, and queues the delta entries in `pending_log_lines`.
+    pub fn append_log_lines(&self, job_id: &str, chunk: &str) -> usize {
+        if chunk.is_empty() {
+            return 0;
+        }
+        let key = job_id.to_ascii_lowercase();
+        self.append_to_local_log_buffer(&key, chunk);
+
+        let redactor = DeterministicSecretRedactor::new();
+        let trace_ctx = job_root_trace_context(job_id, "controller");
+        let trace_id = encode_hex(&trace_ctx.trace_id);
+        let span_id = encode_hex(&trace_ctx.span_id);
+        let now_ns = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_micros().saturating_mul(1_000));
+
+        let mut new_otel = Vec::new();
+        for raw_line in chunk.lines() {
+            let trimmed = raw_line.trim_end_matches('\r');
+            if trimmed.is_empty() {
+                continue;
+            }
+            let line_no = self.next_controller_line_no(&key);
+            if !self.record_dedup_line(&key, "controller", 1, line_no) {
+                continue;
+            }
+            let mut otel_entry = OtelLogEntry {
+                timestamp_unix_nano: now_ns,
+                trace_id: trace_id.clone(),
+                span_id: span_id.clone(),
+                severity_number: 9,
+                severity_text: "INFO".to_string(),
+                service_name: "action-runner-controller".to_string(),
+                node_id: "controller".to_string(),
+                body: trimmed.to_string(),
+                attributes_json: serde_json::json!({
+                    "stream": "stdout",
+                    "line_no": line_no,
+                })
+                .to_string(),
+                job_id: Some(job_id.to_string()),
+                stage_id: Some("controller".to_string()),
+            };
+            otel_entry.redact_in_place(&redactor);
+            new_otel.push(otel_entry);
+        }
+
+        let count = new_otel.len();
+        if count > 0 {
+            if let Ok(mut pending) = self.pending_log_lines.write() {
+                pending.extend(new_otel);
+            }
+            if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+                dirty.insert(key.clone());
+            }
+            if let Ok(mut last) = self.last_log_flush.lock() {
+                last.entry(key).or_insert_with(std::time::Instant::now);
+            }
+        }
+        count
+    }
+
+    /// Returns a snapshot of currently queued [`OtelLogEntry`] delta records awaiting flush.
+    #[must_use]
+    pub fn pending_log_lines_snapshot(&self) -> Vec<OtelLogEntry> {
+        self.pending_log_lines
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn drain_pending_log_lines(&self, job_id: Option<&str>) -> Vec<OtelLogEntry> {
+        let Ok(mut pending) = self.pending_log_lines.write() else {
+            return Vec::new();
+        };
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        match job_id {
+            None => {
+                if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+                    if let Ok(mut last) = self.last_log_flush.lock() {
+                        for k in dirty.iter() {
+                            last.insert(k.clone(), now);
+                        }
+                    }
+                    dirty.clear();
+                }
+                std::mem::take(&mut *pending)
+            }
+            Some(target_job) => {
+                let key = target_job.to_ascii_lowercase();
+                let mut drained = Vec::new();
+                let mut remaining = Vec::new();
+                for entry in pending.drain(..) {
+                    let matches_job = entry
+                        .job_id
+                        .as_deref()
+                        .map(|j| j.eq_ignore_ascii_case(target_job))
+                        .unwrap_or(true);
+                    if matches_job {
+                        drained.push(entry);
+                    } else {
+                        remaining.push(entry);
+                    }
+                }
+                *pending = remaining;
+                if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+                    dirty.remove(&key);
+                }
+                if let Ok(mut last) = self.last_log_flush.lock() {
+                    last.insert(key, now);
+                }
+                drained
+            }
+        }
+    }
+
+    /// Drains all queued delta [`OtelLogEntry`] records and streams them as a single
+    /// `MSG_TYPE_ARROW_OTEL_LOGS` frame (`encode_otel_logs_ipc`) to `MuObserve`.
+    pub async fn flush_dirty_logs(&self) -> Result<usize, String> {
+        let batch = self.drain_pending_log_lines(None);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        self.send_otel_logs_async(&batch).await
+    }
+
+    /// Synchronously drains and flushes pending [`OtelLogEntry`] delta records for `job_id`
+    /// (or all jobs when `None`) via `MSG_TYPE_ARROW_OTEL_LOGS`.
+    pub fn flush_dirty_logs_blocking(&self, job_id: Option<&str>) -> Result<usize, String> {
+        let batch = self.drain_pending_log_lines(job_id);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        self.send_otel_logs_blocking(&batch)
+    }
+
+    async fn exchange_otel_logs_stream<S>(
+        stream: &mut S,
+        seq: u64,
+        batch: &[OtelLogEntry],
+    ) -> Result<usize, String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let payload =
+            encode_otel_logs_ipc(batch).map_err(|e| format!("Arrow OTel log encode error: {e}"))?;
+        let flags = if batch.iter().any(|l| l.severity_number >= 13) {
+            FLAG_HIGH_PRIORITY
+        } else {
+            0
+        };
+        let header = IpcHeader::new(MSG_TYPE_ARROW_OTEL_LOGS, payload.len() as u32, flags, seq);
+        write_frame(stream, &header, &payload)
+            .await
+            .map_err(|e| format!("Write MUOB OTel log frame error: {e}"))?;
+        if let Ok((resp_hdr, resp_payload)) = read_frame(stream).await {
+            if resp_hdr.msg_type == MSG_TYPE_WAL_ACK || resp_hdr.msg_type == MSG_TYPE_FORY_CONTROL {
+                if let Ok(ControlRpcEnvelope::WalAck(ack)) = decode_control_envelope(&resp_payload)
+                {
+                    if !ack.ok {
+                        return Err(ack
+                            .error_message
+                            .unwrap_or_else(|| "MuObserve rejected OTel log batch".to_string()));
+                    }
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+        Ok(batch.len())
+    }
+
+    /// Sends a batch of [`OtelLogEntry`] records to `MuObserve` via `MSG_TYPE_ARROW_OTEL_LOGS`.
+    pub async fn send_otel_logs_async(&self, batch: &[OtelLogEntry]) -> Result<usize, String> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let timeout_dur = Duration::from_millis(self.config.timeout_ms.max(100));
+        let seq = self.next_seq();
+        let addr = self.config.endpoint_addr.clone();
+        let tls_cfg = self.tls_client_config.clone();
+        let sni = self
+            .config
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| "muobserve.node-a.cluster.internal".to_string());
+        let batch_owned = batch.to_vec();
+
+        tokio::time::timeout(timeout_dur, async move {
+            let tcp = TcpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("Connect to {addr} failed: {e}"))?;
+            let _ = tcp.set_nodelay(true);
+
+            if let Some(client_cfg) = tls_cfg {
+                let connector = TlsConnector::from(client_cfg);
+                let server_name = ServerName::try_from(sni.clone())
+                    .map_err(|e| format!("Invalid TLS server name '{sni}': {e}"))?;
+                let mut tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| format!("mTLS handshake with {addr} failed: {e}"))?;
+                Self::exchange_otel_logs_stream(&mut tls_stream, seq, &batch_owned).await
+            } else {
+                let mut tcp = tcp;
+                Self::exchange_otel_logs_stream(&mut tcp, seq, &batch_owned).await
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "MuObserve OTel log flush timed out after {}ms",
+                self.config.timeout_ms
+            )
+        })?
+    }
+
+    /// Executes `send_otel_logs_async` safely from a synchronous context.
+    pub fn send_otel_logs_blocking(&self, batch: &[OtelLogEntry]) -> Result<usize, String> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let this = self.clone();
+        let batch_clone = batch.to_vec();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to build OTel log flush runtime: {e}"))?;
+            rt.block_on(this.send_otel_logs_async(&batch_clone))
+        })
+        .join()
+        .map_err(|_| "MuObserve OTel log flush worker thread panicked".to_string())?
     }
 
     fn query_internal_snapshot(
@@ -1460,106 +1860,78 @@ impl ControllerStorage for MuObserveRemoteStorage {
         }
     }
 
-    fn append_job_log(&self, job_id: &str, chunk: &str) {
-        if chunk.is_empty() {
+    fn append_structured_log_entries(&self, job_id: &str, entries: &[mu_ci_ipc::LogEntry]) {
+        let added = self.append_structured_log_entries_sync(job_id, entries);
+        if added == 0 {
             return;
         }
         let key = job_id.to_ascii_lowercase();
-        let Some(accumulated) = self.append_to_local_log_buffer(&key, chunk) else {
-            return;
-        };
-        self.flush_single_log_key(&key, job_id, accumulated);
-    }
-
-    fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
-        if chunk.is_empty() {
-            return;
-        }
-        let key = job_id.to_ascii_lowercase();
-        let Some(accumulated) = self.append_to_local_log_buffer(&key, chunk) else {
-            return;
-        };
-        if let Ok(mut dirty) = self.dirty_log_keys.lock() {
-            dirty.insert(key.clone());
-        }
         let should_flush_now = self
             .last_log_flush
             .lock()
             .ok()
             .and_then(|g| g.get(&key).copied())
             .map(|t| t.elapsed() >= BUFFERED_LOG_FLUSH_INTERVAL)
-            .unwrap_or(true);
+            .unwrap_or(false);
         if should_flush_now {
-            self.flush_single_log_key(&key, job_id, accumulated);
+            if let Err(e) = self.flush_dirty_logs_blocking(Some(job_id)) {
+                debug!(job_id = %job_id, error = %e, "MuObserve periodic OTel log flush failed");
+            }
+        }
+    }
+
+    fn append_log_lines(&self, job_id: &str, chunk: &str) {
+        let _ = MuObserveRemoteStorage::append_log_lines(self, job_id, chunk);
+    }
+
+    fn append_job_log(&self, job_id: &str, chunk: &str) {
+        let added = MuObserveRemoteStorage::append_log_lines(self, job_id, chunk);
+        if added > 0 {
+            if let Err(e) = self.flush_dirty_logs_blocking(Some(job_id)) {
+                debug!(job_id = %job_id, error = %e, "MuObserve immediate OTel log flush failed");
+            }
+        }
+    }
+
+    fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
+        let added = MuObserveRemoteStorage::append_log_lines(self, job_id, chunk);
+        if added == 0 {
+            return;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let should_flush_now = self
+            .last_log_flush
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&key).copied())
+            .map(|t| t.elapsed() >= BUFFERED_LOG_FLUSH_INTERVAL)
+            .unwrap_or(false);
+        if should_flush_now {
+            if let Err(e) = self.flush_dirty_logs_blocking(Some(job_id)) {
+                debug!(job_id = %job_id, error = %e, "MuObserve buffered OTel log flush failed");
+            }
+        }
+    }
+
+    fn flush_dirty_logs(&self) {
+        if let Err(e) = self.flush_dirty_logs_blocking(None) {
+            debug!(error = %e, "MuObserve flush_dirty_logs failed");
         }
     }
 
     fn flush_job_log(&self, job_id: Option<&str>) {
-        let keys_to_flush: Vec<String> = match job_id {
-            Some(id) => vec![id.to_ascii_lowercase()],
-            None => self
-                .dirty_log_keys
-                .lock()
-                .ok()
-                .map(|g| g.iter().cloned().collect())
-                .unwrap_or_default(),
-        };
-
-        for key in keys_to_flush {
-            let is_dirty = self
-                .dirty_log_keys
-                .lock()
-                .ok()
-                .map(|g| g.contains(&key))
-                .unwrap_or(false);
-            if !is_dirty {
-                continue;
-            }
-            let accumulated = self
-                .log_buffer
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&key).cloned());
-            if let Some(acc) = accumulated {
-                self.flush_single_log_key(&key, &key, acc);
-            }
+        if let Err(e) = self.flush_dirty_logs_blocking(job_id) {
+            debug!(job_id = ?job_id, error = %e, "MuObserve flush_job_log failed");
         }
     }
 
     fn get_job_log(&self, job_id: &str) -> Option<String> {
         let key = job_id.to_ascii_lowercase();
-        let local_copy = self
-            .log_buffer
-            .lock()
+        self.log_buffer
+            .read()
             .ok()
             .and_then(|g| g.get(&key).cloned())
-            .filter(|s| !s.is_empty());
-        let is_dirty = self
-            .dirty_log_keys
-            .lock()
-            .ok()
-            .map(|g| g.contains(&key))
-            .unwrap_or(false);
-        if is_dirty {
-            if let Some(local) = local_copy {
-                return Some(local);
-            }
-        }
-        if let Some(snap) = self.query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key) {
-            if let Some(content) = snap.latest_active_json {
-                if !content.is_empty() {
-                    let chosen = match local_copy {
-                        Some(ref local) if local.len() > content.len() => local.clone(),
-                        _ => content,
-                    };
-                    if let Ok(mut guard) = self.log_buffer.lock() {
-                        guard.insert(key, chosen.clone());
-                    }
-                    return Some(chosen);
-                }
-            }
-        }
-        local_copy
+            .filter(|s| !s.is_empty())
     }
 
     fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {
@@ -1809,5 +2181,162 @@ pub fn apply_regression_gate_to_job(
             metrics.benchmark_summary = Some(reason.clone());
             *status = JobStatus::Failed { error: reason };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mu_observable_ipc::{decode_log_batch, WalBatchAck};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_delta_otel_log_streaming_dedup_and_no_full_file_snapshots() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+
+        let received_otel_batches: Arc<Mutex<Vec<Vec<OtelLogEntry>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let received_control_frames: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
+        let otel_clone = received_otel_batches.clone();
+        let ctrl_clone = received_control_frames.clone();
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let otel_c = otel_clone.clone();
+                let ctrl_c = ctrl_clone.clone();
+                tokio::spawn(async move {
+                    while let Ok((hdr, payload)) = read_frame(&mut socket).await {
+                        if hdr.msg_type == MSG_TYPE_ARROW_OTEL_LOGS {
+                            let batch = decode_log_batch(&payload).expect("decode OTel log batch");
+                            otel_c.lock().expect("lock").push(batch.clone());
+                            let ack = ControlRpcEnvelope::WalAck(WalBatchAck {
+                                sequence: hdr.sequence,
+                                ok: true,
+                                accepted_rows: batch.len() as u32,
+                                error_message: None,
+                            });
+                            let resp_bytes = encode_control_envelope(&ack).expect("encode ack");
+                            let resp_hdr = IpcHeader::new(
+                                MSG_TYPE_WAL_ACK,
+                                resp_bytes.len() as u32,
+                                0,
+                                hdr.sequence,
+                            );
+                            let _ = write_frame(&mut socket, &resp_hdr, &resp_bytes).await;
+                        } else if hdr.msg_type == MSG_TYPE_FORY_CONTROL {
+                            *ctrl_c.lock().expect("lock") += 1;
+                        }
+                    }
+                });
+            }
+        });
+
+        let storage = MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(addr))
+            .expect("storage init");
+
+        // 1. Append initial batch of structured worker log entries (including a secret token)
+        let batch1 = vec![
+            mu_ci_ipc::LogEntry {
+                job_id: "job-delta-1".to_string(),
+                stage_id: "build".to_string(),
+                node_id: "node-a".to_string(),
+                timestamp_us: 1_700_000_000_000_000,
+                stream: 1,
+                line_no: 1,
+                content: "Compiling crate v0.1.0".to_string(),
+            },
+            mu_ci_ipc::LogEntry {
+                job_id: "job-delta-1".to_string(),
+                stage_id: "build".to_string(),
+                node_id: "node-a".to_string(),
+                timestamp_us: 1_700_000_000_100_000,
+                stream: 2,
+                line_no: 2,
+                content: "token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890".to_string(),
+            },
+        ];
+        storage
+            .append_structured_log_entries("job-delta-1", &batch1)
+            .await;
+        assert_eq!(storage.pending_log_lines_snapshot().len(), 2);
+
+        // First flush sends exactly those 2 delta lines via MSG_TYPE_ARROW_OTEL_LOGS
+        let flushed1 = storage.flush_dirty_logs().await.expect("flush 1");
+        assert_eq!(flushed1, 2);
+        assert!(storage.pending_log_lines_snapshot().is_empty());
+
+        // 2. Re-sending duplicate (stage_id, stream, line_no) + 1 new line queues ONLY the 1 new delta line
+        let batch2 = vec![
+            batch1[0].clone(),
+            batch1[1].clone(),
+            mu_ci_ipc::LogEntry {
+                job_id: "job-delta-1".to_string(),
+                stage_id: "build".to_string(),
+                node_id: "node-a".to_string(),
+                timestamp_us: 1_700_000_000_200_000,
+                stream: 1,
+                line_no: 3,
+                content: "Finished release target".to_string(),
+            },
+        ];
+        storage
+            .append_structured_log_entries("job-delta-1", &batch2)
+            .await;
+        assert_eq!(
+            storage.pending_log_lines_snapshot().len(),
+            1,
+            "duplicate lines must not be re-queued"
+        );
+
+        // Append controller status line as well
+        let ctrl_added = storage.append_log_lines("job-delta-1", "Stage build succeeded\n");
+        assert_eq!(ctrl_added, 1);
+        assert_eq!(storage.pending_log_lines_snapshot().len(), 2);
+
+        let flushed2 = storage.flush_dirty_logs().await.expect("flush 2");
+        assert_eq!(flushed2, 2);
+
+        // Verify local tail cache fallback still serves combined log locally
+        let local_log = ControllerStorage::get_job_log(&storage, "job-delta-1").expect("local log");
+        assert!(local_log.contains("Compiling crate v0.1.0"));
+        assert!(local_log.contains("Finished release target"));
+        assert!(local_log.contains("Stage build succeeded"));
+
+        // Verify zero MSG_TYPE_FORY_CONTROL (__ar_job_logs__ snapshot) frames were ever sent
+        assert_eq!(*received_control_frames.lock().expect("lock"), 0);
+
+        // Verify exact delta batches received by MuObserve
+        let batches = received_otel_batches.lock().expect("lock");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[0][0].service_name, "action-runner-worker");
+        assert_eq!(batches[0][0].node_id, "node-a");
+        assert_eq!(batches[0][0].body, "Compiling crate v0.1.0");
+        assert_eq!(
+            batches[0][0].attributes_json,
+            r#"{"line_no":1,"stream":"stdout"}"#
+        );
+        // Secret token on stderr must be redacted by DeterministicSecretRedactor
+        assert!(
+            !batches[0][1]
+                .body
+                .contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"),
+            "secret token must be redacted before leaving controller"
+        );
+        assert_eq!(
+            batches[0][1].attributes_json,
+            r#"{"line_no":2,"stream":"stderr"}"#
+        );
+
+        assert_eq!(batches[1].len(), 2);
+        assert_eq!(batches[1][0].body, "Finished release target");
+        assert_eq!(batches[1][1].service_name, "action-runner-controller");
+        assert_eq!(batches[1][1].body, "Stage build succeeded");
+
+        server.abort();
     }
 }

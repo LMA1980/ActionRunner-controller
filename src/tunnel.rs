@@ -85,7 +85,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             code: axum::extract::ws::close_code::NORMAL,
             reason: "controller in standby".into(),
         };
-        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ws_sender.send(Message::Close(Some(close_frame))),
+        )
+        .await;
         return;
     }
 
@@ -128,10 +132,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
                                 frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
                                 frame.extend_from_slice(&payload);
-                                if let Err(e) = ws_sender.send(Message::Binary(frame.into())).await {
-                                    error!("Failed to send dispatch frame over ws: {}", e);
-                                } else {
-                                    info!(stage = %task.stage_id, "Dispatched stage frame successfully sent to ws_sender");
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    ws_sender.send(Message::Binary(frame.into())),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {
+                                        info!(stage = %task.stage_id, "Dispatched stage frame successfully sent to ws_sender");
+                                    }
+                                    Ok(Err(e)) => {
+                                        error!("Failed to send dispatch frame over ws: {}", e);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        error!(node = %node_id, stage = %task.stage_id, "Timed out (10s) sending dispatch frame over ws");
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -145,7 +162,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             let mut frame = Vec::with_capacity(mu_ci_ipc::HEADER_SIZE + payload.len());
                             frame.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
                             frame.extend_from_slice(&payload);
-                            let _ = ws_sender.send(Message::Binary(frame.into())).await;
+                            if tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                ws_sender.send(Message::Binary(frame.into())),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(node = %node_id, "Timed out (10s) sending cancel frame over ws");
+                                break;
+                            }
                         }
                     }
                     WorkerCommand::Disconnect => {
@@ -153,7 +179,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             code: axum::extract::ws::close_code::NORMAL,
                             reason: "controller demoted to standby".into(),
                         };
-                        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            ws_sender.send(Message::Close(Some(close_frame))),
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -178,11 +208,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 code: axum::extract::ws::close_code::NORMAL,
                                 reason: "controller demoted to standby".into(),
                             };
-                            let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                ws_sender.send(Message::Close(Some(close_frame))),
+                            )
+                            .await;
                             break;
                         }
-                        if ws_sender.send(Message::Pong(payload)).await.is_err() {
-                            break;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            ws_sender.send(Message::Pong(payload)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            _ => break,
                         }
                     }
                     Message::Close(_) => break,
@@ -200,15 +240,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             code: axum::extract::ws::close_code::NORMAL,
                                             reason: "controller demoted to standby".into(),
                                         };
-                                        let _ = ws_sender.send(Message::Close(Some(close_frame))).await;
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            ws_sender.send(Message::Close(Some(close_frame))),
+                                        )
+                                        .await;
                                         break;
                                     }
                                     if let Ok(hb) = fory.deserialize::<WorkerHeartbeat>(payload) {
                                         state.cluster.heartbeat(hb).await;
                                         // Acknowledge heartbeat at application layer so the worker's
                                         // inbound read-liveness deadline is refreshed every 5s (#104, #39).
-                                        if ws_sender.send(Message::Pong(Vec::new().into())).await.is_err() {
-                                            break;
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            ws_sender.send(Message::Pong(Vec::new().into())),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            _ => break,
                                         }
                                     }
                                 }
@@ -323,11 +373,26 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             MSG_TYPE_ARROW_LOG => {
                                 if let Ok(entries) = decode_log_batch(payload) {
                                     if let Some(first) = entries.first() {
-                                        if let Some(record) = state.job_store.get_job(&first.job_id).await {
+                                        let job_id = first.job_id.clone();
+                                        if let Some(record) = state.job_store.get_job(&job_id).await {
                                             let full_path = state.config.workspace_dir.join(&record.log_file);
-                                            let _ = append_logs(&full_path, &entries);
+                                            let entries_for_disk = entries.clone();
+                                            let _ = tokio::time::timeout(
+                                                std::time::Duration::from_secs(5),
+                                                tokio::task::spawn_blocking(move || {
+                                                    append_logs(&full_path, &entries_for_disk)
+                                                }),
+                                            )
+                                            .await;
+                                            state
+                                                .job_store
+                                                .append_structured_log_entries(&job_id, &entries)
+                                                .await;
                                             let chunk = format_log_entries(&entries);
-                                            state.broadcast_log_buffered(&first.job_id, &chunk);
+                                            let _ = state.log_broadcaster.send(crate::webhook::LogBroadcast {
+                                                job_id,
+                                                chunk,
+                                            });
                                         }
                                     }
                                 }
