@@ -210,6 +210,7 @@ pub struct JobStore {
     ha_role: Arc<std::sync::RwLock<crate::config::HaRole>>,
     node_id: String,
     in_flight_jobs: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    disk_io_unhealthy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JobStore {
@@ -421,7 +422,25 @@ impl JobStore {
             ha_role: Arc::new(std::sync::RwLock::new(initial_role)),
             node_id,
             in_flight_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            disk_io_unhealthy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub fn mark_disk_io_healthy(&self) {
+        self.disk_io_unhealthy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn mark_disk_io_unhealthy(&self) {
+        self.disk_io_unhealthy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_disk_io_healthy(&self) -> bool {
+        !self
+            .disk_io_unhealthy
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[must_use]
@@ -480,32 +499,41 @@ impl JobStore {
         job_id: &str,
         entries: &[mu_ci_ipc::LogEntry],
     ) {
-        self.db.append_structured_log_entries(job_id, entries);
+        let db = Arc::clone(&self.db);
+        let job_id_owned = job_id.to_string();
+        let entries_owned = entries.to_vec();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                db.append_structured_log_entries(&job_id_owned, &entries_owned);
+            }),
+        )
+        .await;
     }
 
     pub fn append_log_lines(&self, job_id: &str, chunk: &str) {
-        self.db.append_log_lines(job_id, chunk);
+        self.run_storage_op(|db| db.append_log_lines(job_id, chunk));
     }
 
     pub fn append_job_log(&self, job_id: &str, chunk: &str) {
-        self.db.append_job_log(job_id, chunk);
+        self.run_storage_op(|db| db.append_job_log(job_id, chunk));
     }
 
     pub fn append_job_log_buffered(&self, job_id: &str, chunk: &str) {
-        self.db.append_job_log_buffered(job_id, chunk);
+        self.run_storage_op(|db| db.append_job_log_buffered(job_id, chunk));
     }
 
     pub fn flush_dirty_logs(&self) {
-        self.db.flush_dirty_logs();
+        self.run_storage_op(|db| db.flush_dirty_logs());
     }
 
     pub fn flush_job_log(&self, job_id: Option<&str>) {
-        self.db.flush_job_log(job_id);
+        self.run_storage_op(|db| db.flush_job_log(job_id));
     }
 
     #[must_use]
     pub fn get_job_log(&self, job_id: &str) -> Option<String> {
-        self.db.get_job_log(job_id)
+        self.run_storage_op(|db| db.get_job_log(job_id))
     }
 
     pub fn seed_bootstrap_admins(&self, admins: &[String]) {
@@ -701,30 +729,56 @@ impl JobStore {
 
     async fn persist(&self) {
         if let Some(ref path) = self.index_file {
+            let Some(parent) = path.parent() else {
+                return;
+            };
             let json_str = {
                 let store = self.inner.read().await;
                 serde_json::to_string_pretty(&*store).ok()
             };
             if let Some(json_str) = json_str {
-                if let Some(parent) = path.parent() {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        tokio::fs::create_dir_all(parent),
-                    )
-                    .await;
-                }
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    tokio::fs::write(path, json_str),
+                    tokio::fs::create_dir_all(parent),
                 )
                 .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
+                        self.mark_disk_io_unhealthy();
+                        warn!("Failed to create directory for jobs_index.json: {}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        self.mark_disk_io_unhealthy();
+                        warn!("Timed out (5s) creating directory for jobs_index.json");
+                        return;
+                    }
+                }
+                let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+                    self.mark_disk_io_unhealthy();
+                    return;
+                };
+                let index_path = canonical_parent.join("jobs_index.json");
+                if !index_path.starts_with(&canonical_parent) {
+                    return;
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tokio::fs::write(&index_path, json_str),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        self.mark_disk_io_healthy();
+                    }
+                    Ok(Err(e)) => {
+                        self.mark_disk_io_unhealthy();
                         warn!("Failed to persist jobs_index.json: {}", e);
                     }
                     Err(_) => {
-                        warn!("Timed out (5s) persisting jobs_index.json to {:?}", path);
+                        self.mark_disk_io_unhealthy();
+                        warn!("Timed out (5s) persisting jobs_index.json");
                     }
                 }
             }

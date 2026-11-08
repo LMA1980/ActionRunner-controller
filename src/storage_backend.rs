@@ -88,6 +88,9 @@ impl LeaderLease {
 
 const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
 const INTERNAL_CONSOLE_REPO_KEY: &str = "__ar_console_registry__";
+/// Read-only virtual snapshot key used by `MuObserveRemoteStorage::get_job_log` on local cache miss
+/// so `MuObserve` reconstructs the job log from `v_logs` (`otel_logs`) without any `__ar_job_logs__` snapshot writes.
+const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
 
 /// Abstract persistence interface for `mu-ci-controller` job records, branch snapshots,
 /// submodule snapshots, shared job logs, single-leader leases, and hardware-stratified regression gate queries (`#43`, `#78`–`#84`).
@@ -576,7 +579,51 @@ fn build_mtls_client_config(
 }
 
 type DedupLineKey = (String, i8, u32);
-type JobDedupMap = BTreeMap<String, std::collections::BTreeSet<DedupLineKey>>;
+
+#[derive(Default)]
+struct JobDedupRing {
+    order: std::collections::VecDeque<DedupLineKey>,
+    seen: std::collections::HashSet<DedupLineKey>,
+}
+
+impl JobDedupRing {
+    fn insert(&mut self, key: DedupLineKey, max_capacity: usize) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        while self.seen.len() >= max_capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.seen.insert(key)
+    }
+}
+
+type JobDedupMap = BTreeMap<String, JobDedupRing>;
+
+fn shared_redactor() -> &'static DeterministicSecretRedactor {
+    static REDACTOR: std::sync::OnceLock<DeterministicSecretRedactor> = std::sync::OnceLock::new();
+    REDACTOR.get_or_init(DeterministicSecretRedactor::new)
+}
+
+fn is_metric_summary_line(line: &str) -> bool {
+    let body = if let Some((_, after_stream)) = line.split_once("[stdout] ") {
+        after_stream
+    } else if let Some((_, after_stream)) = line.split_once("[stderr] ") {
+        after_stream
+    } else {
+        line
+    };
+    let trimmed = body.trim();
+    body.contains("test result:")
+        || trimmed.starts_with("TOTAL ")
+        || (trimmed.contains(".rs ") && trimmed.contains('%'))
+        || body.contains("bench:")
+}
 
 /// Remote `MuObserve` implementation of [`ControllerStorage`] communicating via
 /// `MUOB`-framed Apache Fory [`ControlRpcEnvelope`] messages and Arrow IPC [`OtelLogEntry`]
@@ -589,6 +636,7 @@ pub struct MuObserveRemoteStorage {
     pending_log_lines: Arc<std::sync::RwLock<Vec<OtelLogEntry>>>,
     seen_log_lines: Arc<std::sync::RwLock<JobDedupMap>>,
     controller_line_counters: Arc<std::sync::RwLock<BTreeMap<String, u32>>>,
+    job_commit_shas: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
     log_buffer: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
     dirty_log_keys: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     last_log_flush: Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>>,
@@ -597,6 +645,7 @@ pub struct MuObserveRemoteStorage {
 
 const MAX_BUFFERED_JOB_LOGS: usize = 100;
 const MAX_LOG_BUFFER_BYTES_PER_JOB: usize = 256 * 1024;
+const MAX_PRESERVED_METRIC_BYTES: usize = 16 * 1024;
 const MAX_SEEN_LINES_PER_JOB: usize = 50_000;
 const BUFFERED_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -625,6 +674,7 @@ impl MuObserveRemoteStorage {
             pending_log_lines: Arc::new(std::sync::RwLock::new(Vec::new())),
             seen_log_lines: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             controller_line_counters: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            job_commit_shas: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             log_buffer: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             dirty_log_keys: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             last_log_flush: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
@@ -632,11 +682,38 @@ impl MuObserveRemoteStorage {
         })
     }
 
+    fn register_job_commit_sha(&self, job_id: &str, commit_sha: &str) {
+        if commit_sha.is_empty() {
+            return;
+        }
+        let key = job_id.to_ascii_lowercase();
+        let Ok(mut guard) = self.job_commit_shas.write() else {
+            return;
+        };
+        guard.insert(key.clone(), commit_sha.to_string());
+        while guard.len() > MAX_BUFFERED_JOB_LOGS {
+            if let Some(first_key) = guard.keys().find(|k| k.as_str() != key).cloned() {
+                guard.remove(&first_key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn resolve_job_commit_sha(&self, job_id: &str) -> String {
+        let key = job_id.to_ascii_lowercase();
+        self.job_commit_shas
+            .read()
+            .ok()
+            .and_then(|g| g.get(&key).cloned())
+            .unwrap_or_else(|| job_id.to_string())
+    }
+
     fn append_to_local_log_buffer(&self, key: &str, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
-        let redactor = DeterministicSecretRedactor::new();
+        let redactor = shared_redactor();
         let scrubbed = redactor.redact(chunk);
         let Ok(mut guard) = self.log_buffer.write() else {
             return;
@@ -644,15 +721,29 @@ impl MuObserveRemoteStorage {
         let entry = guard.entry(key.to_string()).or_default();
         entry.push_str(&scrubbed);
         if entry.len() > MAX_LOG_BUFFER_BYTES_PER_JOB {
-            let overflow = entry.len() - MAX_LOG_BUFFER_BYTES_PER_JOB;
-            let mut cut = overflow;
+            let tail_budget =
+                MAX_LOG_BUFFER_BYTES_PER_JOB.saturating_sub(MAX_PRESERVED_METRIC_BYTES);
+            let mut cut = entry.len().saturating_sub(tail_budget);
             while cut < entry.len() && !entry.is_char_boundary(cut) {
                 cut += 1;
             }
             if let Some(rel_nl) = entry[cut..].find('\n') {
                 cut += rel_nl + 1;
             }
-            entry.drain(..cut.min(entry.len()));
+            cut = cut.min(entry.len());
+            let mut preserved = String::new();
+            for line in entry[..cut].lines() {
+                if is_metric_summary_line(line)
+                    && preserved.len().saturating_add(line.len()).saturating_add(1)
+                        <= MAX_PRESERVED_METRIC_BYTES
+                {
+                    preserved.push_str(line);
+                    preserved.push('\n');
+                }
+            }
+            let tail = entry[cut..].to_string();
+            preserved.push_str(&tail);
+            *entry = preserved;
         }
         while guard.len() > MAX_BUFFERED_JOB_LOGS {
             if let Some(first_key) = guard.keys().find(|k| k.as_str() != key).cloned() {
@@ -667,15 +758,11 @@ impl MuObserveRemoteStorage {
         let Ok(mut guard) = self.seen_log_lines.write() else {
             return true;
         };
-        let set = guard.entry(job_key.to_string()).or_default();
-        if set.len() >= MAX_SEEN_LINES_PER_JOB
-            && !set.contains(&(stage_id.to_string(), stream, line_no))
-        {
-            if let Some(oldest) = set.iter().next().cloned() {
-                set.remove(&oldest);
-            }
-        }
-        let inserted = set.insert((stage_id.to_string(), stream, line_no));
+        let ring = guard.entry(job_key.to_string()).or_default();
+        let inserted = ring.insert(
+            (stage_id.to_string(), stream, line_no),
+            MAX_SEEN_LINES_PER_JOB,
+        );
         while guard.len() > MAX_BUFFERED_JOB_LOGS {
             if let Some(first_key) = guard.keys().find(|k| k.as_str() != job_key).cloned() {
                 guard.remove(&first_key);
@@ -715,7 +802,8 @@ impl MuObserveRemoteStorage {
             return 0;
         }
         let key = job_id.to_ascii_lowercase();
-        let redactor = DeterministicSecretRedactor::new();
+        let commit_sha = self.resolve_job_commit_sha(job_id);
+        let redactor = shared_redactor();
         let mut new_otel = Vec::with_capacity(entries.len());
         let mut new_raw = Vec::with_capacity(entries.len());
 
@@ -731,7 +819,7 @@ impl MuObserveRemoteStorage {
                     .timestamp_nanos_opt()
                     .unwrap_or_else(|| chrono::Utc::now().timestamp_micros().saturating_mul(1_000))
             };
-            let trace_ctx = job_root_trace_context(job_id, &entry.stage_id);
+            let trace_ctx = job_stage_trace_context(job_id, &commit_sha, &entry.stage_id);
             let trace_id = encode_hex(&trace_ctx.trace_id);
             let span_id = encode_hex(&trace_ctx.span_id);
             let (severity_number, severity_text, stream_name) = if entry.stream == 2 {
@@ -756,7 +844,7 @@ impl MuObserveRemoteStorage {
                 job_id: Some(job_id.to_string()),
                 stage_id: Some(entry.stage_id.clone()),
             };
-            otel_entry.redact_in_place(&redactor);
+            otel_entry.redact_in_place(redactor);
             new_otel.push(otel_entry);
         }
 
@@ -814,8 +902,9 @@ impl MuObserveRemoteStorage {
         let key = job_id.to_ascii_lowercase();
         self.append_to_local_log_buffer(&key, chunk);
 
-        let redactor = DeterministicSecretRedactor::new();
-        let trace_ctx = job_root_trace_context(job_id, "controller");
+        let commit_sha = self.resolve_job_commit_sha(job_id);
+        let redactor = shared_redactor();
+        let trace_ctx = job_stage_trace_context(job_id, &commit_sha, "controller");
         let trace_id = encode_hex(&trace_ctx.trace_id);
         let span_id = encode_hex(&trace_ctx.span_id);
         let now_ns = chrono::Utc::now()
@@ -849,7 +938,7 @@ impl MuObserveRemoteStorage {
                 job_id: Some(job_id.to_string()),
                 stage_id: Some("controller".to_string()),
             };
-            otel_entry.redact_in_place(&redactor);
+            otel_entry.redact_in_place(redactor);
             new_otel.push(otel_entry);
         }
 
@@ -925,24 +1014,59 @@ impl MuObserveRemoteStorage {
         }
     }
 
+    fn requeue_failed_log_batch(&self, mut failed_batch: Vec<OtelLogEntry>) {
+        if failed_batch.is_empty() {
+            return;
+        }
+        if let Ok(mut dirty) = self.dirty_log_keys.lock() {
+            for entry in &failed_batch {
+                if let Some(ref jid) = entry.job_id {
+                    dirty.insert(jid.to_ascii_lowercase());
+                }
+            }
+        }
+        if let Ok(mut pending) = self.pending_log_lines.write() {
+            failed_batch.append(&mut *pending);
+            *pending = failed_batch;
+            if pending.len() > MAX_SEEN_LINES_PER_JOB {
+                let overflow = pending.len() - MAX_SEEN_LINES_PER_JOB;
+                pending.drain(..overflow);
+            }
+        }
+    }
+
     /// Drains all queued delta [`OtelLogEntry`] records and streams them as a single
     /// `MSG_TYPE_ARROW_OTEL_LOGS` frame (`encode_otel_logs_ipc`) to `MuObserve`.
+    /// On transient network or WAL error, re-queues the drained batch so no delta lines are lost.
     pub async fn flush_dirty_logs(&self) -> Result<usize, String> {
         let batch = self.drain_pending_log_lines(None);
         if batch.is_empty() {
             return Ok(0);
         }
-        self.send_otel_logs_async(&batch).await
+        match self.send_otel_logs_async(&batch).await {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.requeue_failed_log_batch(batch);
+                Err(e)
+            }
+        }
     }
 
     /// Synchronously drains and flushes pending [`OtelLogEntry`] delta records for `job_id`
     /// (or all jobs when `None`) via `MSG_TYPE_ARROW_OTEL_LOGS`.
+    /// On transient network or WAL error, re-queues the drained batch so no delta lines are lost.
     pub fn flush_dirty_logs_blocking(&self, job_id: Option<&str>) -> Result<usize, String> {
         let batch = self.drain_pending_log_lines(job_id);
         if batch.is_empty() {
             return Ok(0);
         }
-        self.send_otel_logs_blocking(&batch)
+        match self.send_otel_logs_blocking(&batch) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.requeue_failed_log_batch(batch);
+                Err(e)
+            }
+        }
     }
 
     async fn exchange_otel_logs_stream<S>(
@@ -1600,6 +1724,7 @@ pub(crate) fn resolve_submodule_from_snapshots(
 
 impl ControllerStorage for MuObserveRemoteStorage {
     fn upsert_record(&self, record: &JobRecord) {
+        self.register_job_commit_sha(&record.job.id, &record.job.commit_sha);
         let Some(central_record) = CatalogStore::to_central_job_record(record) else {
             return;
         };
@@ -1664,6 +1789,7 @@ impl ControllerStorage for MuObserveRemoteStorage {
             BTreeMap::new();
 
         for rec in records {
+            self.register_job_commit_sha(&rec.job.id, &rec.job.commit_sha);
             let Some(central) = CatalogStore::to_central_job_record(rec) else {
                 continue;
             };
@@ -1927,11 +2053,21 @@ impl ControllerStorage for MuObserveRemoteStorage {
 
     fn get_job_log(&self, job_id: &str) -> Option<String> {
         let key = job_id.to_ascii_lowercase();
-        self.log_buffer
+        if let Some(cached) = self
+            .log_buffer
             .read()
             .ok()
             .and_then(|g| g.get(&key).cloned())
             .filter(|s| !s.is_empty())
+        {
+            return Some(cached);
+        }
+        let remote_log = self
+            .query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key)
+            .and_then(|s| s.latest_active_json)
+            .filter(|s| !s.is_empty())?;
+        self.append_to_local_log_buffer(&key, &remote_log);
+        Some(remote_log)
     }
 
     fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {
@@ -2112,6 +2248,35 @@ pub fn job_root_trace_context(job_id: &str, commit_sha: &str) -> TraceContext {
 #[must_use]
 pub fn job_root_traceparent(job_id: &str, commit_sha: &str) -> String {
     job_root_trace_context(job_id, commit_sha).to_traceparent()
+}
+
+/// Generates a deterministic stage-scoped W3C [`TraceContext`] for a CI job that shares the
+/// exact 128-bit `trace_id` of [`job_root_trace_context`]`(job_id, commit_sha)` while deriving
+/// a deterministic 64-bit `span_id` for `stage_id` (`#142`).
+#[must_use]
+pub fn job_stage_trace_context(job_id: &str, commit_sha: &str, stage_id: &str) -> TraceContext {
+    let root = job_root_trace_context(job_id, commit_sha);
+    let mut span_hasher = Sha256::new();
+    span_hasher.update(b"muobserve-job-stage-span:");
+    span_hasher.update(job_id.as_bytes());
+    span_hasher.update(b":");
+    span_hasher.update(commit_sha.as_bytes());
+    span_hasher.update(b":");
+    span_hasher.update(stage_id.as_bytes());
+    let span_digest = span_hasher.finalize();
+
+    let mut span_id = [0u8; 8];
+    span_id.copy_from_slice(&span_digest[..8]);
+    if span_id == [0u8; 8] {
+        span_id[7] = 1;
+    }
+
+    TraceContext {
+        version: W3C_TRACEPARENT_VERSION,
+        trace_id: root.trace_id,
+        span_id,
+        trace_flags: TRACE_FLAG_SAMPLED,
+    }
 }
 
 /// Maps a numeric quality score (`0..=100`) to `mu-ci-controller`'s letter grade scale.
@@ -2337,6 +2502,128 @@ mod tests {
         assert_eq!(batches[1][1].service_name, "action-runner-controller");
         assert_eq!(batches[1][1].body, "Stage build succeeded");
 
+        // All worker stages and controller logs for job-delta-1 must share the exact same W3C trace_id (#142)
+        assert_eq!(batches[0][0].trace_id, batches[1][1].trace_id);
+        assert_ne!(batches[0][0].span_id, batches[1][1].span_id);
+
         server.abort();
+    }
+
+    #[test]
+    fn test_w3c_trace_id_shared_across_stages_and_fifo_dedup_eviction() {
+        let storage = MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(
+            "127.0.0.1:9".to_string(),
+        ))
+        .expect("storage init");
+        storage.register_job_commit_sha("job-trace-1", "deadbeefcafe1234");
+
+        let root_ctx = job_root_trace_context("job-trace-1", "deadbeefcafe1234");
+        let root_trace_hex = encode_hex(&root_ctx.trace_id);
+
+        storage.append_structured_log_entries_sync(
+            "job-trace-1",
+            &[
+                mu_ci_ipc::LogEntry {
+                    job_id: "job-trace-1".to_string(),
+                    stage_id: "build".to_string(),
+                    node_id: "node-a".to_string(),
+                    timestamp_us: 1_000,
+                    stream: 1,
+                    line_no: 1,
+                    content: "build line".to_string(),
+                },
+                mu_ci_ipc::LogEntry {
+                    job_id: "job-trace-1".to_string(),
+                    stage_id: "test".to_string(),
+                    node_id: "node-a".to_string(),
+                    timestamp_us: 2_000,
+                    stream: 1,
+                    line_no: 1,
+                    content: "test line".to_string(),
+                },
+            ],
+        );
+        storage.append_log_lines("job-trace-1", "controller summary\n");
+
+        let snapshot = storage.pending_log_lines_snapshot();
+        assert_eq!(snapshot.len(), 3);
+        for entry in &snapshot {
+            assert_eq!(entry.trace_id, root_trace_hex);
+        }
+        assert_ne!(snapshot[0].span_id, snapshot[1].span_id);
+        assert_ne!(snapshot[1].span_id, snapshot[2].span_id);
+
+        // Verify JobDedupRing evicts in strict FIFO order rather than lexicographical order (#142)
+        let mut ring = JobDedupRing::default();
+        assert!(ring.insert(("z-stage".to_string(), 1, 1), 2));
+        assert!(ring.insert(("a-stage".to_string(), 1, 1), 2));
+        // Inserting a 3rd item into capacity=2 ring must evict "z-stage" (oldest FIFO), NOT "a-stage"
+        assert!(ring.insert(("m-stage".to_string(), 1, 1), 2));
+        assert!(
+            !ring.insert(("a-stage".to_string(), 1, 1), 2),
+            "second FIFO item ('a-stage') must still be present"
+        );
+        assert!(
+            ring.insert(("z-stage".to_string(), 1, 1), 2),
+            "first FIFO item ('z-stage') must have been evicted first"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_metric_summary_lines_retained_across_log_buffer_truncation() {
+        let storage = MuObserveRemoteStorage::new(MuObserveRemoteConfig::plain_tcp(
+            "127.0.0.1:9".to_string(),
+        ))
+        .expect("storage init");
+
+        // Emit early stage metric summaries followed by >300 KiB of verbose compiler lines
+        storage.append_log_lines(
+            "job-metrics-1",
+            "test result: ok. 37 passed; 0 failed; 0 ignored\nTOTAL 1000 50 95.00%\nsrc/lib.rs 100 5 95.00% 100 5 95.00% 200 10 95.00%\ntest bench_fast ... bench: 12.5 ns/iter (+/- 0.4)\n",
+        );
+        let padding_line = format!("{}\n", "x".repeat(1024));
+        for _ in 0..300 {
+            storage.append_log_lines("job-metrics-1", &padding_line);
+        }
+        storage.append_log_lines(
+            "job-metrics-1",
+            "test result: ok. 13 passed; 0 failed; 0 ignored\n",
+        );
+
+        let retained =
+            ControllerStorage::get_job_log(&storage, "job-metrics-1").expect("retained log buffer");
+        assert!(retained.len() <= MAX_LOG_BUFFER_BYTES_PER_JOB);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let extracted = CatalogStore::extract_metrics_from_content_and_workspace(
+            tmp.path(),
+            "LMA1980/mu-ci-controller",
+            &retained,
+            true,
+        );
+        assert_eq!(extracted.tests_passed, 50);
+        assert_eq!(extracted.tests_total, 50);
+        assert_eq!(extracted.coverage_pct, Some(95.0));
+        assert_eq!(extracted.benchmark_summary.as_deref(), Some("12.5 ns/iter"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_failed_otel_flush_requeues_batch_for_retry() {
+        let mut cfg = MuObserveRemoteConfig::plain_tcp("127.0.0.1:9".to_string());
+        cfg.timeout_ms = 100;
+        let storage = MuObserveRemoteStorage::new(cfg).expect("storage init");
+
+        storage.append_log_lines("job-retry-1", "line 1\nline 2\n");
+        assert_eq!(storage.pending_log_lines_snapshot().len(), 2);
+
+        // Flush to unreachable endpoint fails, but batch must be re-queued (#141)
+        let res = storage.flush_dirty_logs().await;
+        assert!(res.is_err());
+        let pending = storage.pending_log_lines_snapshot();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].body, "line 1");
+        assert_eq!(pending[1].body, "line 2");
     }
 }

@@ -327,23 +327,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     for (job_id, stage_id) in &recovered {
                                         if let Some(record) = state.job_store.get_job(job_id).await
                                         {
-                                            let full_path =
-                                                state.config.workspace_dir.join(&record.log_file);
                                             let note = format!(
                                                 "{} [{}] [{}] [stderr] Worker signaled restart; stage execution interrupted and returned to queue for re-dispatch\n",
                                                 chrono::Utc::now().to_rfc3339(),
                                                 node_id,
                                                 stage_id
                                             );
-                                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
-                                                .create(true)
-                                                .append(true)
-                                                .open(&full_path)
-                                                .await
-                                            {
-                                                use tokio::io::AsyncWriteExt;
-                                                let _ = f.write_all(note.as_bytes()).await;
-                                            }
+                                            append_note_to_job_log_bounded(
+                                                &state,
+                                                &record.log_file,
+                                                &note,
+                                            )
+                                            .await;
+                                            state.job_store.append_log_lines(job_id, &note);
                                             state.broadcast_log(job_id, &note);
                                         }
                                     }
@@ -375,15 +371,34 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     if let Some(first) = entries.first() {
                                         let job_id = first.job_id.clone();
                                         if let Some(record) = state.job_store.get_job(&job_id).await {
-                                            let full_path = state.config.workspace_dir.join(&record.log_file);
+                                            let ws_dir = state.config.workspace_dir.clone();
+                                            let rel_log = record.log_file.clone();
                                             let entries_for_disk = entries.clone();
-                                            let _ = tokio::time::timeout(
+                                            let disk_res = tokio::time::timeout(
                                                 std::time::Duration::from_secs(5),
-                                                tokio::task::spawn_blocking(move || {
-                                                    append_logs(&full_path, &entries_for_disk)
-                                                }),
+                                                tokio::task::spawn_blocking(
+                                                    move || -> std::io::Result<()> {
+                                                        let Some(full_path) =
+                                                            resolve_safe_log_path(&ws_dir, &rel_log)
+                                                        else {
+                                                            return Err(std::io::Error::new(
+                                                                std::io::ErrorKind::InvalidInput,
+                                                                "invalid log path",
+                                                            ));
+                                                        };
+                                                        append_logs(&full_path, &entries_for_disk)
+                                                    },
+                                                ),
                                             )
                                             .await;
+                                            match disk_res {
+                                                Ok(Ok(Ok(()))) => {
+                                                    state.job_store.mark_disk_io_healthy();
+                                                }
+                                                _ => {
+                                                    state.job_store.mark_disk_io_unhealthy();
+                                                }
+                                            }
                                             state
                                                 .job_store
                                                 .append_structured_log_entries(&job_id, &entries)
@@ -429,26 +444,93 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         );
         for (job_id, stage_id) in &recovered {
             if let Some(record) = state.job_store.get_job(job_id).await {
-                let full_path = state.config.workspace_dir.join(&record.log_file);
                 let note = format!(
                     "{} [controller] [{}] [stderr] Worker '{}' disconnected unexpectedly; stage returned to queue for recovery\n",
                     chrono::Utc::now().to_rfc3339(),
                     stage_id,
                     node_id
                 );
-                if let Ok(mut f) = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&full_path)
-                    .await
-                {
-                    use tokio::io::AsyncWriteExt;
-                    let _ = f.write_all(note.as_bytes()).await;
-                }
+                append_note_to_job_log_bounded(&state, &record.log_file, &note).await;
+                state.job_store.append_log_lines(job_id, &note);
                 state.broadcast_log(job_id, &note);
             }
         }
         state.job_store.notify_event();
     }
     info!(node = %node_id, "Cluster tunnel session terminated");
+}
+
+pub(crate) fn resolve_safe_log_path(
+    workspace_dir: &std::path::Path,
+    rel_log_file: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let _ = std::fs::create_dir_all(workspace_dir);
+    let canonical_ws = std::fs::canonicalize(workspace_dir).ok()?;
+    let mut safe_rel = std::path::PathBuf::new();
+    for comp in rel_log_file.components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                let s = seg.to_str()?;
+                if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') {
+                    return None;
+                }
+                safe_rel.push(s);
+            }
+            _ => return None,
+        }
+    }
+    if safe_rel.as_os_str().is_empty() {
+        return None;
+    }
+    let joined = canonical_ws.join(&safe_rel);
+    if !joined.starts_with(&canonical_ws) {
+        return None;
+    }
+    let parent = joined.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    if !canonical_parent.starts_with(&canonical_ws) {
+        return None;
+    }
+    let file_name = joined.file_name()?.to_str()?;
+    if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
+        return None;
+    }
+    let final_path = canonical_parent.join(file_name);
+    if !final_path.starts_with(&canonical_ws) {
+        return None;
+    }
+    Some(final_path)
+}
+
+pub(crate) async fn append_note_to_job_log_bounded(
+    state: &Arc<AppState>,
+    rel_log_file: &std::path::Path,
+    note: &str,
+) {
+    let ws_dir = state.config.workspace_dir.clone();
+    let rel = rel_log_file.to_path_buf();
+    let note_owned = note.to_string();
+    let write_res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let Some(full_path) = resolve_safe_log_path(&ws_dir, &rel) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid log path",
+                ));
+            };
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&full_path)?;
+            f.write_all(note_owned.as_bytes())
+        }),
+    )
+    .await;
+    match write_res {
+        Ok(Ok(Ok(()))) => state.job_store.mark_disk_io_healthy(),
+        _ => state.job_store.mark_disk_io_unhealthy(),
+    }
 }

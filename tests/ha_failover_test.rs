@@ -564,25 +564,58 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
                             })
                         }
                         ControlRpcEnvelope::QuerySubmoduleSnapshotsReq(q) => {
-                            let g = store_conn.lock().unwrap();
-                            let snapshots: Vec<CentralSubmoduleSnapshot> = g
-                                .values()
-                                .filter(|s| {
-                                    q.parent_repo_key
-                                        .as_ref()
-                                        .map(|p| &s.parent_repo_key == p)
-                                        .unwrap_or(true)
-                                        && q.branch_key
-                                            .as_ref()
-                                            .map(|b| &s.branch_key == b)
-                                            .unwrap_or(true)
-                                        && q.submodule_key
-                                            .as_ref()
-                                            .map(|k| &s.submodule_key == k)
-                                            .unwrap_or(true)
-                                })
-                                .cloned()
-                                .collect();
+                            let snapshots: Vec<CentralSubmoduleSnapshot> =
+                                if q.parent_repo_key.as_deref() == Some("__ar_job_logs__") {
+                                    let target_job = q.submodule_key.clone().unwrap_or_default();
+                                    let logs = otel_conn.lock().unwrap();
+                                    let mut combined = String::new();
+                                    for entry in logs.iter().filter(|e| {
+                                        e.job_id
+                                            .as_deref()
+                                            .map(|j| j.eq_ignore_ascii_case(&target_job))
+                                            .unwrap_or(false)
+                                    }) {
+                                        combined.push_str(&entry.body);
+                                        if !combined.ends_with('\n') {
+                                            combined.push('\n');
+                                        }
+                                    }
+                                    if combined.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![CentralSubmoduleSnapshot {
+                                            parent_repo_key: "__ar_job_logs__".to_string(),
+                                            branch_key: "log".to_string(),
+                                            submodule_key: target_job.clone(),
+                                            submodule_path_key: "log".to_string(),
+                                            latest_active_job_id: Some(target_job),
+                                            latest_active_json: Some(combined),
+                                            latest_active_queued_us: Some(0),
+                                            latest_completed_job_id: None,
+                                            latest_completed_json: None,
+                                            latest_completed_queued_us: None,
+                                        }]
+                                    }
+                                } else {
+                                    let g = store_conn.lock().unwrap();
+                                    g.values()
+                                        .filter(|s| {
+                                            q.parent_repo_key
+                                                .as_ref()
+                                                .map(|p| &s.parent_repo_key == p)
+                                                .unwrap_or(true)
+                                                && q.branch_key
+                                                    .as_ref()
+                                                    .map(|b| &s.branch_key == b)
+                                                    .unwrap_or(true)
+                                                && q.submodule_key
+                                                    .as_ref()
+                                                    .map(|k| &s.submodule_key == k)
+                                                    .unwrap_or(true)
+                                        })
+                                        .cloned()
+                                        .collect()
+                                };
                             ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(
                                 QuerySubmoduleSnapshotsResponse {
                                     request_id: q.request_id,
@@ -623,17 +656,24 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
     assert_eq!(lease.holder_id, "node-b");
     assert_eq!(lease.epoch, 2);
 
-    // 2. Delta OTel log line streaming & local tail cache fallback
+    // 2. Delta OTel log line streaming, local tail cache, & cross-instance fallback (#143)
     remote_a.append_job_log("job-rpc-1", "Stage 1 output\n");
     remote_a.append_job_log("job-rpc-1", "Stage 2 output\n");
     assert_eq!(
         remote_a.get_job_log("job-rpc-1").as_deref(),
         Some("Stage 1 output\nStage 2 output\n")
     );
-    let streamed_otel = otel_logs_store.lock().unwrap();
-    assert_eq!(streamed_otel.len(), 2);
-    assert_eq!(streamed_otel[0].body, "Stage 1 output");
-    assert_eq!(streamed_otel[1].body, "Stage 2 output");
+    assert_eq!(
+        remote_b.get_job_log("job-rpc-1").as_deref(),
+        Some("Stage 1 output\nStage 2 output\n"),
+        "standby/failover controller instance must reconstruct job log from MuObserve OTel logs on cache miss"
+    );
+    {
+        let streamed_otel = otel_logs_store.lock().unwrap();
+        assert_eq!(streamed_otel.len(), 2);
+        assert_eq!(streamed_otel[0].body, "Stage 1 output");
+        assert_eq!(streamed_otel[1].body, "Stage 2 output");
+    }
     assert!(
         !sub_store
             .lock()

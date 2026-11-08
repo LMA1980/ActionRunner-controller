@@ -220,14 +220,15 @@ fn check_operator_gate(
 }
 
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Response {
-    let io_ok = matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::fs::metadata(&state.config.workspace_dir),
-        )
-        .await,
-        Ok(Ok(_))
-    );
+    let io_ok = state.job_store.is_disk_io_healthy()
+        && matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::fs::metadata(&state.config.workspace_dir),
+            )
+            .await,
+            Ok(Ok(_))
+        );
     if !io_ok {
         return json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -634,20 +635,11 @@ pub async fn resume_job_handler(
     }
     match state.job_store.resume_job(&job_id).await {
         Ok(record) => {
-            let full_path = state.config.workspace_dir.join(&record.log_file);
             let note = format!(
                 "{} [controller] Manual pipeline resume initiated; queuing pending stages\n",
                 Utc::now().to_rfc3339()
             );
-            if let Ok(mut f) = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&full_path)
-                .await
-            {
-                use tokio::io::AsyncWriteExt;
-                let _ = f.write_all(note.as_bytes()).await;
-            }
+            crate::tunnel::append_note_to_job_log_bounded(&state, &record.log_file, &note).await;
             state.broadcast_log(&job_id, &note);
             let pos = state
                 .job_store
@@ -699,20 +691,11 @@ pub async fn restart_job_handler(
     }
     match state.job_store.restart_job(&job_id).await {
         Ok(record) => {
-            let full_path = state.config.workspace_dir.join(&record.log_file);
             let note = format!(
                 "{} [controller] Manual pipeline full restart initiated; resetting all stages to Pending\n",
                 Utc::now().to_rfc3339()
             );
-            if let Ok(mut f) = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&full_path)
-                .await
-            {
-                use tokio::io::AsyncWriteExt;
-                let _ = f.write_all(note.as_bytes()).await;
-            }
+            crate::tunnel::append_note_to_job_log_bounded(&state, &record.log_file, &note).await;
             state.broadcast_log(&job_id, &note);
             let pos = state
                 .job_store
@@ -1535,5 +1518,96 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["reason"], "workspace_dir_io_unavailable");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_health_check_503_when_disk_write_marked_unhealthy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_health_test_state(tmp.path().to_path_buf(), HaRoleConfig::Leader);
+        state.job_store.mark_disk_io_unhealthy();
+        let app = create_router(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["reason"], "workspace_dir_io_unavailable");
+
+        // Recovering disk I/O restores 200 OK
+        state.job_store.mark_disk_io_healthy();
+        let app2 = create_router(state);
+        let resp2 = app2
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_tick_ha_coordinator_demotes_configured_leader_on_lease_loss() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut unreachable_cfg =
+            crate::storage_backend::MuObserveRemoteConfig::plain_tcp("127.0.0.1:9".to_string());
+        unreachable_cfg.timeout_ms = 100;
+        let failing_storage: Arc<dyn crate::storage_backend::ControllerStorage> = Arc::new(
+            crate::storage_backend::MuObserveRemoteStorage::new(unreachable_cfg)
+                .expect("storage init"),
+        );
+
+        let config = Config {
+            bind_addr: "127.0.0.1:0".to_string(),
+            workspace_dir: tmp.path().to_path_buf(),
+            node_id: "node-a".to_string(),
+            ha_role: HaRoleConfig::Leader,
+            ..Config::default()
+        };
+        let job_store = JobStore::with_storage(10, None, failing_storage);
+        job_store.set_ha_role(HaRole::Leader);
+        let cluster = ClusterRegistry::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (log_broadcaster, _) = broadcast::channel(64);
+        let state = Arc::new(AppState {
+            config,
+            job_store,
+            cluster,
+            tx,
+            log_broadcaster,
+            console: ConsoleState::default(),
+        });
+
+        // When storage lease renewal fails, even HaRoleConfig::Leader must step down to Standby (#140)
+        state.tick_ha_coordinator().await;
+        assert_eq!(state.job_store.ha_role(), HaRole::Standby);
+
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
