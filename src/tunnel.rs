@@ -464,8 +464,6 @@ pub(crate) fn resolve_safe_log_path(
     workspace_dir: &std::path::Path,
     rel_log_file: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    let _ = std::fs::create_dir_all(workspace_dir);
-    let canonical_ws = std::fs::canonicalize(workspace_dir).ok()?;
     let mut safe_rel = std::path::PathBuf::new();
     for comp in rel_log_file.components() {
         match comp {
@@ -482,12 +480,16 @@ pub(crate) fn resolve_safe_log_path(
     if safe_rel.as_os_str().is_empty() {
         return None;
     }
-    let joined = canonical_ws.join(&safe_rel);
-    if !joined.starts_with(&canonical_ws) {
+    let joined = workspace_dir.join(&safe_rel);
+    if !joined.starts_with(workspace_dir) {
         return None;
     }
     let parent = joined.parent()?;
+    if !parent.starts_with(workspace_dir) {
+        return None;
+    }
     std::fs::create_dir_all(parent).ok()?;
+    let canonical_ws = std::fs::canonicalize(workspace_dir).ok()?;
     let canonical_parent = std::fs::canonicalize(parent).ok()?;
     if !canonical_parent.starts_with(&canonical_ws) {
         return None;
