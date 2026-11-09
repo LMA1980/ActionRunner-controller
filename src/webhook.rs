@@ -1119,7 +1119,7 @@ mod tests {
         assert_eq!(events[0].sha, commit);
         assert_eq!(events[0].auth, "Bearer ghs_unit_test_tok");
         assert_eq!(events[0].body["state"], "pending");
-        assert_eq!(events[0].body["context"], "k3-ci");
+        assert_eq!(events[0].body["context"], "continuous integration");
         assert_eq!(
             events[0].body["description"],
             "ActionRunner distributed pipeline queued (position #1)..."

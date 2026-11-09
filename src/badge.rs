@@ -724,7 +724,7 @@ mod tests {
             stages: Vec::new(),
         };
 
-        let svg = render_status_badge("k3-ci", Some(&record));
+        let svg = render_status_badge("continuous integration", Some(&record));
         assert!(svg.contains("<svg"));
         assert!(svg.contains("passing"));
         assert!(svg.contains("#2ea44f"));

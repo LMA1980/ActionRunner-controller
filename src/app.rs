@@ -743,7 +743,7 @@ pub async fn get_repo_badge(
 ) -> Response {
     let repo_full = format!("{}/{}", owner, repo);
     let record = state.job_store.find_latest_job(&repo_full, None).await;
-    let svg = badge::render_status_badge("k3-ci", record.as_ref());
+    let svg = badge::render_status_badge("continuous integration", record.as_ref());
     svg_response(svg)
 }
 
@@ -756,7 +756,7 @@ pub async fn get_branch_badge(
         .job_store
         .find_latest_job(&repo_full, Some(&branch))
         .await;
-    let svg = badge::render_status_badge("k3-ci", record.as_ref());
+    let svg = badge::render_status_badge("continuous integration", record.as_ref());
     svg_response(svg)
 }
 
@@ -847,7 +847,7 @@ pub async fn get_repo_shield(
         StatusCode::OK,
         serde_json::json!({
             "schemaVersion": 1,
-            "label": "k3-ci",
+            "label": "continuous integration",
             "message": msg,
             "color": color
         }),
@@ -875,7 +875,7 @@ pub async fn get_branch_shield(
         StatusCode::OK,
         serde_json::json!({
             "schemaVersion": 1,
-            "label": "k3-ci",
+            "label": "continuous integration",
             "message": msg,
             "color": color
         }),
@@ -957,7 +957,7 @@ pub async fn get_submodule_badge(
         .job_store
         .find_submodule_job(&parent_full, &submodule, None)
         .await;
-    let svg = badge::render_status_badge("k3-ci", record.as_ref());
+    let svg = badge::render_status_badge("continuous integration", record.as_ref());
     svg_response(svg)
 }
 
@@ -970,7 +970,7 @@ pub async fn get_branch_submodule_badge(
         .job_store
         .find_submodule_job(&parent_full, &submodule, Some(&branch))
         .await;
-    let svg = badge::render_status_badge("k3-ci", record.as_ref());
+    let svg = badge::render_status_badge("continuous integration", record.as_ref());
     svg_response(svg)
 }
 
@@ -1175,6 +1175,33 @@ pub struct EventsQuery {
     pub api_key: Option<String>,
 }
 
+fn resolve_job_stream_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_key: Option<&str>,
+) -> Result<bool, Box<Response>> {
+    let auth = crate::console::api::resolve_auth_with_query_key(
+        &state.config,
+        &state.job_store,
+        headers,
+        query_key,
+    );
+    match auth {
+        crate::console::api::AuthResolution::AdminApiKey
+        | crate::console::api::AuthResolution::BoundUser { .. } => Ok(true),
+        crate::console::api::AuthResolution::UninvitedUser { .. } => Err(Box::new(json_response(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "Forbidden: GitHub account is not bound to an active MuConsole invite"
+            }),
+        ))),
+        crate::console::api::AuthResolution::Anonymous => Ok(state.config.log_api_key.is_none()
+            && state.config.proxy_secret.is_none()
+            && !headers.contains_key("x-forwarded-user")
+            && !headers.contains_key("x-proxy-secret")),
+    }
+}
+
 pub async fn handle_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1183,10 +1210,11 @@ pub async fn handle_events(
     let query_key = query.api_key.as_deref().or(query.token.as_deref());
 
     if let Some(ref job_id) = query.job_id {
-        if let Some(denied) = check_operator_gate(&state, &headers, query_key) {
-            return denied;
-        }
-        return stream_job_events(state, job_id.clone()).await;
+        let is_operator = match resolve_job_stream_operator(&state, &headers, query_key) {
+            Ok(v) => v,
+            Err(denied) => return *denied,
+        };
+        return stream_job_events(state, job_id.clone(), is_operator).await;
     }
 
     let auth = crate::console::api::resolve_auth_with_query_key(
@@ -1218,11 +1246,12 @@ pub async fn handle_job_events(
     Query(query): Query<EventsQuery>,
 ) -> Response {
     let query_key = query.api_key.as_deref().or(query.token.as_deref());
-    if let Some(denied) = check_operator_gate(&state, &headers, query_key) {
-        return denied;
-    }
+    let is_operator = match resolve_job_stream_operator(&state, &headers, query_key) {
+        Ok(v) => v,
+        Err(denied) => return *denied,
+    };
 
-    stream_job_events(state, job_id).await
+    stream_job_events(state, job_id, is_operator).await
 }
 
 /// Dashboard SSE stream. Existing kinds (`queue`, `jobs`, `cluster`) are unchanged; the
@@ -1304,7 +1333,27 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
     resp
 }
 
-async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
+async fn read_best_job_log(state: &AppState, full_path: &std::path::Path, job_id: &str) -> String {
+    let disk_log = tokio::fs::read_to_string(full_path)
+        .await
+        .unwrap_or_default();
+    let shared_log = state.job_store.get_job_log(job_id).unwrap_or_default();
+    if shared_log.len() > disk_log.len() {
+        shared_log
+    } else {
+        disk_log
+    }
+}
+
+fn format_log_for_viewer(raw: &str, is_operator: bool) -> String {
+    if is_operator {
+        raw.to_string()
+    } else {
+        crate::console::sanitize_log_text(raw)
+    }
+}
+
+async fn stream_job_events(state: Arc<AppState>, job_id: String, is_operator: bool) -> Response {
     let Some(initial_job) = state.job_store.get_job(&job_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -1322,14 +1371,17 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
     };
 
     let full_path = state.config.workspace_dir.join(&initial_job.log_file);
-    let initial_log = match tokio::fs::read_to_string(&full_path).await {
-        Ok(s) if !s.is_empty() => s,
-        _ => state.job_store.get_job_log(&job_id).unwrap_or_default(),
-    };
+    let initial_raw_log = read_best_job_log(&state, &full_path, &job_id).await;
+    let initial_log = format_log_for_viewer(&initial_raw_log, is_operator);
 
     let mut log_rx = state.log_broadcaster.subscribe();
     let jid = job_id.clone();
-    let initial_job_json = serde_json::to_string(&initial_job).unwrap_or_default();
+    let initial_job_raw_json = serde_json::to_string(&initial_job).unwrap_or_default();
+    let initial_job_json = format_log_for_viewer(&initial_job_raw_json, is_operator);
+    let mut is_terminal = matches!(
+        initial_job.status,
+        JobStatus::Completed { .. } | JobStatus::Failed { .. } | JobStatus::Skipped { .. }
+    );
 
     let stream = async_stream::stream! {
         // Send initial job state
@@ -1340,26 +1392,33 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
             yield Ok::<_, Infallible>(Event::default().event("log_init").data(json_log));
         }
 
-        let mut last_job_version = initial_job_json;
+        let mut last_job_version = initial_job_raw_json;
+        let mut emitted_raw_len = initial_raw_log.len();
+        let mut storage_poll = tokio::time::interval(std::time::Duration::from_secs(1));
+        storage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        storage_poll.tick().await;
 
         loop {
             tokio::select! {
-                // New log chunks broadcast from workers or manual actions
+                // New log chunks broadcast from workers or manual actions on this controller node
                 recv_res = log_rx.recv() => {
                     match recv_res {
                         Ok(msg) => {
                             if msg.job_id == jid {
-                                if let Ok(json_chunk) = serde_json::to_string(&msg.chunk) {
+                                emitted_raw_len = emitted_raw_len.saturating_add(msg.chunk.len());
+                                let chunk_out = format_log_for_viewer(&msg.chunk, is_operator);
+                                if let Ok(json_chunk) = serde_json::to_string(&chunk_out) {
                                     yield Ok::<_, Infallible>(Event::default().event("log_chunk").data(json_chunk));
                                 }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // Subscriber lagged: read fresh log from disk and re-initialize
-                            if let Ok(full_log) = tokio::fs::read_to_string(&full_path).await {
-                                if let Ok(json_log) = serde_json::to_string(&full_log) {
-                                    yield Ok::<_, Infallible>(Event::default().event("log_init").data(json_log));
-                                }
+                            // Subscriber lagged: read fresh log from disk / shared storage and re-initialize
+                            let full_raw = read_best_job_log(&state, &full_path, &jid).await;
+                            emitted_raw_len = full_raw.len();
+                            let full_out = format_log_for_viewer(&full_raw, is_operator);
+                            if let Ok(json_log) = serde_json::to_string(&full_out) {
+                                yield Ok::<_, Infallible>(Event::default().event("log_init").data(json_log));
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1368,13 +1427,48 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String) -> Response {
                     }
                 }
 
-                // Job status / stage status changes
-                _ = state.job_store.wait_for_event() => {
+                // Cross-controller HA shared-storage delta tailing while job is non-terminal (#131)
+                _ = storage_poll.tick(), if !is_terminal => {
+                    let latest_raw = read_best_job_log(&state, &full_path, &jid).await;
+                    if latest_raw.len() > emitted_raw_len {
+                        let delta_raw = &latest_raw[emitted_raw_len..];
+                        emitted_raw_len = latest_raw.len();
+                        let chunk_out = format_log_for_viewer(delta_raw, is_operator);
+                        if let Ok(json_chunk) = serde_json::to_string(&chunk_out) {
+                            yield Ok::<_, Infallible>(Event::default().event("log_chunk").data(json_chunk));
+                        }
+                    }
                     if let Some(curr_job) = state.job_store.get_job(&jid).await {
+                        is_terminal = matches!(
+                            curr_job.status,
+                            JobStatus::Completed { .. }
+                                | JobStatus::Failed { .. }
+                                | JobStatus::Skipped { .. }
+                        );
                         if let Ok(curr_str) = serde_json::to_string(&curr_job) {
                             if curr_str != last_job_version {
                                 last_job_version = curr_str.clone();
-                                yield Ok::<_, Infallible>(Event::default().event("job").data(curr_str));
+                                let out_str = format_log_for_viewer(&curr_str, is_operator);
+                                yield Ok::<_, Infallible>(Event::default().event("job").data(out_str));
+                            }
+                        }
+                    }
+                }
+
+                // Job status / stage status changes
+                _ = state.job_store.wait_for_event() => {
+                    if let Some(curr_job) = state.job_store.get_job(&jid).await {
+                        is_terminal = matches!(
+                            curr_job.status,
+                            JobStatus::Completed { .. }
+                                | JobStatus::Failed { .. }
+                                | JobStatus::Skipped { .. }
+                        );
+                        if let Ok(curr_str) = serde_json::to_string(&curr_job) {
+                            if curr_str != last_job_version {
+                                last_job_version = curr_str.clone();
+                                let out_str = format_log_for_viewer(&curr_str, is_operator);
+                                yield Ok::<_, Infallible>(Event::default().event("job").data(out_str));
                             }
                         }
                     }
