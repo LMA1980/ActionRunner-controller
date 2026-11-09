@@ -1147,40 +1147,48 @@ pub async fn report_github_commit_status_with_base_url(
         }
     };
 
-    let payload = serde_json::json!({
-        "state": state,
-        "target_url": target_url,
-        "description": desc,
-        "context": "continuous integration",
-    });
+    let contexts: &[&str] = if resolved_base_url.contains("api.github.com") {
+        &["continuous integration", "k3-ci"]
+    } else {
+        &["continuous integration"]
+    };
 
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "ActionRunner-Controller/0.1.0")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                info!(repo = %repo, sha = %sha, state = %state, "Reported commit status to GitHub");
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!(
-                    repo = %repo,
-                    sha = %sha,
-                    status = %status,
-                    body = %body,
-                    "GitHub commit status API responded with error"
-                );
+    for &ctx in contexts {
+        let payload = serde_json::json!({
+            "state": state,
+            "target_url": target_url,
+            "description": desc,
+            "context": ctx,
+        });
+
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "ActionRunner-Controller/0.1.0")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(repo = %repo, sha = %sha, state = %state, context = %ctx, "Reported commit status to GitHub");
+                } else {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(
+                        repo = %repo,
+                        sha = %sha,
+                        status = %status,
+                        body = %body,
+                        "GitHub commit status API responded with error"
+                    );
+                }
             }
-        }
-        Err(err) => {
-            warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
+            Err(err) => {
+                warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
+            }
         }
     }
 }
@@ -1350,11 +1358,19 @@ pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
     if let Some(reg_base) = muregist_api_url.map(str::trim).filter(|s| !s.is_empty()) {
         let reg_url = format!("{}/api/v1/bundles/it", reg_base.trim_end_matches('/'));
         let reg_payload = serde_json::json!({
-            "bundle_digest": job.commit_sha,
             "service_name": service_name,
+            "binary_digest": job.commit_sha,
+            "it_archive_digest": job.commit_sha,
+            "bundle_digest": job.commit_sha,
             "git_commit": job.commit_sha,
         });
-        match client.post(&reg_url).json(&reg_payload).send().await {
+        match client
+            .post(&reg_url)
+            .header("x-client-cert-san", "mu-ci-controller")
+            .json(&reg_payload)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 info!(
                     job_id = %job.id,
