@@ -866,6 +866,7 @@ impl DAGScheduler {
                             Some(&target_url),
                         )
                         .await;
+                        let _ = trigger_post_ci_cd_pipeline(&job, &repo_workspace).await;
                     }
                 }
                 self.job_store.flush_job_log(Some(&job.id));
@@ -1146,40 +1147,319 @@ pub async fn report_github_commit_status_with_base_url(
         }
     };
 
-    let payload = serde_json::json!({
-        "state": state,
-        "target_url": target_url,
-        "description": desc,
-        "context": "continuous integration",
-    });
+    let contexts: &[&str] = if resolved_base_url.contains("api.github.com") {
+        &["continuous integration", "k3-ci"]
+    } else {
+        &["continuous integration"]
+    };
 
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "ActionRunner-Controller/0.1.0")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&payload)
-        .send()
-        .await
+    for &ctx in contexts {
+        let payload = serde_json::json!({
+            "state": state,
+            "target_url": target_url,
+            "description": desc,
+            "context": ctx,
+        });
+
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "ActionRunner-Controller/0.1.0")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(repo = %repo, sha = %sha, state = %state, context = %ctx, "Reported commit status to GitHub");
+                } else {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(
+                        repo = %repo,
+                        sha = %sha,
+                        status = %status,
+                        body = %body,
+                        "GitHub commit status API responded with error"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
+            }
+        }
+    }
+}
+
+/// Ordered candidate paths for Continuous Delivery (`MuConDe`) manifests.
+pub const CD_MANIFEST_CANDIDATES: &[&str] = &[
+    ".mucd/mu-cd.yml",
+    ".mucd/mu-cd.yaml",
+    ".mucd/MuConDe.yml",
+    ".mucd/MuConDe.yaml",
+    ".muconde/MuConDe.yml",
+    ".muconde/MuConDe.yaml",
+    ".muconde/mu-cd.yml",
+    ".muconde/mu-cd.yaml",
+];
+
+/// Returns `true` when `job` represents a `push` or `merge` event on the `main` branch.
+#[must_use]
+pub fn is_main_push_or_merge(job: &Job) -> bool {
+    !job.commit_sha.trim().is_empty()
+        && (job.event_type == "push" || job.event_type == "merge")
+        && (job.ref_name == "refs/heads/main" || job.ref_name == "main")
+}
+
+/// Resolves the raw YAML content of a repository's CD manifest from either `git show <sha>:<cand>`
+/// or the local `repo_workspace` checkout.
+pub async fn resolve_cd_manifest_yaml(repo_workspace: &Path, commit_sha: &str) -> Option<String> {
+    if !commit_sha.trim().is_empty() && repo_workspace.join(".git").exists() {
+        for cand in CD_MANIFEST_CANDIDATES {
+            let git_spec = format!("{commit_sha}:{cand}");
+            if let Ok(out) = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_workspace)
+                .arg("show")
+                .arg(&git_spec)
+                .output()
+                .await
+            {
+                if out.status.success() {
+                    if let Ok(content) = String::from_utf8(out.stdout) {
+                        if !content.trim().is_empty() {
+                            return Some(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for cand in CD_MANIFEST_CANDIDATES {
+        let p = repo_workspace.join(cand);
+        if let Ok(content) = tokio::fs::read_to_string(&p).await {
+            if !content.trim().is_empty() {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
+/// Extracts the `service` identifier from a `MuConDe` YAML manifest, falling back to the repository short name.
+#[must_use]
+pub fn extract_cd_service_name(manifest_yaml: &str, repo_name: &str) -> String {
+    if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(manifest_yaml) {
+        if let Some(svc) = val.get("service").and_then(|v| v.as_str()) {
+            let trimmed = svc.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    repo_name
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(repo_name)
+        .to_string()
+}
+
+/// Resolves the `MuConDe` CD API bearer token from an explicit file path or literal/file environment value.
+/// Fails closed (`None`) if a configured file path cannot be read or is empty.
+#[must_use]
+pub fn load_cd_api_token_from_values(
+    token_file: Option<&str>,
+    token_literal_or_path: Option<&str>,
+) -> Option<String> {
+    if let Some(file_path) = token_file.map(str::trim).filter(|s| !s.is_empty()) {
+        return std::fs::read_to_string(file_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if let Some(val) = token_literal_or_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                info!(repo = %repo, sha = %sha, state = %state, "Reported commit status to GitHub");
-            } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+        if val.starts_with('/') {
+            return std::fs::read_to_string(val)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        return Some(val.to_string());
+    }
+    None
+}
+
+/// Loads the `MuConDe` CD API bearer token from `MUCONDE_CD_API_TOKEN_FILE` or `MUCONDE_CD_API_TOKEN`.
+#[must_use]
+pub fn load_cd_api_token() -> Option<String> {
+    let token_file = std::env::var("MUCONDE_CD_API_TOKEN_FILE").ok();
+    let token_val = std::env::var("MUCONDE_CD_API_TOKEN").ok();
+    load_cd_api_token_from_values(token_file.as_deref(), token_val.as_deref())
+}
+
+/// Triggers post-CI Continuous Distribution (`MuRegist`) and Continuous Deployment (`MuConDe`)
+/// when a `main` branch `push` or `merge` job succeeds and the repository defines a CD manifest.
+pub async fn trigger_post_ci_cd_pipeline(job: &Job, repo_workspace: &Path) -> bool {
+    let muregist_url = std::env::var("MUREGIST_API_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let muconde_url = std::env::var("MUCONDE_CD_API_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cd_token = load_cd_api_token();
+    trigger_post_ci_cd_pipeline_with_endpoints(
+        job,
+        repo_workspace,
+        muregist_url.as_deref(),
+        muconde_url.as_deref(),
+        cd_token.as_deref(),
+    )
+    .await
+}
+
+/// Testable implementation of post-CI `MuRegist` bundle registration and `MuConDe` rollout dispatch.
+pub async fn trigger_post_ci_cd_pipeline_with_endpoints(
+    job: &Job,
+    repo_workspace: &Path,
+    muregist_api_url: Option<&str>,
+    muconde_cd_api_url: Option<&str>,
+    cd_api_token: Option<&str>,
+) -> bool {
+    if !is_main_push_or_merge(job) {
+        return false;
+    }
+
+    let manifest_yaml = match resolve_cd_manifest_yaml(repo_workspace, &job.commit_sha).await {
+        Some(yaml) => yaml,
+        None => return false,
+    };
+
+    let service_name = extract_cd_service_name(&manifest_yaml, &job.repo_name);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to build HTTP client for post-CI CD pipeline");
+            return false;
+        }
+    };
+
+    if let Some(reg_base) = muregist_api_url.map(str::trim).filter(|s| !s.is_empty()) {
+        let reg_url = format!("{}/api/v1/bundles/it", reg_base.trim_end_matches('/'));
+        let reg_payload = serde_json::json!({
+            "service_name": service_name,
+            "binary_digest": job.commit_sha,
+            "it_archive_digest": job.commit_sha,
+            "bundle_digest": job.commit_sha,
+            "git_commit": job.commit_sha,
+        });
+        match client
+            .post(&reg_url)
+            .header("x-client-cert-san", "mu-ci-controller")
+            .json(&reg_payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    job_id = %job.id,
+                    repo = %job.repo_name,
+                    service = %service_name,
+                    commit = %job.commit_sha,
+                    "Registered post-CI artifact bundle in MuRegist"
+                );
+            }
+            Ok(resp) => {
                 warn!(
-                    repo = %repo,
-                    sha = %sha,
-                    status = %status,
-                    body = %body,
-                    "GitHub commit status API responded with error"
+                    job_id = %job.id,
+                    repo = %job.repo_name,
+                    status = %resp.status(),
+                    "MuRegist bundle registration returned non-success status"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    job_id = %job.id,
+                    repo = %job.repo_name,
+                    error = %e,
+                    "Failed to contact MuRegist for post-CI bundle registration"
                 );
             }
         }
-        Err(err) => {
-            warn!(repo = %repo, sha = %sha, error = %err, "Failed to send commit status to GitHub");
+    }
+
+    let cd_base = match muconde_cd_api_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None => return false,
+    };
+    let token = match cd_api_token.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => t,
+        None => {
+            warn!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                "MUCONDE_CD_API_URL is configured but CD API bearer token is missing or unreadable; skipping rollout dispatch"
+            );
+            return false;
+        }
+    };
+
+    let deploy_url = format!("{}/api/cd/deploy", cd_base.trim_end_matches('/'));
+    let deploy_payload = serde_json::json!({
+        "repo": job.repo_name,
+        "artifact_sha256": job.commit_sha,
+        "manifest_yaml": manifest_yaml,
+        "wait": false,
+    });
+
+    match client
+        .post(&deploy_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&deploy_payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                service = %service_name,
+                commit = %job.commit_sha,
+                "Triggered post-CI MuConDe rollout deployment"
+            );
+            true
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                status = %status,
+                body = %body,
+                "MuConDe /api/cd/deploy returned non-success status"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                job_id = %job.id,
+                repo = %job.repo_name,
+                error = %e,
+                "Failed to dispatch post-CI rollout to MuConDe controller"
+            );
+            false
         }
     }
 }
@@ -1673,5 +1953,161 @@ on_action:
 
         assert_eq!(dispatch_off.sccache_mode, SccacheMode::Off);
         assert_eq!(dispatch_off.tasks[0].sccache_mode, SccacheMode::Off);
+    }
+
+    #[test]
+    fn test_is_main_push_or_merge_and_service_extraction() {
+        let mut job = Job {
+            id: "job-cd-1".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-console".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-console.git".to_string(),
+            commit_sha: "abcdef1234567890".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+        assert!(is_main_push_or_merge(&job));
+
+        job.ref_name = "refs/heads/feat/test".to_string();
+        assert!(!is_main_push_or_merge(&job));
+
+        job.ref_name = "main".to_string();
+        job.event_type = "pull_request".to_string();
+        assert!(!is_main_push_or_merge(&job));
+
+        job.event_type = "merge".to_string();
+        assert!(is_main_push_or_merge(&job));
+
+        assert_eq!(
+            extract_cd_service_name(
+                "version: \"1\"\nservice: \"muconsole\"\n",
+                "LMA1980/mu-console"
+            ),
+            "muconsole"
+        );
+        assert_eq!(
+            extract_cd_service_name("version: \"1\"\n", "LMA1980/mu-console"),
+            "mu-console"
+        );
+    }
+
+    #[test]
+    fn test_load_cd_api_token_from_values_fails_closed_on_missing_file() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("cd_token");
+        std::fs::write(&token_path, "  secret-cd-token-123 \n").unwrap();
+
+        assert_eq!(
+            load_cd_api_token_from_values(token_path.to_str(), None).as_deref(),
+            Some("secret-cd-token-123")
+        );
+        assert_eq!(
+            load_cd_api_token_from_values(Some("/nonexistent/cd_api_token_path"), Some("fallback")),
+            None
+        );
+        assert_eq!(
+            load_cd_api_token_from_values(None, Some("/nonexistent/cd_api_token_path")),
+            None
+        );
+        assert_eq!(
+            load_cd_api_token_from_values(None, Some(" literal-token ")).as_deref(),
+            Some("literal-token")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trigger_post_ci_cd_pipeline_registers_bundle_and_dispatches_deploy() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use std::sync::Mutex;
+
+        let dir = tempdir().unwrap();
+        let muconde_dir = dir.path().join(".muconde");
+        std::fs::create_dir_all(&muconde_dir).unwrap();
+        let manifest_content =
+            "version: \"1\"\nservice: \"muconsole\"\ntarget_nodes:\n  - \"node-a\"\n  - \"node-b\"\n";
+        std::fs::write(muconde_dir.join("MuConDe.yml"), manifest_content).unwrap();
+
+        let captured: Arc<Mutex<Vec<(String, String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/bundles/it",
+                post({
+                    let cap = captured.clone();
+                    move |Json(body): Json<serde_json::Value>| {
+                        let cap = cap.clone();
+                        async move {
+                            cap.lock().unwrap().push((
+                                "/api/v1/bundles/it".to_string(),
+                                String::new(),
+                                body,
+                            ));
+                            axum::http::StatusCode::CREATED
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/cd/deploy",
+                post({
+                    let cap = captured.clone();
+                    move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let cap = cap.clone();
+                        async move {
+                            let auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            cap.lock()
+                                .unwrap()
+                                .push(("/api/cd/deploy".to_string(), auth, body));
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let job = Job {
+            id: "job-cd-e2e".to_string(),
+            event_type: "push".to_string(),
+            repo_name: "LMA1980/mu-console".to_string(),
+            clone_url: "https://github.com/LMA1980/mu-console.git".to_string(),
+            commit_sha: "deadbeefcafe1234".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            sender: "LMA1980".to_string(),
+            queued_at: Utc::now(),
+        };
+
+        let triggered = trigger_post_ci_cd_pipeline_with_endpoints(
+            &job,
+            dir.path(),
+            Some(&base_url),
+            Some(&base_url),
+            Some("test-cd-token"),
+        )
+        .await;
+        assert!(triggered);
+
+        let calls = captured.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "/api/v1/bundles/it");
+        assert_eq!(calls[0].2["service_name"], "muconsole");
+        assert_eq!(calls[0].2["git_commit"], "deadbeefcafe1234");
+        assert_eq!(calls[1].0, "/api/cd/deploy");
+        assert_eq!(calls[1].1, "Bearer test-cd-token");
+        assert_eq!(calls[1].2["repo"], "LMA1980/mu-console");
+        assert_eq!(calls[1].2["artifact_sha256"], "deadbeefcafe1234");
     }
 }
