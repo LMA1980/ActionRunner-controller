@@ -35,7 +35,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn broadcast_log(&self, job_id: &str, chunk: &str) {
-        self.job_store.append_job_log(job_id, chunk);
+        self.job_store.append_log_lines(job_id, chunk);
+        self.job_store.flush_job_log(Some(job_id));
         let _ = self.log_broadcaster.send(LogBroadcast {
             job_id: job_id.to_string(),
             chunk: chunk.to_string(),
@@ -43,7 +44,7 @@ impl AppState {
     }
 
     pub fn broadcast_log_buffered(&self, job_id: &str, chunk: &str) {
-        self.job_store.append_job_log_buffered(job_id, chunk);
+        self.job_store.append_log_lines(job_id, chunk);
         let _ = self.log_broadcaster.send(LogBroadcast {
             job_id: job_id.to_string(),
             chunk: chunk.to_string(),
@@ -132,10 +133,19 @@ impl AppState {
                         let storage = Arc::clone(self.job_store.storage());
                         let node_id = self.config.node_id.clone();
                         let ttl_secs = self.config.lease_ttl_seconds;
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let reacquired = tokio::task::spawn_blocking(move || {
                             storage.try_acquire_or_renew_lease(&node_id, ttl_secs, true)
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
+                        if !reacquired {
+                            warn!(
+                                node_id = %self.config.node_id,
+                                "Designated Leader failed to renew or re-acquire HA lease; stepping down to Standby"
+                            );
+                            self.job_store.set_ha_role(crate::config::HaRole::Standby);
+                            let _ = self.cluster.disconnect_all().await;
+                        }
                     }
                 } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
                     let should_step_down = match &active_lease {
@@ -153,6 +163,13 @@ impl AppState {
                     }
                 }
             }
+            if self.job_store.is_leader() {
+                let storage = Arc::clone(self.job_store.storage());
+                let _ = tokio::task::spawn_blocking(move || {
+                    storage.flush_dirty_logs();
+                })
+                .await;
+            }
             // Note: The active Leader owns the authoritative in-memory JobStore and ConsoleState
             // and writes through to ControllerStorage on every state transition, so it does not
             // need to pull full job history from remote storage on every coordinator tick.
@@ -160,7 +177,17 @@ impl AppState {
             let _ = self.job_store.rehydrate_from_storage(false).await;
             self.console.sync_from_storage(&self.job_store, false).await;
             if self.config.ha_role == crate::config::HaRoleConfig::Leader {
-                let _ = self.promote_to_leader().await;
+                let storage = Arc::clone(self.job_store.storage());
+                let node_id = self.config.node_id.clone();
+                let ttl_secs = self.config.lease_ttl_seconds;
+                let can_promote = tokio::task::spawn_blocking(move || {
+                    storage.try_acquire_or_renew_lease(&node_id, ttl_secs, true)
+                })
+                .await
+                .unwrap_or(false);
+                if can_promote {
+                    let _ = self.promote_to_leader().await;
+                }
             } else if self.config.ha_role == crate::config::HaRoleConfig::Auto {
                 let has_online_workers = self
                     .cluster

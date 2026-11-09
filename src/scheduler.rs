@@ -758,6 +758,7 @@ impl DAGScheduler {
                     Some(&target_url),
                 )
                 .await;
+                self.job_store.flush_job_log(Some(&job.id));
                 break;
             }
 

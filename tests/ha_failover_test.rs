@@ -502,13 +502,44 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
     let addr = listener.local_addr().expect("local_addr");
     let sub_store: Arc<Mutex<SubSnapshotMap>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let otel_logs_store: Arc<Mutex<Vec<mu_observable_ipc::OtelLogEntry>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     let store_clone = Arc::clone(&sub_store);
+    let otel_clone = Arc::clone(&otel_logs_store);
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let store_conn = Arc::clone(&store_clone);
+            let otel_conn = Arc::clone(&otel_clone);
             tokio::spawn(async move {
                 while let Ok((hdr, payload)) = read_frame(&mut stream).await {
+                    if hdr.msg_type == mu_observable_ipc::MSG_TYPE_ARROW_OTEL_LOGS {
+                        let Ok(batch) = mu_observable_ipc::decode_log_batch(&payload) else {
+                            break;
+                        };
+                        let rows = batch.len() as u32;
+                        otel_conn.lock().unwrap().extend(batch);
+                        let ack = ControlRpcEnvelope::WalAck(mu_observable_ipc::WalBatchAck {
+                            sequence: hdr.sequence,
+                            ok: true,
+                            accepted_rows: rows,
+                            error_message: None,
+                        });
+                        let out_bytes = encode_control_envelope(&ack).unwrap();
+                        let out_hdr = IpcHeader::new(
+                            mu_observable_ipc::MSG_TYPE_WAL_ACK,
+                            out_bytes.len() as u32,
+                            0,
+                            hdr.sequence,
+                        );
+                        if write_frame(&mut stream, &out_hdr, &out_bytes)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     let Ok(req) = decode_control_envelope(&payload) else {
                         break;
                     };
@@ -533,25 +564,58 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
                             })
                         }
                         ControlRpcEnvelope::QuerySubmoduleSnapshotsReq(q) => {
-                            let g = store_conn.lock().unwrap();
-                            let snapshots: Vec<CentralSubmoduleSnapshot> = g
-                                .values()
-                                .filter(|s| {
-                                    q.parent_repo_key
-                                        .as_ref()
-                                        .map(|p| &s.parent_repo_key == p)
-                                        .unwrap_or(true)
-                                        && q.branch_key
-                                            .as_ref()
-                                            .map(|b| &s.branch_key == b)
-                                            .unwrap_or(true)
-                                        && q.submodule_key
-                                            .as_ref()
-                                            .map(|k| &s.submodule_key == k)
-                                            .unwrap_or(true)
-                                })
-                                .cloned()
-                                .collect();
+                            let snapshots: Vec<CentralSubmoduleSnapshot> =
+                                if q.parent_repo_key.as_deref() == Some("__ar_job_logs__") {
+                                    let target_job = q.submodule_key.clone().unwrap_or_default();
+                                    let logs = otel_conn.lock().unwrap();
+                                    let mut combined = String::new();
+                                    for entry in logs.iter().filter(|e| {
+                                        e.job_id
+                                            .as_deref()
+                                            .map(|j| j.eq_ignore_ascii_case(&target_job))
+                                            .unwrap_or(false)
+                                    }) {
+                                        combined.push_str(&entry.body);
+                                        if !combined.ends_with('\n') {
+                                            combined.push('\n');
+                                        }
+                                    }
+                                    if combined.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![CentralSubmoduleSnapshot {
+                                            parent_repo_key: "__ar_job_logs__".to_string(),
+                                            branch_key: "log".to_string(),
+                                            submodule_key: target_job.clone(),
+                                            submodule_path_key: "log".to_string(),
+                                            latest_active_job_id: Some(target_job),
+                                            latest_active_json: Some(combined),
+                                            latest_active_queued_us: Some(0),
+                                            latest_completed_job_id: None,
+                                            latest_completed_json: None,
+                                            latest_completed_queued_us: None,
+                                        }]
+                                    }
+                                } else {
+                                    let g = store_conn.lock().unwrap();
+                                    g.values()
+                                        .filter(|s| {
+                                            q.parent_repo_key
+                                                .as_ref()
+                                                .map(|p| &s.parent_repo_key == p)
+                                                .unwrap_or(true)
+                                                && q.branch_key
+                                                    .as_ref()
+                                                    .map(|b| &s.branch_key == b)
+                                                    .unwrap_or(true)
+                                                && q.submodule_key
+                                                    .as_ref()
+                                                    .map(|k| &s.submodule_key == k)
+                                                    .unwrap_or(true)
+                                        })
+                                        .cloned()
+                                        .collect()
+                                };
                             ControlRpcEnvelope::QuerySubmoduleSnapshotsResp(
                                 QuerySubmoduleSnapshotsResponse {
                                     request_id: q.request_id,
@@ -592,12 +656,31 @@ async fn test_muobserve_remote_storage_ha_lease_and_log_roundtrip() {
     assert_eq!(lease.holder_id, "node-b");
     assert_eq!(lease.epoch, 2);
 
-    // 2. Shared job log append & retrieval across instances
+    // 2. Delta OTel log line streaming, local tail cache, & cross-instance fallback (#143)
     remote_a.append_job_log("job-rpc-1", "Stage 1 output\n");
     remote_a.append_job_log("job-rpc-1", "Stage 2 output\n");
     assert_eq!(
-        remote_b.get_job_log("job-rpc-1").as_deref(),
+        remote_a.get_job_log("job-rpc-1").as_deref(),
         Some("Stage 1 output\nStage 2 output\n")
+    );
+    assert_eq!(
+        remote_b.get_job_log("job-rpc-1").as_deref(),
+        Some("Stage 1 output\nStage 2 output\n"),
+        "standby/failover controller instance must reconstruct job log from MuObserve OTel logs on cache miss"
+    );
+    {
+        let streamed_otel = otel_logs_store.lock().unwrap();
+        assert_eq!(streamed_otel.len(), 2);
+        assert_eq!(streamed_otel[0].body, "Stage 1 output");
+        assert_eq!(streamed_otel[1].body, "Stage 2 output");
+    }
+    assert!(
+        !sub_store
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(parent, _, _)| parent == "__ar_job_logs__"),
+        "full-file __ar_job_logs__ snapshots must never be written"
     );
 
     // 3. Normal submodule snapshot queries filter out internal __ar_* records
