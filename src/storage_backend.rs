@@ -2053,21 +2053,35 @@ impl ControllerStorage for MuObserveRemoteStorage {
 
     fn get_job_log(&self, job_id: &str) -> Option<String> {
         let key = job_id.to_ascii_lowercase();
-        if let Some(cached) = self
+        let is_local_writer = self
+            .last_log_flush
+            .lock()
+            .ok()
+            .is_some_and(|g| g.contains_key(&key));
+        let cached = self
             .log_buffer
             .read()
             .ok()
             .and_then(|g| g.get(&key).cloned())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(cached);
+            .filter(|s| !s.is_empty());
+        if is_local_writer {
+            if let Some(local) = cached {
+                return Some(local);
+            }
         }
-        let remote_log = self
+        if let Some(remote_log) = self
             .query_internal_snapshot(INTERNAL_LOG_REPO_KEY, "log", &key)
             .and_then(|s| s.latest_active_json)
-            .filter(|s| !s.is_empty())?;
-        self.append_to_local_log_buffer(&key, &remote_log);
-        Some(remote_log)
+            .filter(|s| !s.is_empty())
+        {
+            if cached.as_ref().is_none_or(|c| remote_log.len() >= c.len()) {
+                if let Ok(mut guard) = self.log_buffer.write() {
+                    guard.insert(key, remote_log.clone());
+                }
+                return Some(remote_log);
+            }
+        }
+        cached
     }
 
     fn try_acquire_or_renew_lease(&self, holder_id: &str, ttl_secs: u64, force: bool) -> bool {

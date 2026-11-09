@@ -1443,6 +1443,174 @@ pub fn default_cache_file(workspace: &Path) -> PathBuf {
     workspace.join("logs").join("console_registry.json")
 }
 
+/// Mask private LAN and documentation IPv4 addresses (`10.x.y.z`, `172.16-31.x.y`,
+/// `192.168.x.y`, `192.0.2.x`) by replacing octet 3 with `###`.
+fn mask_private_ipv4_octets(s: &mut String) {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut replacements = Vec::new();
+
+    while i < len {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'/') {
+            while i < len && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            continue;
+        }
+
+        let start = i;
+        let mut octets = [0u32; 4];
+        let mut oct_lens = [0usize; 4];
+        let mut valid = true;
+
+        for (oct_idx, oct_slot) in octets.iter_mut().enumerate() {
+            let mut val = 0u32;
+            let mut count = 0;
+            while i < len && bytes[i].is_ascii_digit() && count < 3 {
+                val = val * 10 + u32::from(bytes[i] - b'0');
+                count += 1;
+                i += 1;
+            }
+            if count == 0 || val > 255 {
+                valid = false;
+                break;
+            }
+            *oct_slot = val;
+            oct_lens[oct_idx] = count;
+
+            if oct_idx < 3 {
+                if i < len && bytes[i] == b'.' {
+                    i += 1;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if valid && (i == len || !bytes[i].is_ascii_alphanumeric()) {
+            let o1 = octets[0];
+            let o2 = octets[1];
+            let is_match = (o1 == 10)
+                || (o1 == 172 && (16..=31).contains(&o2))
+                || (o1 == 192 && o2 == 168)
+                || (o1 == 192 && o2 == 0);
+
+            if is_match {
+                let o3_start = start + oct_lens[0] + 1 + oct_lens[1] + 1;
+                let o3_end = o3_start + oct_lens[2];
+                replacements.push((o3_start, o3_end));
+            }
+        }
+    }
+
+    for (start, end) in replacements.into_iter().rev() {
+        s.replace_range(start..end, "###");
+    }
+}
+
+/// Sanitize a job log string (`log_init` or `log_chunk`) for unauthenticated public console
+/// viewers (`#131`):
+/// - Applies optional hostname aliasing from `MU_REDACT_HOSTNAMES` (`from=to,from2=to2`);
+/// - Strips internal domain suffixes (`.internal.local`, `.local`, `.internal`, `.lan`);
+/// - Masks octet 3 of RFC 1918 and RFC 5737 IPv4 addresses (`192.0.###.42`);
+/// - Scrubs `Bearer <token>`, `ghp_...`, `github_pat_...`, and `glpat-...` secrets;
+/// - Truncates deep absolute filesystem paths (`/a/b/c/seg1/seg2` -> `.../seg1/seg2`).
+#[must_use]
+pub fn sanitize_log_text(raw: &str) -> String {
+    let mut s = String::from(raw);
+
+    if let Ok(mappings) = std::env::var("MU_REDACT_HOSTNAMES") {
+        for mapping in mappings.split(',') {
+            if let Some((from, to)) = mapping.split_once('=') {
+                let f = from.trim();
+                let t = to.trim();
+                if !f.is_empty() {
+                    s = s.replace(f, t);
+                }
+            } else if let Some((from, to)) = mapping.split_once(':') {
+                let f = from.trim();
+                let t = to.trim();
+                if !f.is_empty() {
+                    s = s.replace(f, t);
+                }
+            }
+        }
+    }
+
+    s = s
+        .replace(".internal.local", "")
+        .replace(".local", "")
+        .replace(".internal", "")
+        .replace(".lan", "");
+
+    mask_private_ipv4_octets(&mut s);
+
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let mut prev_bearer = false;
+        for token in body.split_inclusive(' ') {
+            let trimmed = token.trim_end_matches(' ');
+            let trail = &token[trimmed.len()..];
+            if prev_bearer && !trimmed.is_empty() {
+                out.push_str("[REDACTED]");
+                out.push_str(trail);
+                prev_bearer = false;
+                continue;
+            }
+            if trimmed.eq_ignore_ascii_case("Bearer") {
+                prev_bearer = true;
+                out.push_str(token);
+                continue;
+            }
+            if trimmed.starts_with("ghp_")
+                || trimmed.starts_with("github_pat_")
+                || trimmed.starts_with("glpat-")
+            {
+                out.push_str("[REDACTED]");
+                out.push_str(trail);
+                continue;
+            }
+            let (lead_punct, core_tok) = match trimmed.chars().next() {
+                Some(c @ ('(' | '[' | '"' | '\'')) => {
+                    (&trimmed[..c.len_utf8()], &trimmed[c.len_utf8()..])
+                }
+                _ => ("", trimmed),
+            };
+            let (core_path, tail_punct) = match core_tok.chars().last() {
+                Some(c @ (')' | ']' | '"' | '\'' | ',' | ';')) => {
+                    let idx = core_tok.len() - c.len_utf8();
+                    (&core_tok[..idx], &core_tok[idx..])
+                }
+                _ => (core_tok, ""),
+            };
+            if core_path.starts_with('/') && core_path.matches('/').count() >= 3 {
+                let parts: Vec<&str> = core_path.split('/').filter(|p| !p.is_empty()).collect();
+                if parts.len() >= 3 {
+                    out.push_str(&format!(
+                        "{lead_punct}.../{}/{}{tail_punct}{trail}",
+                        parts[parts.len() - 2],
+                        parts[parts.len() - 1]
+                    ));
+                    continue;
+                }
+            }
+            out.push_str(token);
+        }
+        out.push_str(nl);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

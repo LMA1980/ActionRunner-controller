@@ -1782,3 +1782,94 @@ async fn redeem_invite_valid_token_binds_user_and_grants_operator_role() {
         .unwrap_or("")
         .contains("already been used"));
 }
+
+#[tokio::test]
+async fn anonymous_job_sse_streams_sanitized_log_init_and_shared_storage_deltas() {
+    let state = seeded_state().await;
+    let job_id = "job-live-sse-131";
+    let job = Job {
+        id: job_id.to_string(),
+        event_type: "push".to_string(),
+        repo_name: "LMA1980/parent".to_string(),
+        clone_url: "https://github.com/LMA1980/parent.git".to_string(),
+        commit_sha: SHA_CORE.to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        sender: "LMA1980".to_string(),
+        queued_at: Utc::now(),
+    };
+    state
+        .job_store
+        .enqueue_job(job, PathBuf::from(format!("logs/{job_id}.log")))
+        .await;
+    state
+        .job_store
+        .update_status(
+            job_id,
+            JobStatus::Running {
+                started_at: Utc::now(),
+            },
+        )
+        .await;
+    state.job_store.append_job_log(
+        job_id,
+        "[fmt] connected to worker-a.internal.local (192.0.2.42) with token ghp_secret12345\n",
+    );
+
+    let app = create_router(state.clone());
+    // Anonymous caller (even though API_KEY is configured on `state`) must receive 200 OK SSE.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/jobs/{job_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+
+    let init_acc = read_until(&mut stream, "log_init").await;
+    assert!(
+        init_acc.contains("event: job\n"),
+        "expected initial job frame before log_init: {init_acc}"
+    );
+    let init_text = frame_data(&init_acc, "log_init")
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        init_text.contains("worker-a"),
+        "expected hostname prefix preserved: {init_text}"
+    );
+    assert!(
+        !init_text.contains(".internal.local"),
+        "internal domain suffix must be stripped: {init_text}"
+    );
+    assert!(
+        init_text.contains("192.0.###.42"),
+        "private IPv4 third octet must be masked: {init_text}"
+    );
+    assert!(
+        !init_text.contains("ghp_secret12345") && init_text.contains("[REDACTED]"),
+        "GitHub token must be redacted for anonymous viewers: {init_text}"
+    );
+
+    // Append a delta solely via shared storage (`job_store.append_job_log`) without local file
+    // or `log_broadcaster` emission, simulating cross-controller HA log tailing.
+    state.job_store.append_job_log(
+        job_id,
+        "[clippy] finished on 10.20.30.40 Bearer secret-jwt-token\n",
+    );
+
+    let chunk_acc = read_until(&mut stream, "log_chunk").await;
+    let chunk_text = frame_data(&chunk_acc, "log_chunk")
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        chunk_text.contains("[clippy] finished on 10.20.###.40 Bearer [REDACTED]"),
+        "expected sanitized delta chunk from shared storage poll, got: {chunk_text}"
+    );
+}

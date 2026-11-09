@@ -1057,7 +1057,7 @@ pub fn job_target_url(job_id: &str) -> String {
     format!("https://hook.lma1980.duckdns.org/web/#/jobs/{job_id}")
 }
 
-/// Immediately reports a `"pending"` (`context: "k3-ci"`) commit status to GitHub when a job
+/// Immediately reports a `"pending"` (`context: "continuous integration"`) commit status to GitHub when a job
 /// enters `JobStatus::Queued`, provided the job has not already transitioned out of `Queued`.
 pub async fn report_queued_github_status(
     config: &Config,
@@ -1081,7 +1081,7 @@ pub async fn report_queued_github_status(
     report_github_commit_status(config, repo, sha, "pending", &desc, Some(&target_url)).await;
 }
 
-/// Reports a `k3-ci` commit status to GitHub (`/repos/{repo}/statuses/{sha}`).
+/// Reports a `continuous integration` commit status to GitHub (`/repos/{repo}/statuses/{sha}`).
 pub async fn report_github_commit_status(
     config: &Config,
     repo: &str,
@@ -1104,7 +1104,7 @@ pub async fn report_github_commit_status(
     .await;
 }
 
-/// Reports a `k3-ci` commit status against a configurable GitHub API base URL.
+/// Reports a `continuous integration` commit status against a configurable GitHub API base URL.
 pub async fn report_github_commit_status_with_base_url(
     api_base_url: &str,
     config: &Config,
@@ -1150,7 +1150,7 @@ pub async fn report_github_commit_status_with_base_url(
         "state": state,
         "target_url": target_url,
         "description": desc,
-        "context": "k3-ci",
+        "context": "continuous integration",
     });
 
     match client
