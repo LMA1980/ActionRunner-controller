@@ -6,6 +6,7 @@ pub mod config;
 pub mod console;
 pub mod db;
 pub mod job;
+pub mod quic;
 pub mod scheduler;
 pub mod storage_backend;
 pub mod tls;

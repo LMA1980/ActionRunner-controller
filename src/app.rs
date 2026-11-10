@@ -18,7 +18,7 @@ use crate::job::JobStatus;
 use crate::webhook::{handle_webhook, AppState};
 
 pub fn create_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_check))
         .route("/api/health", get(health_check))
         .route("/webhook", post(handle_webhook))
@@ -168,7 +168,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_branch_submodule_card),
         )
         .route("/", get(health_check))
-        .with_state(state)
+        .with_state(state.clone());
+
+    let alt_svc_port = state.config.quic_alt_svc_port.or_else(|| {
+        state
+            .config
+            .quic_bind_addr
+            .as_ref()
+            .and_then(|a| a.parse::<std::net::SocketAddr>().ok().map(|s| s.port()))
+    });
+
+    if let Some(port) = alt_svc_port {
+        let max_age = state.config.quic_alt_svc_max_age.unwrap_or(86400);
+        crate::quic::attach_alt_svc_header(
+            router,
+            crate::quic::AltSvcConfig::new(port).with_max_age(max_age),
+        )
+    } else {
+        router
+    }
 }
 
 fn json_response(status: StatusCode, val: serde_json::Value) -> Response {
