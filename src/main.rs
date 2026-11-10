@@ -67,7 +67,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     mu_ci_controller::webhook::spawn_ha_coordinator(state.clone());
 
-    let app = create_router(state);
+    let app = create_router(state.clone());
+
+    if let (Some(quic_bind), Some(cert_path), Some(key_path), Some(ca_path)) = (
+        &state.config.quic_bind_addr,
+        &state.config.tls_cert_path,
+        &state.config.tls_key_path,
+        &state.config.tls_ca_path,
+    ) {
+        match mu_ci_controller::tls::build_server_config_from_files(cert_path, key_path, ca_path) {
+            Ok(server_tls_cfg) => {
+                match mu_ci_controller::quic::make_quic_server_config(server_tls_cfg) {
+                    Ok(quic_cfg) => match quic_bind.parse::<SocketAddr>() {
+                        Ok(quic_addr) => {
+                            match mu_ci_controller::quic::bind_quic_endpoint(quic_addr, quic_cfg) {
+                                Ok(endpoint) => {
+                                    info!(
+                                        "Bound dual-stack UDP QUIC endpoint (ALPN h3) on {}",
+                                        quic_addr
+                                    );
+                                    tokio::spawn(mu_ci_controller::quic::run_quic_server(
+                                        endpoint,
+                                        app.clone(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    warn!("Failed to bind QUIC endpoint: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Invalid ACTION_RUNNER_QUIC_BIND address '{quic_bind}': {e}");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to configure QUIC transport crypto: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load mTLS certificates for QUIC: {e}");
+            }
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;

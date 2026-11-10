@@ -83,6 +83,12 @@ pub struct Config {
     pub proxy_secret: Option<String>,
     pub invite_signing_key: Option<String>,
     pub bootstrap_admins: Vec<String>,
+    pub quic_bind_addr: Option<String>,
+    pub quic_alt_svc_port: Option<u16>,
+    pub quic_alt_svc_max_age: Option<u64>,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub tls_ca_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -112,6 +118,12 @@ impl Default for Config {
             proxy_secret: None,
             invite_signing_key: None,
             bootstrap_admins: Vec::new(),
+            quic_bind_addr: None,
+            quic_alt_svc_port: None,
+            quic_alt_svc_max_age: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
         }
     }
 }
@@ -211,6 +223,23 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let quic_bind_addr = std::env::var("ACTION_RUNNER_QUIC_BIND").ok();
+        let quic_alt_svc_port = std::env::var("ACTION_RUNNER_QUIC_ALT_SVC_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let quic_alt_svc_max_age = std::env::var("ACTION_RUNNER_QUIC_ALT_SVC_MAX_AGE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let tls_cert_path = std::env::var("ACTION_RUNNER_TLS_CERT")
+            .ok()
+            .map(PathBuf::from);
+        let tls_key_path = std::env::var("ACTION_RUNNER_TLS_KEY")
+            .ok()
+            .map(PathBuf::from);
+        let tls_ca_path = std::env::var("ACTION_RUNNER_TLS_CA")
+            .ok()
+            .map(PathBuf::from);
+
         Self {
             bind_addr,
             workspace_dir,
@@ -232,6 +261,12 @@ impl Config {
             proxy_secret,
             invite_signing_key,
             bootstrap_admins,
+            quic_bind_addr,
+            quic_alt_svc_port,
+            quic_alt_svc_max_age,
+            tls_cert_path,
+            tls_key_path,
+            tls_ca_path,
         }
     }
 
