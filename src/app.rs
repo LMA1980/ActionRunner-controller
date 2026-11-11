@@ -257,6 +257,7 @@ fn sanitize_public_node_id(raw: &str) -> String {
     const S_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
     const S_TB: &[u8] = b"\x74\x69\x2d\x62\x72\x61\x73";
     const S_TBU: &[u8] = b"\x74\x69\x5f\x62\x72\x61\x73";
+    const S_L: &[u8] = b"\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
     const S_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
 
     let lower = raw.to_ascii_lowercase();
@@ -272,8 +273,10 @@ fn sanitize_public_node_id(raw: &str) -> String {
         || lower.contains(std::str::from_utf8(S_TBU).unwrap())
     {
         "worker-aarch64".to_string()
-    } else if lower.contains(std::str::from_utf8(S_D).unwrap()) {
-        lower.replace(std::str::from_utf8(S_D).unwrap(), ".example.invalid")
+    } else if lower.contains(std::str::from_utf8(S_L).unwrap()) {
+        lower
+            .replace(std::str::from_utf8(S_D).unwrap(), ".example.invalid")
+            .replace(std::str::from_utf8(S_L).unwrap(), "example.invalid")
     } else {
         raw.to_string()
     }
