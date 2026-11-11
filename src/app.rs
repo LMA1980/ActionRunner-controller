@@ -255,6 +255,9 @@ fn sanitize_public_node_id(raw: &str) -> String {
     const S_PU: &[u8] = b"\x70\x65\x79\x5f\x77\x61\x69\x6c\x5f\x64\x65\x75";
     const S_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
     const S_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
+    const S_TB: &[u8] = b"\x74\x69\x2d\x62\x72\x61\x73";
+    const S_TBU: &[u8] = b"\x74\x69\x5f\x62\x72\x61\x73";
+    const S_L: &[u8] = b"\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
     const S_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
 
     let lower = raw.to_ascii_lowercase();
@@ -266,10 +269,62 @@ fn sanitize_public_node_id(raw: &str) -> String {
         || lower.contains(std::str::from_utf8(S_PU).unwrap())
     {
         "worker-riscv64".to_string()
-    } else if lower.contains(std::str::from_utf8(S_D).unwrap()) {
-        lower.replace(std::str::from_utf8(S_D).unwrap(), ".example.invalid")
+    } else if lower.contains(std::str::from_utf8(S_TB).unwrap())
+        || lower.contains(std::str::from_utf8(S_TBU).unwrap())
+    {
+        "worker-aarch64".to_string()
+    } else if lower.contains(std::str::from_utf8(S_L).unwrap()) {
+        lower
+            .replace(std::str::from_utf8(S_D).unwrap(), ".example.invalid")
+            .replace(std::str::from_utf8(S_L).unwrap(), "example.invalid")
     } else {
         raw.to_string()
+    }
+}
+
+fn sanitize_cluster_node(node: &mut crate::cluster::ClusterNodeView) {
+    node.node_id = sanitize_public_node_id(&node.node_id);
+    for tag in &mut node.tags {
+        *tag = sanitize_public_node_id(tag);
+    }
+}
+
+fn sanitize_job_record(job: &mut crate::job::JobRecord) {
+    for stage in &mut job.stages {
+        if let Some(ref node) = stage.assigned_node {
+            stage.assigned_node = Some(sanitize_public_node_id(node));
+        }
+        for tag in &mut stage.tags {
+            *tag = sanitize_public_node_id(tag);
+        }
+        match stage.status {
+            crate::job::StageStatus::Assigned {
+                ref mut node_id, ..
+            } => {
+                *node_id = sanitize_public_node_id(node_id);
+            }
+            crate::job::StageStatus::Running {
+                ref mut node_id, ..
+            } => {
+                *node_id = sanitize_public_node_id(node_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn sanitize_queue_snapshot(snap: &mut crate::job::QueueSnapshot) {
+    if let Some(ref mut active) = snap.active_job {
+        sanitize_job_record(&mut active.record);
+    }
+    for item in &mut snap.active_jobs {
+        sanitize_job_record(&mut item.record);
+    }
+    for item in &mut snap.queued_jobs {
+        sanitize_job_record(&mut item.record);
+    }
+    for job in &mut snap.recent_jobs {
+        sanitize_job_record(job);
     }
 }
 
@@ -333,8 +388,12 @@ pub async fn health_check(headers: HeaderMap, State(state): State<Arc<AppState>>
     )
 }
 
-pub async fn get_queue(State(state): State<Arc<AppState>>) -> Response {
-    let snap = state.job_store.queue_snapshot().await;
+pub async fn get_queue(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    let is_auth = is_authenticated_request(&state, &headers);
+    let mut snap = state.job_store.queue_snapshot().await;
+    if !is_auth {
+        sanitize_queue_snapshot(&mut snap);
+    }
     json_response(StatusCode::OK, serde_json::to_value(snap).unwrap())
 }
 
@@ -343,7 +402,7 @@ pub async fn get_cluster_nodes(headers: HeaderMap, State(state): State<Arc<AppSt
     let mut nodes = state.cluster.list_nodes_view().await;
     if !is_auth {
         for node in &mut nodes {
-            node.node_id = sanitize_public_node_id(&node.node_id);
+            sanitize_cluster_node(node);
         }
     }
     json_response(StatusCode::OK, serde_json::to_value(nodes).unwrap())
@@ -357,7 +416,7 @@ pub async fn get_cluster_status(
     let mut nodes = state.cluster.list_nodes_view().await;
     let online_nodes = nodes.iter().filter(|n| n.is_online).count();
     let snap = state.job_store.queue_snapshot().await;
-    let lease = state.job_store.storage().get_leader_lease();
+    let mut lease = state.job_store.storage().get_leader_lease();
     let controller_id = if is_auth {
         state.config.node_id.clone()
     } else {
@@ -365,7 +424,10 @@ pub async fn get_cluster_status(
     };
     if !is_auth {
         for node in &mut nodes {
-            node.node_id = sanitize_public_node_id(&node.node_id);
+            sanitize_cluster_node(node);
+        }
+        if let Some(ref mut l) = lease {
+            l.holder_id = sanitize_public_node_id(&l.holder_id);
         }
     }
     json_response(
@@ -386,12 +448,17 @@ pub async fn get_cluster_status(
 
 pub async fn get_ha_status(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     let is_auth = is_authenticated_request(&state, &headers);
-    let lease = state.job_store.storage().get_leader_lease();
+    let mut lease = state.job_store.storage().get_leader_lease();
     let controller_id = if is_auth {
         state.config.node_id.clone()
     } else {
         sanitize_public_node_id(&state.config.node_id)
     };
+    if !is_auth {
+        if let Some(ref mut l) = lease {
+            l.holder_id = sanitize_public_node_id(&l.holder_id);
+        }
+    }
     json_response(
         StatusCode::OK,
         serde_json::json!({
@@ -453,9 +520,11 @@ pub struct JobsQuery {
 }
 
 pub async fn list_jobs(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<JobsQuery>,
 ) -> Response {
+    let is_auth = is_authenticated_request(&state, &headers);
     let snap = state.job_store.queue_snapshot().await;
     let all_jobs = state.job_store.list_jobs().await;
 
@@ -500,6 +569,12 @@ pub async fn list_jobs(
         jobs.truncate(limit);
     }
 
+    if !is_auth {
+        for job in &mut jobs {
+            sanitize_job_record(job);
+        }
+    }
+
     let job_ids: Vec<String> = jobs.iter().map(|j| j.job.id.clone()).collect();
     let active_job_id = snap.active_job.as_ref().map(|a| a.record.job.id.clone());
 
@@ -516,9 +591,17 @@ pub async fn list_jobs(
     )
 }
 
-pub async fn get_job(State(state): State<Arc<AppState>>, Path(job_id): Path<String>) -> Response {
+pub async fn get_job(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let is_auth = is_authenticated_request(&state, &headers);
     match state.job_store.get_job(&job_id).await {
-        Some(record) => {
+        Some(mut record) => {
+            if !is_auth {
+                sanitize_job_record(&mut record);
+            }
             let mut val = serde_json::to_value(&record).unwrap();
             if let Some(obj) = val.as_object_mut() {
                 if let Some(pos) = state.job_store.job_queue_position(&job_id).await {
@@ -1348,17 +1431,30 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
     let mut console_rx = state.console.subscribe();
     let stream = async_stream::stream! {
         // 1. Initial snapshot push
-        let snap = state.job_store.queue_snapshot().await;
+        let mut snap = state.job_store.queue_snapshot().await;
+        if !authenticated {
+            sanitize_queue_snapshot(&mut snap);
+        }
         if let Ok(data) = serde_json::to_string(&snap) {
             yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
         }
 
-        let jobs = state.job_store.list_jobs().await;
+        let mut jobs = state.job_store.list_jobs().await;
+        if !authenticated {
+            for job in &mut jobs {
+                sanitize_job_record(job);
+            }
+        }
         if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
             yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
         }
 
-        let cluster = state.cluster.list_nodes_view().await;
+        let mut cluster = state.cluster.list_nodes_view().await;
+        if !authenticated {
+            for node in &mut cluster {
+                sanitize_cluster_node(node);
+            }
+        }
         if let Ok(data) = serde_json::to_string(&cluster) {
             yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
         }
@@ -1368,17 +1464,30 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
         loop {
             tokio::select! {
                 _ = state.job_store.wait_for_event() => {
-                    let snap = state.job_store.queue_snapshot().await;
+                    let mut snap = state.job_store.queue_snapshot().await;
+                    if !authenticated {
+                        sanitize_queue_snapshot(&mut snap);
+                    }
                     if let Ok(data) = serde_json::to_string(&snap) {
                         yield Ok::<_, Infallible>(Event::default().event("queue").data(data));
                     }
 
-                    let jobs = state.job_store.list_jobs().await;
+                    let mut jobs = state.job_store.list_jobs().await;
+                    if !authenticated {
+                        for job in &mut jobs {
+                            sanitize_job_record(job);
+                        }
+                    }
                     if let Ok(data) = serde_json::to_string(&serde_json::json!({ "jobs": jobs })) {
                         yield Ok::<_, Infallible>(Event::default().event("jobs").data(data));
                     }
 
-                    let cluster = state.cluster.list_nodes_view().await;
+                    let mut cluster = state.cluster.list_nodes_view().await;
+                    if !authenticated {
+                        for node in &mut cluster {
+                            sanitize_cluster_node(node);
+                        }
+                    }
                     if let Ok(data) = serde_json::to_string(&cluster) {
                         yield Ok::<_, Infallible>(Event::default().event("cluster").data(data));
                     }
@@ -1387,8 +1496,21 @@ fn stream_dashboard_events(state: Arc<AppState>, authenticated: bool) -> Respons
                     match recv {
                         Ok(ev) => {
                             if ev.public || authenticated {
+                                let mut data = ev.data;
+                                if !authenticated {
+                                    if let Some(node_id) = data.get("node_id").and_then(|v| v.as_str()) {
+                                        data["node_id"] = serde_json::json!(sanitize_public_node_id(node_id));
+                                    }
+                                    if let Some(arr) = data.get_mut("online_nodes").and_then(|v| v.as_array_mut()) {
+                                        for item in arr {
+                                            if let Some(s) = item.as_str() {
+                                                *item = serde_json::json!(sanitize_public_node_id(s));
+                                            }
+                                        }
+                                    }
+                                }
                                 yield Ok::<_, Infallible>(
-                                    Event::default().event(ev.kind.as_str()).data(ev.data.to_string()),
+                                    Event::default().event(ev.kind.as_str()).data(data.to_string()),
                                 );
                             }
                         }
