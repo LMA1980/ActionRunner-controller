@@ -250,36 +250,50 @@ fn is_authenticated_request(state: &AppState, headers: &HeaderMap) -> bool {
     )
 }
 
-fn sanitize_public_node_id(raw: &str) -> String {
-    const S_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
-    const S_PU: &[u8] = b"\x70\x65\x79\x5f\x77\x61\x69\x6c\x5f\x64\x65\x75";
-    const S_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
-    const S_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
-    const S_TB: &[u8] = b"\x74\x69\x2d\x62\x72\x61\x73";
-    const S_TBU: &[u8] = b"\x74\x69\x5f\x62\x72\x61\x73";
-    const S_L: &[u8] = b"\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-    const S_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains(std::str::from_utf8(S_E).unwrap()) {
-        "node-a".to_string()
-    } else if lower.contains(std::str::from_utf8(S_R).unwrap()) {
-        "node-b".to_string()
-    } else if lower.contains(std::str::from_utf8(S_P).unwrap())
-        || lower.contains(std::str::from_utf8(S_PU).unwrap())
-    {
-        "worker-riscv64".to_string()
-    } else if lower.contains(std::str::from_utf8(S_TB).unwrap())
-        || lower.contains(std::str::from_utf8(S_TBU).unwrap())
-    {
-        "worker-aarch64".to_string()
-    } else if lower.contains(std::str::from_utf8(S_L).unwrap()) {
-        lower
-            .replace(std::str::from_utf8(S_D).unwrap(), ".example.invalid")
-            .replace(std::str::from_utf8(S_L).unwrap(), "example.invalid")
-    } else {
-        raw.to_string()
+fn parse_node_alias_map() -> Vec<(String, String)> {
+    let mut map = Vec::new();
+    let val = std::env::var("MUCI_NODE_MAP")
+        .or_else(|_| std::env::var("MUCONDE_NODE_MAP"))
+        .or_else(|_| std::env::var("MU_REDACT_HOSTNAMES"));
+    if let Ok(entries) = val {
+        for entry in entries.split(',') {
+            if let Some((k, v)) = entry.split_once('=').or_else(|| entry.split_once(':')) {
+                let k_trim = k.trim().to_ascii_lowercase();
+                let v_trim = v.trim().to_string();
+                if !k_trim.is_empty() && !v_trim.is_empty() {
+                    map.push((k_trim, v_trim));
+                }
+            }
+        }
     }
+    map
+}
+
+fn sanitize_public_node_id(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    for (k, v) in parse_node_alias_map() {
+        if lower.contains(&k) {
+            return v;
+        }
+    }
+    if lower.starts_with("node-") || lower.starts_with("worker-") {
+        return raw.to_string();
+    }
+    for suffix in &[
+        ".corp.internal",
+        ".cluster.internal",
+        ".local",
+        ".internal",
+        ".lan",
+    ] {
+        if lower.contains(suffix) {
+            return lower.replace(suffix, ".example.invalid");
+        }
+    }
+    if lower == "corp.internal" || lower == "local" || lower == "internal" || lower == "lan" {
+        return "example.invalid".to_string();
+    }
+    raw.to_string()
 }
 
 fn sanitize_cluster_node(node: &mut crate::cluster::ClusterNodeView) {
@@ -1584,7 +1598,11 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String, is_operator: bo
 
     let mut log_rx = state.log_broadcaster.subscribe();
     let jid = job_id.clone();
-    let initial_job_raw_json = serde_json::to_string(&initial_job).unwrap_or_default();
+    let mut init_job_for_sse = initial_job.clone();
+    if !is_operator {
+        sanitize_job_record(&mut init_job_for_sse);
+    }
+    let initial_job_raw_json = serde_json::to_string(&init_job_for_sse).unwrap_or_default();
     let initial_job_json = format_log_for_viewer(&initial_job_raw_json, is_operator);
     let mut is_terminal = matches!(
         initial_job.status,
@@ -1646,13 +1664,16 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String, is_operator: bo
                             yield Ok::<_, Infallible>(Event::default().event("log_chunk").data(json_chunk));
                         }
                     }
-                    if let Some(curr_job) = state.job_store.get_job(&jid).await {
+                    if let Some(mut curr_job) = state.job_store.get_job(&jid).await {
                         is_terminal = matches!(
                             curr_job.status,
                             JobStatus::Completed { .. }
                                 | JobStatus::Failed { .. }
                                 | JobStatus::Skipped { .. }
                         );
+                        if !is_operator {
+                            sanitize_job_record(&mut curr_job);
+                        }
                         if let Ok(curr_str) = serde_json::to_string(&curr_job) {
                             if curr_str != last_job_version {
                                 last_job_version = curr_str.clone();
@@ -1665,13 +1686,16 @@ async fn stream_job_events(state: Arc<AppState>, job_id: String, is_operator: bo
 
                 // Job status / stage status changes
                 _ = state.job_store.wait_for_event() => {
-                    if let Some(curr_job) = state.job_store.get_job(&jid).await {
+                    if let Some(mut curr_job) = state.job_store.get_job(&jid).await {
                         is_terminal = matches!(
                             curr_job.status,
                             JobStatus::Completed { .. }
                                 | JobStatus::Failed { .. }
                                 | JobStatus::Skipped { .. }
                         );
+                        if !is_operator {
+                            sanitize_job_record(&mut curr_job);
+                        }
                         if let Ok(curr_str) = serde_json::to_string(&curr_job) {
                             if curr_str != last_job_version {
                                 last_job_version = curr_str.clone();

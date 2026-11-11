@@ -22,26 +22,36 @@ use tower::ServiceExt;
 
 const TEST_API_KEY: &str = "challenge-secret-api-key-42";
 
-// Obfuscated byte sequences for internal identifiers
-const S_E: &[u8] = b"\x65\x6e\x74\x72\x61\x6e\x63\x65";
-const S_R: &[u8] = b"\x72\x75\x62\x69\x63\x6f\x6e";
-const S_P: &[u8] = b"\x70\x65\x79\x2d\x77\x61\x69\x6c\x2d\x64\x65\x75";
-const S_PU: &[u8] = b"\x70\x65\x79\x5f\x77\x61\x69\x6c\x5f\x64\x65\x75";
-const S_TB: &[u8] = b"\x74\x69\x2d\x62\x72\x61\x73";
-const S_TBU: &[u8] = b"\x74\x69\x5f\x62\x72\x61\x73";
-const S_L: &[u8] = b"\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
-const S_D: &[u8] = b"\x2e\x6c\x61\x62\x2e\x6c\x6f\x63\x61\x6c";
+// Synthetic test fixtures for privacy boundary verification
+const TEST_NODE_A: &str = "test-node-alpha";
+const TEST_NODE_B: &str = "test-node-beta";
+const TEST_WORKER_RV: &str = "test-worker-riscv";
+const TEST_WORKER_RV_U: &str = "test_worker_riscv";
+const TEST_WORKER_ARM: &str = "test-worker-arm";
+const TEST_WORKER_ARM_U: &str = "test_worker_arm";
+const TEST_DOMAIN: &str = "corp.internal";
+const TEST_DOMAIN_SUFFIX: &str = ".corp.internal";
+
+static INIT_ENV: std::sync::Once = std::sync::Once::new();
+fn ensure_test_env() {
+    INIT_ENV.call_once(|| {
+        std::env::set_var(
+            "MUCI_NODE_MAP",
+            "test-node-alpha=node-a,test-node-beta=node-b,test-worker-riscv=worker-riscv64,test_worker_riscv=worker-riscv64,test-worker-arm=worker-aarch64,test_worker_arm=worker-aarch64",
+        );
+    });
+}
 
 fn assert_no_leak(payload: &str, context: &str) {
     let lower = payload.to_lowercase();
     let forbidden_names = [
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_PU).unwrap(),
-        std::str::from_utf8(S_TB).unwrap(),
-        std::str::from_utf8(S_TBU).unwrap(),
-        std::str::from_utf8(S_L).unwrap(),
+        TEST_NODE_A,
+        TEST_NODE_B,
+        TEST_WORKER_RV,
+        TEST_WORKER_RV_U,
+        TEST_WORKER_ARM,
+        TEST_WORKER_ARM_U,
+        TEST_DOMAIN,
     ];
     for token in forbidden_names {
         assert!(
@@ -56,6 +66,7 @@ fn make_test_state_with_key(
     api_key: Option<&str>,
     healthy_ws: bool,
 ) -> Arc<AppState> {
+    ensure_test_env();
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let (log_broadcaster, _) = tokio::sync::broadcast::channel(128);
 
@@ -102,28 +113,16 @@ fn make_test_state(controller_node_id: &str, healthy_ws: bool) -> Arc<AppState> 
 #[tokio::test]
 async fn test_unauthenticated_health_redacts_internal_hostnames() {
     let forbidden_names = [
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_PU).unwrap(),
-        std::str::from_utf8(S_L).unwrap(),
+        TEST_NODE_A,
+        TEST_NODE_B,
+        TEST_WORKER_RV,
+        TEST_WORKER_RV_U,
+        TEST_DOMAIN,
     ];
 
-    let host_a = format!(
-        "{}{}",
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let host_b = format!(
-        "{}{}",
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let host_c = format!(
-        "{}{}",
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
+    let host_a = format!("{TEST_NODE_A}{TEST_DOMAIN_SUFFIX}");
+    let host_b = format!("{TEST_NODE_B}{TEST_DOMAIN_SUFFIX}");
+    let host_c = format!("{TEST_WORKER_RV}{TEST_DOMAIN_SUFFIX}");
 
     let test_hosts = [host_a.as_str(), host_b.as_str(), host_c.as_str()];
 
@@ -203,24 +202,12 @@ async fn test_unauthenticated_health_redacts_internal_hostnames() {
 
 #[tokio::test]
 async fn test_unauthenticated_cluster_nodes_redacts_all_registered_workers() {
-    let node_a = format!(
-        "{}{}",
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let node_b = format!(
-        "{}{}",
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let node_c = format!(
-        "{}{}",
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let node_d = format!("extra-node{}", std::str::from_utf8(S_D).unwrap());
-    let node_tb = std::str::from_utf8(S_TB).unwrap();
-    let node_tbu = std::str::from_utf8(S_TBU).unwrap();
+    let node_a = format!("{TEST_NODE_A}{TEST_DOMAIN_SUFFIX}");
+    let node_b = format!("{TEST_NODE_B}{TEST_DOMAIN_SUFFIX}");
+    let node_c = format!("{TEST_WORKER_RV}{TEST_DOMAIN_SUFFIX}");
+    let node_d = format!("extra-node{TEST_DOMAIN_SUFFIX}");
+    let node_tb = TEST_WORKER_ARM;
+    let node_tbu = TEST_WORKER_ARM_U;
 
     let state = make_test_state(&node_a, true);
 
@@ -255,13 +242,13 @@ async fn test_unauthenticated_cluster_nodes_redacts_all_registered_workers() {
     let app = create_router(state.clone());
 
     let forbidden_names = [
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_PU).unwrap(),
-        std::str::from_utf8(S_TB).unwrap(),
-        std::str::from_utf8(S_TBU).unwrap(),
-        std::str::from_utf8(S_L).unwrap(),
+        TEST_NODE_A,
+        TEST_NODE_B,
+        TEST_WORKER_RV,
+        TEST_WORKER_RV_U,
+        TEST_WORKER_ARM,
+        TEST_WORKER_ARM_U,
+        TEST_DOMAIN,
     ];
 
     // 1. Unauthenticated request to /api/cluster/nodes
@@ -378,12 +365,8 @@ async fn test_unauthenticated_cluster_nodes_redacts_all_registered_workers() {
 
 #[tokio::test]
 async fn test_unauthenticated_queue_and_jobs_redacts_node_and_stage_metadata() {
-    let node_a = format!(
-        "{}{}",
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_D).unwrap()
-    );
-    let node_tb = std::str::from_utf8(S_TB).unwrap();
+    let node_a = format!("{TEST_NODE_A}{TEST_DOMAIN_SUFFIX}");
+    let node_tb = TEST_WORKER_ARM;
 
     let state = make_test_state(&node_a, true);
 
@@ -423,13 +406,13 @@ async fn test_unauthenticated_queue_and_jobs_redacts_node_and_stage_metadata() {
     let app = create_router(state.clone());
 
     let forbidden_names = [
-        std::str::from_utf8(S_E).unwrap(),
-        std::str::from_utf8(S_R).unwrap(),
-        std::str::from_utf8(S_P).unwrap(),
-        std::str::from_utf8(S_PU).unwrap(),
-        std::str::from_utf8(S_TB).unwrap(),
-        std::str::from_utf8(S_TBU).unwrap(),
-        std::str::from_utf8(S_L).unwrap(),
+        TEST_NODE_A,
+        TEST_NODE_B,
+        TEST_WORKER_RV,
+        TEST_WORKER_RV_U,
+        TEST_WORKER_ARM,
+        TEST_WORKER_ARM_U,
+        TEST_DOMAIN,
     ];
 
     // 1. Unauthenticated GET /api/queue
@@ -528,28 +511,23 @@ async fn test_unauthenticated_queue_and_jobs_redacts_node_and_stage_metadata() {
 
 #[tokio::test]
 async fn test_adversarial_mixed_case_and_fqdn_sanitization() {
-    let s_e = std::str::from_utf8(S_E).unwrap();
-    let s_r = std::str::from_utf8(S_R).unwrap();
-    let s_p = std::str::from_utf8(S_P).unwrap();
-    let s_pu = std::str::from_utf8(S_PU).unwrap();
-    let s_tb = std::str::from_utf8(S_TB).unwrap();
-    let _s_tbu = std::str::from_utf8(S_TBU).unwrap();
-    let s_d = std::str::from_utf8(S_D).unwrap();
+    let s_e = TEST_NODE_A;
+    let s_r = TEST_NODE_B;
+    let s_p = TEST_WORKER_RV;
+    let s_pu = TEST_WORKER_RV_U;
+    let s_tb = TEST_WORKER_ARM;
+    let _s_tbu = TEST_WORKER_ARM_U;
+    let s_d = TEST_DOMAIN_SUFFIX;
 
     let s_tb_upper = s_tb.to_ascii_uppercase();
-    const S_TBU_MIXED: &[u8] = b"\x54\x69\x5f\x42\x72\x61\x73";
-    let s_tbu_mixed = std::str::from_utf8(S_TBU_MIXED).unwrap().to_string();
-    const S_PU_MIXED: &[u8] = b"\x50\x65\x79\x5f\x57\x61\x69\x6c\x5f\x44\x65\x75";
-    let s_pu_mixed = std::str::from_utf8(S_PU_MIXED).unwrap().to_string();
+    let s_tbu_mixed = "Test_Worker_Arm".to_string();
+    let s_pu_mixed = "Test_Worker_Riscv".to_string();
     let s_p_upper = s_p.to_ascii_uppercase();
-    const S_E_CAP: &[u8] = b"\x45\x6e\x74\x72\x61\x6e\x63\x65";
-    let s_e_cap = std::str::from_utf8(S_E_CAP).unwrap().to_string();
+    let s_e_cap = "Test-Node-Alpha".to_string();
     let s_e_upper = s_e.to_ascii_uppercase();
-    const S_E_MIXED: &[u8] = b"\x65\x4e\x74\x52\x61\x4e\x63\x65";
-    let s_e_mixed = std::str::from_utf8(S_E_MIXED).unwrap().to_string();
+    let s_e_mixed = "tEsT-nOdE-aLpHa".to_string();
     let s_r_upper = s_r.to_ascii_uppercase();
-    const S_R_MIXED: &[u8] = b"\x52\x75\x42\x69\x43\x6f\x4e";
-    let s_r_mixed = std::str::from_utf8(S_R_MIXED).unwrap().to_string();
+    let s_r_mixed = "tEsT-nOdE-bEtA".to_string();
 
     let adversarial_nodes = vec![
         // Uppercase and mixed case
@@ -674,10 +652,10 @@ async fn test_adversarial_mixed_case_and_fqdn_sanitization() {
 
 #[tokio::test]
 async fn test_adversarial_endpoints_privacy_across_all_routes() {
-    let s_e = std::str::from_utf8(S_E).unwrap();
-    let s_r = std::str::from_utf8(S_R).unwrap();
-    let s_tb = std::str::from_utf8(S_TB).unwrap();
-    let s_d = std::str::from_utf8(S_D).unwrap();
+    let s_e = TEST_NODE_A;
+    let s_r = TEST_NODE_B;
+    let s_tb = TEST_WORKER_ARM;
+    let s_d = TEST_DOMAIN_SUFFIX;
 
     let host_ctrl = format!("{s_r}{s_d}");
     let state = make_test_state(&host_ctrl, true);
@@ -909,9 +887,9 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
 
 #[tokio::test]
 async fn test_unauthenticated_events_stream_sanitization_in_open_mode() {
-    let s_e = std::str::from_utf8(S_E).unwrap();
-    let s_tb = std::str::from_utf8(S_TB).unwrap();
-    let s_d = std::str::from_utf8(S_D).unwrap();
+    let s_e = TEST_NODE_A;
+    let s_tb = TEST_WORKER_ARM;
+    let s_d = TEST_DOMAIN_SUFFIX;
 
     let host_ctrl = format!("{s_e}{s_d}");
     // No API key configured -> open public mode where /api/events streams unauthenticated
@@ -1007,7 +985,7 @@ async fn test_unauthenticated_events_stream_sanitization_in_open_mode() {
 
 #[tokio::test]
 async fn test_adversarial_bare_domain_check() {
-    let s_l = std::str::from_utf8(S_L).unwrap();
+    let s_l = TEST_DOMAIN;
     let state = make_test_state("node-a", true);
 
     let (cmd_tx, _) = mpsc::channel(4);
