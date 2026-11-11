@@ -727,6 +727,10 @@ impl JobStore {
         self.db.evaluate_regression_gate(req)
     }
 
+    pub fn emit_trace_spans(&self, spans: &[mu_observable_ipc::OtelSpanEntry]) {
+        self.db.emit_trace_spans(spans);
+    }
+
     async fn persist(&self) {
         if let Some(ref path) = self.index_file {
             let Some(parent) = path.parent() else {
