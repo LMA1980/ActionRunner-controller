@@ -55,9 +55,83 @@ pub fn is_worker_memory_exhausted(ram_total_mb: u64, ram_used_mb: u64) -> bool {
     avail_mb < 256 && ram_used_mb.saturating_mul(100) >= ram_total_mb.saturating_mul(90)
 }
 
+fn heartbeat_timeout_secs() -> i64 {
+    std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(15)
+}
+
+fn effective_slot_limit(max_slots: u32, max_concurrent_per_node: Option<u32>) -> u32 {
+    match max_concurrent_per_node {
+        Some(lim) if lim > 0 => lim.min(max_slots),
+        _ => max_slots,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_can_accept_stage(
+    worker: &ActiveWorker,
+    now: DateTime<Utc>,
+    timeout_secs: i64,
+    required_tags: &[String],
+    required_toolchain: Option<&str>,
+    exclusive: bool,
+    max_concurrent_per_node: Option<u32>,
+    include_pending_claims: bool,
+) -> bool {
+    let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+    if secs_since_seen > timeout_secs {
+        return false;
+    }
+    if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
+        return false;
+    }
+    if worker.exclusive_lease.is_some()
+        || (include_pending_claims && worker.pending_exclusive_claim.is_some())
+    {
+        return false;
+    }
+
+    let occupied = if include_pending_claims {
+        worker.leased_stages.len() + worker.pending_claims.len()
+    } else {
+        worker.leased_stages.len()
+    };
+    if exclusive {
+        if occupied > 0 {
+            return false;
+        }
+    } else {
+        let limit = effective_slot_limit(worker.registration.max_slots, max_concurrent_per_node);
+        if (occupied as u32) >= limit {
+            return false;
+        }
+    }
+
+    if let Some(tc) = required_toolchain {
+        if !worker.registration.toolchains.iter().any(|t| t == tc) {
+            return false;
+        }
+    }
+
+    let node_tags: HashSet<&str> = worker
+        .registration
+        .tags
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    required_tags.is_empty()
+        || required_tags
+            .iter()
+            .all(|req| req == "default" || node_tags.contains(req.as_str()))
+}
+
 #[derive(Clone, Default)]
 pub struct ClusterRegistry {
     workers: Arc<RwLock<HashMap<String, ActiveWorker>>>,
+    stage_concurrency_limits: Arc<std::sync::RwLock<HashMap<(String, String), u32>>>,
     dispatch_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -65,8 +139,35 @@ impl ClusterRegistry {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
+            stage_concurrency_limits: Arc::new(std::sync::RwLock::new(HashMap::new())),
             dispatch_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_stage_concurrency_limits(
+        &self,
+        job_id: &str,
+        limits: impl IntoIterator<Item = (String, u32)>,
+    ) {
+        let mut guard = self
+            .stage_concurrency_limits
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(jid, _), _| jid != job_id);
+        for (stage_id, limit) in limits {
+            guard.insert((job_id.to_string(), stage_id), limit);
+        }
+    }
+
+    #[must_use]
+    pub fn stage_concurrency_limit(&self, job_id: &str, stage_id: &str) -> Option<u32> {
+        let guard = self
+            .stage_concurrency_limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&(job_id.to_string(), stage_id.to_string()))
+            .copied()
     }
 
     pub async fn register(
@@ -180,89 +281,51 @@ impl ClusterRegistry {
         let stage_is_untagged_default =
             required_tags.is_empty() || required_tags.iter().all(|req| req == "default");
 
+        let timeout_secs = heartbeat_timeout_secs();
         type NodeDispatchScore = (usize, u8, u8, u64, i32);
         let mut best_node: Option<(String, NodeDispatchScore)> = None;
 
         for (node_id, worker) in workers.iter() {
-            // Heartbeat timeout check: 15 seconds (default) or configurable
-            let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(15);
-            let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > timeout_secs {
+            if !worker_can_accept_stage(
+                worker,
+                now,
+                timeout_secs,
+                required_tags,
+                required_toolchain,
+                exclusive,
+                max_concurrent_per_node,
+                false,
+            ) {
                 continue;
             }
 
-            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
-                continue;
-            }
-
-            // Scenario 2 (Full-Node Exclusive Lock):
-            // If worker has an active exclusive lease, reject ALL requests.
-            if worker.exclusive_lease.is_some() {
-                continue;
-            }
-
-            if exclusive {
-                // Scenario 1 (Drain Before Dispatch):
-                // Exclusive stage requires a completely idle worker (zero active leased stages).
-                if !worker.leased_stages.is_empty() {
-                    continue;
-                }
-            } else {
-                // Shared stage: limit by max_concurrent_per_node.min(node.max_slots)
-                let limit = match max_concurrent_per_node {
-                    Some(lim) if lim > 0 => lim.min(worker.registration.max_slots),
-                    _ => worker.registration.max_slots,
-                };
-                if (worker.leased_stages.len() as u32) >= limit {
-                    continue;
-                }
-            }
-
-            // Verify toolchain if requested
-            if let Some(tc) = required_toolchain {
-                if !worker.registration.toolchains.iter().any(|t| t == tc) {
-                    continue;
-                }
-            }
-
-            // Verify required tags (empty tags or "default" matches any available node)
             let node_tags: HashSet<&str> = worker
                 .registration
                 .tags
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            let matches_tags = required_tags.is_empty()
-                || required_tags
-                    .iter()
-                    .all(|req| req == "default" || node_tags.contains(req.as_str()));
-
-            if matches_tags {
-                let node_is_hw = HW_EXCLUSIVE_TAGS.iter().any(|t| node_tags.contains(t));
-                let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
-                let node_is_low_ram =
-                    worker.registration.ram_total_mb > 0 && worker.registration.ram_total_mb < 8192;
-                let low_ram_tier = u8::from(stage_is_untagged_default && node_is_low_ram);
-                let active_leases = worker.leased_stages.len();
-                let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let score = (
-                    active_leases,
-                    hw_tier,
-                    low_ram_tier,
-                    worker.last_dispatched_seq,
-                    load_int,
-                );
-                if match &best_node {
-                    None => true,
-                    Some((best_id, best_score)) => {
-                        (score, node_id.as_str()) < (*best_score, best_id.as_str())
-                    }
-                } {
-                    best_node = Some((node_id.clone(), score));
+            let node_is_hw = HW_EXCLUSIVE_TAGS.iter().any(|t| node_tags.contains(t));
+            let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
+            let node_is_low_ram =
+                worker.registration.ram_total_mb > 0 && worker.registration.ram_total_mb < 8192;
+            let low_ram_tier = u8::from(stage_is_untagged_default && node_is_low_ram);
+            let active_leases = worker.leased_stages.len();
+            let load_int = (worker.cpu_load_pct * 100.0) as i32;
+            let score = (
+                active_leases,
+                hw_tier,
+                low_ram_tier,
+                worker.last_dispatched_seq,
+                load_int,
+            );
+            if match &best_node {
+                None => true,
+                Some((best_id, best_score)) => {
+                    (score, node_id.as_str()) < (*best_score, best_id.as_str())
                 }
+            } {
+                best_node = Some((node_id.clone(), score));
             }
         }
 
@@ -325,6 +388,10 @@ impl ClusterRegistry {
     }
 
     pub async fn cancel_and_release_job_slots(&self, job_id: &str, reason: &str) {
+        self.stage_concurrency_limits
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(jid, _), _| jid != job_id);
         let mut to_cancel = Vec::new();
         {
             let mut workers = self.workers.write().await;
@@ -400,10 +467,7 @@ impl ClusterRegistry {
     pub async fn is_node_online(&self, node_id: &str) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
-        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(15);
+        let timeout_secs = heartbeat_timeout_secs();
         if let Some(worker) = workers.get(node_id) {
             (now - worker.last_heartbeat).num_seconds().max(0) <= timeout_secs
         } else {
@@ -414,10 +478,7 @@ impl ClusterRegistry {
     pub async fn list_nodes_view(&self) -> Vec<ClusterNodeView> {
         let workers = self.workers.read().await;
         let now = Utc::now();
-        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(15);
+        let timeout_secs = heartbeat_timeout_secs() as u64;
 
         workers
             .values()
@@ -461,82 +522,49 @@ impl ClusterRegistry {
         required_toolchain: Option<&str>,
         exclusive: bool,
     ) -> bool {
+        self.has_available_slot_for_stage_with_limit(
+            required_tags,
+            required_toolchain,
+            exclusive,
+            None,
+        )
+        .await
+    }
+
+    pub async fn has_available_slot_for_stage_with_limit(
+        &self,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+        exclusive: bool,
+        max_concurrent_per_node: Option<u32>,
+    ) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
-        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(15);
+        let timeout_secs = heartbeat_timeout_secs();
 
-        for worker in workers.values() {
-            let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > timeout_secs {
-                continue;
-            }
-            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
-                continue;
-            }
-            if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
-                continue;
-            }
-            if exclusive {
-                if !worker.leased_stages.is_empty() || !worker.pending_claims.is_empty() {
-                    continue;
-                }
-            } else if ((worker.leased_stages.len() + worker.pending_claims.len()) as u32)
-                >= worker.registration.max_slots
-            {
-                continue;
-            }
-            if let Some(tc) = required_toolchain {
-                if !worker.registration.toolchains.iter().any(|t| t == tc) {
-                    continue;
-                }
-            }
-            let node_tags: HashSet<&str> = worker
-                .registration
-                .tags
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let matches_tags = required_tags.is_empty()
-                || required_tags
-                    .iter()
-                    .all(|req| req == "default" || node_tags.contains(req.as_str()));
-            if matches_tags {
-                return true;
-            }
-        }
-        false
+        workers.values().any(|worker| {
+            worker_can_accept_stage(
+                worker,
+                now,
+                timeout_secs,
+                required_tags,
+                required_toolchain,
+                exclusive,
+                max_concurrent_per_node,
+                true,
+            )
+        })
     }
 
     /// Checks whether any online worker node currently has an available execution slot.
     pub async fn has_any_available_slot(&self) -> bool {
         let workers = self.workers.read().await;
         let now = Utc::now();
-        let timeout_secs = std::env::var("ACTION_RUNNER_HEARTBEAT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(15);
+        let timeout_secs = heartbeat_timeout_secs();
 
-        for worker in workers.values() {
-            let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-            if secs_since_seen > timeout_secs {
-                continue;
-            }
-            if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
-                continue;
-            }
-            if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
-                continue;
-            }
-            if ((worker.leased_stages.len() + worker.pending_claims.len()) as u32)
-                < worker.registration.max_slots
-            {
-                return true;
-            }
-        }
-        false
+        workers.values().any(|worker| {
+            worker_can_accept_stage(worker, now, timeout_secs, &[], None, false, None, true)
+        })
     }
 
     /// Checks whether any worker node currently holds an active stage lease (or exclusive lock)
@@ -566,6 +594,7 @@ impl ClusterRegistry {
     ) -> bool {
         let mut workers = self.workers.write().await;
         let now = Utc::now();
+        let timeout_secs = heartbeat_timeout_secs();
 
         // 1. Prune pending claims across all workers
         for worker in workers.values_mut() {
@@ -592,19 +621,7 @@ impl ClusterRegistry {
         if stages.is_empty() {
             let mut best_node: Option<(String, usize, i32)> = None;
             for (node_id, worker) in workers.iter() {
-                let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-                if secs_since_seen > 15 {
-                    continue;
-                }
-                if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb)
-                {
-                    continue;
-                }
-                if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
-                    continue;
-                }
-                if (worker.leased_stages.len() + worker.pending_claims.len()) as u32
-                    >= worker.registration.max_slots
+                if !worker_can_accept_stage(worker, now, timeout_secs, &[], None, false, None, true)
                 {
                     continue;
                 }
@@ -650,49 +667,19 @@ impl ClusterRegistry {
                 continue;
             }
 
+            let stage_limit = self.stage_concurrency_limit(job_id, &stage.id);
             let mut best_node: Option<(String, usize, i32)> = None;
             for (node_id, worker) in workers.iter() {
-                let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-                if secs_since_seen > 15 {
-                    continue;
-                }
-                if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb)
-                {
-                    continue;
-                }
-                if worker.exclusive_lease.is_some() || worker.pending_exclusive_claim.is_some() {
-                    continue;
-                }
-                if stage.exclusive {
-                    if !worker.leased_stages.is_empty() || !worker.pending_claims.is_empty() {
-                        continue;
-                    }
-                } else if (worker.leased_stages.len() + worker.pending_claims.len()) as u32
-                    >= worker.registration.max_slots
-                {
-                    continue;
-                }
-
-                // Verify toolchain if requested
-                if let Some(ref tc) = stage.toolchain {
-                    if !worker.registration.toolchains.iter().any(|t| t == tc) {
-                        continue;
-                    }
-                }
-
-                // Verify required tags (empty tags or "default" matches any available node)
-                let node_tags: HashSet<&str> = worker
-                    .registration
-                    .tags
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                let matches_tags = stage.tags.is_empty()
-                    || stage
-                        .tags
-                        .iter()
-                        .all(|req| req == "default" || node_tags.contains(req.as_str()));
-                if !matches_tags {
+                if !worker_can_accept_stage(
+                    worker,
+                    now,
+                    timeout_secs,
+                    &stage.tags,
+                    stage.toolchain.as_deref(),
+                    stage.exclusive,
+                    stage_limit,
+                    true,
+                ) {
                     continue;
                 }
 
