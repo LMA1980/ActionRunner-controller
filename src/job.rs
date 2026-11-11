@@ -196,6 +196,7 @@ impl Drop for InFlightJobGuard {
     fn drop(&mut self) {
         if let Some(store) = self.job_store.take() {
             store.release_in_flight_job(&self.job_id);
+            store.notify_event();
         }
     }
 }
@@ -1040,17 +1041,29 @@ impl JobStore {
 
             let mut healed = Vec::new();
             for r in store.iter_mut() {
-                if matches!(r.status, JobStatus::Queued)
-                    && r.stages.iter().any(|s| {
-                        matches!(
-                            s.status,
-                            StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                        )
-                    })
-                {
+                let has_active_stages = r.stages.iter().any(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
+                    )
+                });
+                if matches!(r.status, JobStatus::Queued) && has_active_stages {
                     r.status = JobStatus::Running { started_at: now };
                     r.updated_at = now;
                     healed.push(r.clone());
+                } else if let Some(cluster_reg) = cluster {
+                    if matches!(r.status, JobStatus::Running { .. })
+                        && !has_active_stages
+                        && !self.is_job_in_flight(&r.job.id)
+                        && !cluster_reg.has_active_leases_for_job(&r.job.id).await
+                    {
+                        r.status = JobStatus::Queued;
+                        r.updated_at = now;
+                        healed.push(r.clone());
+                    } else if sanitize_terminal_job_stages(r) {
+                        r.updated_at = now;
+                        healed.push(r.clone());
+                    }
                 } else if sanitize_terminal_job_stages(r) {
                     r.updated_at = now;
                     healed.push(r.clone());
@@ -1137,6 +1150,9 @@ impl JobStore {
             self.persist().await;
             Some(job)
         } else {
+            if !healed.is_empty() {
+                self.persist().await;
+            }
             None
         }
     }

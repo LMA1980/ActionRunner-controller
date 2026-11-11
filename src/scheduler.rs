@@ -501,6 +501,13 @@ impl DAGScheduler {
         };
 
         self.job_store.set_stages(&job.id, stage_records).await;
+        self.cluster.set_stage_concurrency_limits(
+            &job.id,
+            workflow
+                .stages
+                .iter()
+                .map(|s| (s.id.clone(), s.max_concurrent_per_node)),
+        );
 
         // 3. Orchestration loop: evaluate DAG progression
         let stages_by_id: HashMap<String, StageConfig> = workflow
@@ -631,17 +638,36 @@ impl DAGScheduler {
                         });
 
                         if deps_satisfied {
-                            let stage_cfg = stages_by_id.get(&stage.id).unwrap();
+                            let Some(stage_cfg) = stages_by_id.get(&stage.id) else {
+                                let err_msg = format!(
+                                    "Stage '{}' missing from resolved workflow configuration",
+                                    stage.id
+                                );
+                                warn!(job_id = %job.id, stage = %stage.id, "{}", err_msg);
+                                self.job_store
+                                    .update_stage_status(
+                                        &job.id,
+                                        &stage.id,
+                                        StageStatus::Failed {
+                                            error: err_msg.clone(),
+                                        },
+                                    )
+                                    .await;
+                                any_failed = true;
+                                failure_error = err_msg;
+                                continue;
+                            };
                             let required_tags = workflow.effective_stage_tags(stage_cfg);
-                            // Attempt to lease a slot (respecting node capacity and exclusive stage locks)
+                            // Attempt to lease a slot (respecting node capacity, per-stage limits, and exclusive stage locks)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
-                                .lease_slot(
+                                .lease_slot_with_limit(
                                     &job.id,
                                     &stage.id,
                                     &required_tags,
                                     stage_cfg.toolchain.as_deref(),
                                     stage_cfg.exclusive,
+                                    Some(stage_cfg.max_concurrent_per_node),
                                 )
                                 .await
                             {
@@ -682,6 +708,7 @@ impl DAGScheduler {
                                             error = %e,
                                             "Failed to build stage dispatch task"
                                         );
+                                        leased_slots.remove(&stage.id);
                                         self.cluster
                                             .release_stage_slot(&node_id, &job.id, &stage.id)
                                             .await;
@@ -698,7 +725,22 @@ impl DAGScheduler {
                                     }
                                 };
 
-                                let _ = cmd_tx.send(WorkerCommand::Dispatch(task)).await;
+                                if cmd_tx.send(WorkerCommand::Dispatch(task)).await.is_err() {
+                                    warn!(
+                                        job_id = %job.id,
+                                        stage = %stage.id,
+                                        node = %node_id,
+                                        "Worker command channel closed during stage dispatch; releasing slot and returning stage to Pending"
+                                    );
+                                    leased_slots.remove(&stage.id);
+                                    self.cluster
+                                        .release_stage_slot(&node_id, &job.id, &stage.id)
+                                        .await;
+                                    let _ = self
+                                        .job_store
+                                        .recover_stage_if_active(&job.id, &stage.id)
+                                        .await;
+                                }
                             }
                         }
                     }

@@ -145,16 +145,50 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     }
                                     Ok(Err(e)) => {
                                         error!("Failed to send dispatch frame over ws: {}", e);
+                                        state
+                                            .cluster
+                                            .release_stage_slot(&node_id, &task.job_id, &task.stage_id)
+                                            .await;
+                                        let _ = state
+                                            .job_store
+                                            .recover_stage_if_active(&task.job_id, &task.stage_id)
+                                            .await;
                                         break;
                                     }
                                     Err(_) => {
                                         error!(node = %node_id, stage = %task.stage_id, "Timed out (10s) sending dispatch frame over ws");
+                                        state
+                                            .cluster
+                                            .release_stage_slot(&node_id, &task.job_id, &task.stage_id)
+                                            .await;
+                                        let _ = state
+                                            .job_store
+                                            .recover_stage_if_active(&task.job_id, &task.stage_id)
+                                            .await;
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
                                 error!(stage = %task.stage_id, error = %e, "Failed to serialize StageDispatchTask with Fory");
+                                state
+                                    .cluster
+                                    .release_stage_slot(&node_id, &task.job_id, &task.stage_id)
+                                    .await;
+                                state
+                                    .job_store
+                                    .update_stage_status(
+                                        &task.job_id,
+                                        &task.stage_id,
+                                        StageStatus::Failed {
+                                            error: format!(
+                                                "Failed to serialize stage dispatch frame: {}",
+                                                e
+                                            ),
+                                        },
+                                    )
+                                    .await;
+                                state.job_store.notify_event();
                             }
                         }
                     }
