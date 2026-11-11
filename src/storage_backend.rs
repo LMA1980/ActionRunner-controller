@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use mu_observable_ipc::{
     decode_control_envelope, encode_control_envelope, encode_hex,
-    encode_log_batch as encode_otel_logs_ipc, read_frame, write_frame, CentralBranchSnapshot,
-    CentralJobRecord, CentralSubmoduleSnapshot, ControlRpcEnvelope, DeterministicSecretRedactor,
-    IpcHeader, OtelLogEntry, QueryBranchSnapshotsRequest, QueryJobsHistoryRequest,
-    QuerySubmoduleSnapshotsRequest, RegressionGateReport, RegressionGateRequest, RegressionVerdict,
-    SecretRedactor, TraceContext, UpsertJobBatchRequest, UpsertJobRecordRequest,
-    FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_OTEL_LOGS, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK,
-    TRACE_FLAG_SAMPLED, W3C_TRACEPARENT_VERSION,
+    encode_log_batch as encode_otel_logs_ipc, encode_span_batch as encode_otel_spans_ipc,
+    read_frame, write_frame, CentralBranchSnapshot, CentralJobRecord, CentralSubmoduleSnapshot,
+    ControlRpcEnvelope, DeterministicSecretRedactor, IpcHeader, OtelLogEntry, OtelSpanEntry,
+    QueryBranchSnapshotsRequest, QueryJobsHistoryRequest, QuerySubmoduleSnapshotsRequest,
+    RegressionGateReport, RegressionGateRequest, RegressionVerdict, SecretRedactor, TraceContext,
+    UpsertJobBatchRequest, UpsertJobRecordRequest, FLAG_HIGH_PRIORITY, MSG_TYPE_ARROW_OTEL_LOGS,
+    MSG_TYPE_ARROW_OTEL_SPANS, MSG_TYPE_FORY_CONTROL, MSG_TYPE_WAL_ACK, TRACE_FLAG_SAMPLED,
+    W3C_TRACEPARENT_VERSION,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -209,6 +210,9 @@ pub trait ControllerStorage: Send + Sync {
     /// Releases the single-leader lease if currently held by `holder_id` (`#79`).
     fn release_lease(&self, _holder_id: &str) {}
 
+    /// Emits a batch of [`OtelSpanEntry`] records to shared observability telemetry.
+    fn emit_trace_spans(&self, _spans: &[OtelSpanEntry]) {}
+
     /// Returns the current [`LeaderLease`] state from shared storage, if any (`#79`).
     fn get_leader_lease(&self) -> Option<LeaderLease> {
         None
@@ -269,13 +273,17 @@ pub trait ControllerStorage: Send + Sync {
 #[derive(Clone, Default)]
 pub struct InMemoryStorage {
     store: Arc<CatalogStore>,
+    emitted_spans: Arc<std::sync::Mutex<Vec<OtelSpanEntry>>>,
 }
 
 impl InMemoryStorage {
     /// Wraps an existing [`CatalogStore`].
     #[must_use]
     pub fn new(store: Arc<CatalogStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            emitted_spans: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     /// Creates a new empty [`InMemoryStorage`].
@@ -283,7 +291,17 @@ impl InMemoryStorage {
     pub fn open() -> Self {
         Self {
             store: Arc::new(CatalogStore::new()),
+            emitted_spans: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Returns a copy of all emitted [`OtelSpanEntry`] records.
+    #[must_use]
+    pub fn get_emitted_spans(&self) -> Vec<OtelSpanEntry> {
+        self.emitted_spans
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Returns a reference to the underlying [`CatalogStore`].
@@ -437,6 +455,15 @@ impl ControllerStorage for InMemoryStorage {
 
     fn revoke_auth_user(&self, github_login: &str) -> bool {
         self.store.revoke_auth_user(github_login)
+    }
+
+    fn emit_trace_spans(&self, spans: &[OtelSpanEntry]) {
+        if spans.is_empty() {
+            return;
+        }
+        if let Ok(mut lock) = self.emitted_spans.lock() {
+            lock.extend(spans.iter().cloned());
+        }
     }
 }
 
@@ -1165,6 +1192,104 @@ impl MuObserveRemoteStorage {
         })
         .join()
         .map_err(|_| "MuObserve OTel log flush worker thread panicked".to_string())?
+    }
+
+    async fn exchange_otel_spans_stream<S>(
+        stream: &mut S,
+        seq: u64,
+        batch: &[OtelSpanEntry],
+    ) -> Result<usize, String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let payload = encode_otel_spans_ipc(batch)
+            .map_err(|e| format!("Arrow OTel span encode error: {e}"))?;
+        let flags = if batch.iter().any(|s| s.status_code == "ERROR") {
+            FLAG_HIGH_PRIORITY
+        } else {
+            0
+        };
+        let header = IpcHeader::new(MSG_TYPE_ARROW_OTEL_SPANS, payload.len() as u32, flags, seq);
+        write_frame(stream, &header, &payload)
+            .await
+            .map_err(|e| format!("Write MUOB OTel span frame error: {e}"))?;
+        if let Ok((resp_hdr, resp_payload)) = read_frame(stream).await {
+            if resp_hdr.msg_type == MSG_TYPE_WAL_ACK || resp_hdr.msg_type == MSG_TYPE_FORY_CONTROL {
+                if let Ok(ControlRpcEnvelope::WalAck(ack)) = decode_control_envelope(&resp_payload)
+                {
+                    if !ack.ok {
+                        return Err(ack
+                            .error_message
+                            .unwrap_or_else(|| "MuObserve rejected OTel span batch".to_string()));
+                    }
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
+        Ok(batch.len())
+    }
+
+    /// Sends a batch of [`OtelSpanEntry`] records to `MuObserve` via `MSG_TYPE_ARROW_OTEL_SPANS`.
+    pub async fn send_otel_spans_async(&self, batch: &[OtelSpanEntry]) -> Result<usize, String> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let timeout_dur = Duration::from_millis(self.config.timeout_ms.max(100));
+        let seq = self.next_seq();
+        let addr = self.config.endpoint_addr.clone();
+        let tls_cfg = self.tls_client_config.clone();
+        let sni = self
+            .config
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| "muobserve.node-a.cluster.internal".to_string());
+        let batch_owned = batch.to_vec();
+
+        tokio::time::timeout(timeout_dur, async move {
+            let tcp = TcpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("Connect to {addr} failed: {e}"))?;
+            let _ = tcp.set_nodelay(true);
+
+            if let Some(client_cfg) = tls_cfg {
+                let connector = TlsConnector::from(client_cfg);
+                let server_name = ServerName::try_from(sni.clone())
+                    .map_err(|e| format!("Invalid TLS server name '{sni}': {e}"))?;
+                let mut tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| format!("mTLS handshake with {addr} failed: {e}"))?;
+                Self::exchange_otel_spans_stream(&mut tls_stream, seq, &batch_owned).await
+            } else {
+                let mut tcp = tcp;
+                Self::exchange_otel_spans_stream(&mut tcp, seq, &batch_owned).await
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "MuObserve OTel span flush timed out after {}ms",
+                self.config.timeout_ms
+            )
+        })?
+    }
+
+    /// Executes `send_otel_spans_async` safely from a synchronous context.
+    pub fn send_otel_spans_blocking(&self, batch: &[OtelSpanEntry]) -> Result<usize, String> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let this = self.clone();
+        let batch_clone = batch.to_vec();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Failed to build OTel span flush runtime: {e}"))?;
+            rt.block_on(this.send_otel_spans_async(&batch_clone))
+        })
+        .join()
+        .map_err(|_| "MuObserve OTel span flush worker thread panicked".to_string())?
     }
 
     fn query_internal_snapshot(
@@ -2210,6 +2335,15 @@ impl ControllerStorage for MuObserveRemoteStorage {
     fn revoke_auth_user(&self, github_login: &str) -> bool {
         self.auth_store.revoke_auth_user(github_login)
     }
+
+    fn emit_trace_spans(&self, spans: &[OtelSpanEntry]) {
+        if spans.is_empty() {
+            return;
+        }
+        if let Err(e) = self.send_otel_spans_blocking(spans) {
+            debug!(error = %e, "MuObserve emit_trace_spans failed");
+        }
+    }
 }
 
 pub use crate::db::{
@@ -2639,5 +2773,33 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].body, "line 1");
         assert_eq!(pending[1].body, "line 2");
+    }
+
+    #[test]
+    fn test_in_memory_storage_emit_trace_spans() {
+        let storage = InMemoryStorage::open();
+        assert!(storage.get_emitted_spans().is_empty());
+
+        let span = OtelSpanEntry {
+            trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+            span_id: "0123456789abcdef".to_string(),
+            parent_span_id: None,
+            service_name: "mu-ci-controller".to_string(),
+            node_id: "controller".to_string(),
+            span_name: "ci.pipeline.run:test-repo".to_string(),
+            span_kind: "SERVER".to_string(),
+            start_time_unix_nano: 1_000_000_000,
+            end_time_unix_nano: 2_000_000_000,
+            duration_ns: 1_000_000_000,
+            status_code: "OK".to_string(),
+            status_message: None,
+            attributes_json: r#"{"job_id":"j1"}"#.to_string(),
+        };
+
+        storage.emit_trace_spans(std::slice::from_ref(&span));
+        let emitted = storage.get_emitted_spans();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].span_name, "ci.pipeline.run:test-repo");
+        assert_eq!(emitted[0].trace_id, span.trace_id);
     }
 }

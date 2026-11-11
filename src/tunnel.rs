@@ -23,7 +23,9 @@ use mu_ci_ipc::{
 use crate::aggregator::{aggregate_metrics, append_logs, format_log_entries};
 use crate::cluster::WorkerCommand;
 use crate::job::StageStatus;
+use crate::storage_backend::{job_root_trace_context, job_stage_trace_context};
 use crate::webhook::AppState;
+use mu_observable_ipc::{encode_hex, OtelSpanEntry};
 
 #[derive(Deserialize)]
 pub struct TunnelQuery {
@@ -280,7 +282,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         }
                                     } else {
                                         StageStatus::Failed {
-                                            error: report.error_message.unwrap_or_else(|| {
+                                            error: report.error_message.clone().unwrap_or_else(|| {
                                                 format!("Process exited with code {}", report.exit_code)
                                             }),
                                         }
@@ -289,6 +291,52 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     // Flush any buffered stage logs and release the stage slot so any job woken by
                                     // `update_stage_status` / `notify_event` sees the freed node slot and completed status.
                                     state.job_store.flush_job_log(Some(&report.job_id));
+
+                                    // Emit stage W3C trace span to MuObserve telemetry
+                                    let commit_sha = state
+                                        .job_store
+                                        .get_job(&report.job_id)
+                                        .await
+                                        .map(|j| j.job.commit_sha)
+                                        .unwrap_or_default();
+                                    let root_ctx =
+                                        job_root_trace_context(&report.job_id, &commit_sha);
+                                    let stage_ctx = job_stage_trace_context(
+                                        &report.job_id,
+                                        &commit_sha,
+                                        &report.stage_id,
+                                    );
+                                    let now_ns = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_nanos() as i64;
+                                    let duration_ns = report.duration_secs.saturating_mul(1_000_000_000);
+                                    let start_ns = (now_ns - duration_ns as i64).max(0);
+                                    let (span_status_code, span_status_msg) = if report.exit_code == 0 {
+                                        ("OK".to_string(), None)
+                                    } else {
+                                        ("ERROR".to_string(), report.error_message.clone())
+                                    };
+                                    let span_entry = OtelSpanEntry {
+                                        trace_id: encode_hex(&stage_ctx.trace_id),
+                                        span_id: encode_hex(&stage_ctx.span_id),
+                                        parent_span_id: Some(encode_hex(&root_ctx.span_id)),
+                                        service_name: "mu-ci-controller".to_string(),
+                                        node_id: node_id.clone(),
+                                        span_name: format!("ci.stage.dispatch:{}", report.stage_id),
+                                        span_kind: "INTERNAL".to_string(),
+                                        start_time_unix_nano: start_ns,
+                                        end_time_unix_nano: now_ns,
+                                        duration_ns,
+                                        status_code: span_status_code,
+                                        status_message: span_status_msg,
+                                        attributes_json: format!(
+                                            r#"{{"job_id":"{}","stage_id":"{}","exit_code":{}}}"#,
+                                            report.job_id, report.stage_id, report.exit_code
+                                        ),
+                                    };
+                                    state.job_store.emit_trace_spans(&[span_entry]);
+
                                     state
                                         .cluster
                                         .release_stage_slot(

@@ -9,12 +9,14 @@ use tracing::{info, warn};
 use crate::cluster::{ClusterRegistry, WorkerCommand};
 use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
+use crate::storage_backend::job_root_trace_context;
 use crate::workflow::{ActionRunnerWorkflow, StageConfig};
 use mu_ci_ipc::{
     NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, SccacheMode, StageDispatchTask,
     TypedTaskInvocation,
 };
 use mu_ci_tools::{SandboxProfileRequirement, ToolInvocation, ToolRegistry};
+use mu_observable_ipc::{encode_hex, OtelSpanEntry};
 
 // ============================================================================
 // Sub-tasks #37 & #38: ToolAdapter Dispatch & Security Validation
@@ -870,6 +872,40 @@ impl DAGScheduler {
                     }
                 }
                 self.job_store.flush_job_log(Some(&job.id));
+
+                // Emit root CI pipeline W3C trace span to MuObserve telemetry
+                let root_ctx = job_root_trace_context(&job.id, &job.commit_sha);
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
+                let duration_ns = duration.saturating_mul(1_000_000_000);
+                let start_ns = (now_ns - duration_ns as i64).max(0);
+                let (span_status_code, span_status_msg) = match &final_status {
+                    JobStatus::Completed { .. } => ("OK".to_string(), None),
+                    JobStatus::Failed { error } => ("ERROR".to_string(), Some(error.clone())),
+                    _ => ("OK".to_string(), None),
+                };
+                let span_entry = OtelSpanEntry {
+                    trace_id: encode_hex(&root_ctx.trace_id),
+                    span_id: encode_hex(&root_ctx.span_id),
+                    parent_span_id: None,
+                    service_name: "mu-ci-controller".to_string(),
+                    node_id: "controller".to_string(),
+                    span_name: format!("ci.pipeline.run:{}", job.repo_name),
+                    span_kind: "SERVER".to_string(),
+                    start_time_unix_nano: start_ns,
+                    end_time_unix_nano: now_ns,
+                    duration_ns,
+                    status_code: span_status_code,
+                    status_message: span_status_msg,
+                    attributes_json: format!(
+                        r#"{{"job_id":"{}","repo":"{}","ref":"{}","sha":"{}"}}"#,
+                        job.id, job.repo_name, job.ref_name, job.commit_sha
+                    ),
+                };
+                self.job_store.emit_trace_spans(&[span_entry]);
+
                 _guard.disarm();
                 break;
             }
