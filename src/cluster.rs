@@ -70,6 +70,60 @@ fn effective_slot_limit(max_slots: u32, max_concurrent_per_node: Option<u32>) ->
     }
 }
 
+const HW_EXCLUSIVE_TAGS: &[&str] = &[
+    "k3",
+    "spacemit",
+    "x100",
+    "a100",
+    "native",
+    "ground-truth",
+    "bench",
+    "verification",
+];
+
+const HYGIENE_LIGHT_TAGS: &[&str] = &["fmt", "docs", "audit"];
+
+const EXPLICIT_AUX_ARCH_TAGS: &[&str] = &["aarch64", "arm64", "rpi4"];
+
+const LOW_RAM_THRESHOLD_MB: u64 = 8192;
+
+/// Computes `(hw_tier, low_ram_tier)` for ranking eligible workers (`0` = primary, `1` = overflow).
+///
+/// - `hw_tier = 1` when a worker advertises hardware-verification tags (`HW_EXCLUSIVE_TAGS`) and
+///   the stage does not request any hardware-exclusive tag, preserving benchmark silicon unless
+///   general compilation workers are saturated.
+/// - `low_ram_tier = 1` when a worker has `< 8 GiB` total RAM (`ram_total_mb < 8192`) and the
+///   stage is neither strictly lightweight hygiene (`fmt`, `docs`, `audit`) nor explicitly
+///   targeting an auxiliary architecture (`aarch64`, `arm64`, `rpi4`). Constrained auxiliary
+///   workers therefore share hygiene stages as tier-0 peers while automatically absorbing
+///   overflow compilation, `clippy`, `riscv64` cross-compilation, and `test` stages whenever
+///   primary `>= 8 GiB` workers are occupied.
+fn worker_dispatch_tiers(worker: &ActiveWorker, required_tags: &[String]) -> (u8, u8) {
+    let stage_requests_hw = required_tags
+        .iter()
+        .any(|req| HW_EXCLUSIVE_TAGS.contains(&req.as_str()));
+    let node_is_hw = worker
+        .registration
+        .tags
+        .iter()
+        .any(|tag| HW_EXCLUSIVE_TAGS.contains(&tag.as_str()));
+    let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
+
+    let stage_is_hygiene_only = !required_tags.is_empty()
+        && required_tags
+            .iter()
+            .all(|req| HYGIENE_LIGHT_TAGS.contains(&req.as_str()));
+    let stage_requests_aux_arch = required_tags
+        .iter()
+        .any(|req| EXPLICIT_AUX_ARCH_TAGS.contains(&req.as_str()));
+    let node_is_low_ram = worker.registration.ram_total_mb > 0
+        && worker.registration.ram_total_mb < LOW_RAM_THRESHOLD_MB;
+    let low_ram_tier =
+        u8::from(node_is_low_ram && !stage_is_hygiene_only && !stage_requests_aux_arch);
+
+    (hw_tier, low_ram_tier)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_can_accept_stage(
     worker: &ActiveWorker,
@@ -256,31 +310,15 @@ impl ClusterRegistry {
         let now = Utc::now();
 
         // Collect all eligible idle nodes and balance dispatch across compilation workers:
-        // 1. Prefer fewest currently leased stages on the node (`leased_stages.len()`)
-        // 2. When a stage does not explicitly require native K3 hardware tags (`k3`, `spacemit`,
-        //    `x100`, `a100`, `native`, `ground-truth`, `bench`, `verification`), prefer general
-        //    compilation/cross-compilation nodes (`tier = 0`) over native K3 hardware (`tier = 1`)
-        //    so native silicon remains available for hardware verification/benchmarks unless all
-        //    x86_64 workers are busy.
-        // 3. Round-robin (`last_dispatched_seq`) and CPU load (`load_int`) so all eligible nodes
-        //    (e.g. `node-a` and `node-b`) share compilation evenly
-        //    without penalizing nodes that advertise extra hygiene tags (`fmt`, `audit`, `docs`).
-        const HW_EXCLUSIVE_TAGS: &[&str] = &[
-            "k3",
-            "spacemit",
-            "x100",
-            "a100",
-            "native",
-            "ground-truth",
-            "bench",
-            "verification",
-        ];
-        let stage_requests_hw = required_tags
-            .iter()
-            .any(|req| HW_EXCLUSIVE_TAGS.contains(&req.as_str()));
-        let stage_is_untagged_default =
-            required_tags.is_empty() || required_tags.iter().all(|req| req == "default");
-
+        // 1. Prefer fewest currently leased stages on the node (`leased_stages.len()`).
+        // 2. Prefer general compilation workers (`hw_tier = 0`) over native K3 benchmark silicon
+        //    (`hw_tier = 1`) unless the stage explicitly requests hardware-exclusive tags.
+        // 3. Prefer `>= 8 GiB` primary compilation workers (`low_ram_tier = 0`) over `< 8 GiB`
+        //    auxiliary workers (`low_ram_tier = 1`) for heavy compilation, cross-compilation, and
+        //    test stages while keeping `< 8 GiB` workers at `low_ram_tier = 0` for lightweight
+        //    hygiene stages (`fmt`, `docs`, `audit`) and explicit `aarch64`/`arm64` stages.
+        // 4. Round-robin (`last_dispatched_seq`) and CPU load (`load_int`) so eligible peers in
+        //    the same tier share stages evenly without penalizing nodes advertising extra tags.
         let timeout_secs = heartbeat_timeout_secs();
         type NodeDispatchScore = (usize, u8, u8, u64, i32);
         let mut best_node: Option<(String, NodeDispatchScore)> = None;
@@ -299,17 +337,7 @@ impl ClusterRegistry {
                 continue;
             }
 
-            let node_tags: HashSet<&str> = worker
-                .registration
-                .tags
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let node_is_hw = HW_EXCLUSIVE_TAGS.iter().any(|t| node_tags.contains(t));
-            let hw_tier = u8::from(!stage_requests_hw && node_is_hw);
-            let node_is_low_ram =
-                worker.registration.ram_total_mb > 0 && worker.registration.ram_total_mb < 8192;
-            let low_ram_tier = u8::from(stage_is_untagged_default && node_is_low_ram);
+            let (hw_tier, low_ram_tier) = worker_dispatch_tiers(worker, required_tags);
             let active_leases = worker.leased_stages.len();
             let load_int = (worker.cpu_load_pct * 100.0) as i32;
             let score = (
@@ -618,29 +646,30 @@ impl ClusterRegistry {
         }
 
         // 2. Check if stages.is_empty()
+        type ClaimReserveScore = (u8, u8, usize, i32);
         if stages.is_empty() {
-            let mut best_node: Option<(String, usize, i32)> = None;
+            let mut best_node: Option<(String, ClaimReserveScore)> = None;
             for (node_id, worker) in workers.iter() {
                 if !worker_can_accept_stage(worker, now, timeout_secs, &[], None, false, None, true)
                 {
                     continue;
                 }
 
+                let (hw_tier, low_ram_tier) = worker_dispatch_tiers(worker, &[]);
                 let tag_count = worker.registration.tags.len();
                 let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let candidate = (node_id.clone(), tag_count, load_int);
+                let score = (hw_tier, low_ram_tier, tag_count, load_int);
                 if match &best_node {
                     None => true,
-                    Some((best_id, best_tags, best_load)) => {
-                        (tag_count, load_int, node_id.as_str())
-                            < (*best_tags, *best_load, best_id.as_str())
+                    Some((best_id, best_score)) => {
+                        (score, node_id.as_str()) < (*best_score, best_id.as_str())
                     }
                 } {
-                    best_node = Some(candidate);
+                    best_node = Some((node_id.clone(), score));
                 }
             }
 
-            if let Some((chosen_id, _, _)) = best_node {
+            if let Some((chosen_id, _)) = best_node {
                 if let Some(worker) = workers.get_mut(&chosen_id) {
                     worker.pending_claims.insert(job_id.to_string());
                     return true;
@@ -668,7 +697,7 @@ impl ClusterRegistry {
             }
 
             let stage_limit = self.stage_concurrency_limit(job_id, &stage.id);
-            let mut best_node: Option<(String, usize, i32)> = None;
+            let mut best_node: Option<(String, ClaimReserveScore)> = None;
             for (node_id, worker) in workers.iter() {
                 if !worker_can_accept_stage(
                     worker,
@@ -683,21 +712,21 @@ impl ClusterRegistry {
                     continue;
                 }
 
+                let (hw_tier, low_ram_tier) = worker_dispatch_tiers(worker, &stage.tags);
                 let tag_count = worker.registration.tags.len();
                 let load_int = (worker.cpu_load_pct * 100.0) as i32;
-                let candidate = (node_id.clone(), tag_count, load_int);
+                let score = (hw_tier, low_ram_tier, tag_count, load_int);
                 if match &best_node {
                     None => true,
-                    Some((best_id, best_tags, best_load)) => {
-                        (tag_count, load_int, node_id.as_str())
-                            < (*best_tags, *best_load, best_id.as_str())
+                    Some((best_id, best_score)) => {
+                        (score, node_id.as_str()) < (*best_score, best_id.as_str())
                     }
                 } {
-                    best_node = Some(candidate);
+                    best_node = Some((node_id.clone(), score));
                 }
             }
 
-            if let Some((chosen_id, _, _)) = best_node {
+            if let Some((chosen_id, _)) = best_node {
                 if let Some(worker) = workers.get_mut(&chosen_id) {
                     worker.pending_claims.insert(job_id.to_string());
                     if stage.exclusive {
@@ -1417,5 +1446,260 @@ mod tests {
             .await
             .expect("should lease after memory pressure subsides");
         assert_eq!(recovered.0, "worker-aarch64");
+    }
+
+    #[test]
+    fn test_worker_dispatch_tiers_classification_under_miri() {
+        let (tx, _rx) = mpsc::channel(1);
+        let now = Utc::now();
+
+        let make_worker = |node_id: &str, arch: &str, tags: &[&str], ram_total_mb: u64| {
+            let mut reg = make_reg(node_id, tags, 1);
+            reg.arch = arch.to_string();
+            reg.ram_total_mb = ram_total_mb;
+            ActiveWorker {
+                registration: reg,
+                leased_stages: HashSet::new(),
+                exclusive_lease: None,
+                pending_claims: HashSet::new(),
+                pending_exclusive_claim: None,
+                cpu_load_pct: 0.0,
+                ram_used_mb: 0,
+                last_heartbeat: now,
+                last_dispatched_seq: 0,
+                command_tx: tx.clone(),
+            }
+        };
+
+        let primary = make_worker(
+            "node-a",
+            "x86_64",
+            &[
+                "x86_64",
+                "fmt",
+                "docs",
+                "audit",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+            ],
+            16384,
+        );
+        let aux_low_ram = make_worker(
+            "worker-aarch64",
+            "aarch64",
+            &[
+                "aarch64",
+                "arm64",
+                "rpi4",
+                "fmt",
+                "docs",
+                "audit",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+            ],
+            3793,
+        );
+        let hw_riscv64 = make_worker(
+            "worker-riscv64",
+            "riscv64gc",
+            &["riscv64", "spacemit", "k3", "x100", "a100", "native"],
+            32768,
+        );
+
+        // Hygiene stages keep < 8 GiB auxiliary worker in tier (0, 0)
+        for tag in ["fmt", "docs", "audit"] {
+            let req = vec![tag.to_string()];
+            assert_eq!(worker_dispatch_tiers(&primary, &req), (0, 0));
+            assert_eq!(worker_dispatch_tiers(&aux_low_ram, &req), (0, 0));
+        }
+
+        // Explicit auxiliary architecture stages keep < 8 GiB worker in tier (0, 0)
+        for tag in ["aarch64", "arm64", "rpi4"] {
+            let req = vec![tag.to_string(), "build".to_string()];
+            assert_eq!(worker_dispatch_tiers(&aux_low_ram, &req), (0, 0));
+        }
+
+        // Heavy compilation, clippy, test, and riscv64 cross-compile stages rank:
+        // primary (0, 0) < aux_low_ram (0, 1) < hw_riscv64 (1, 0)
+        for req in [
+            vec![],
+            vec!["default".to_string()],
+            vec!["clippy".to_string()],
+            vec!["build".to_string()],
+            vec!["test".to_string()],
+            vec!["riscv64".to_string()],
+            vec!["cross-compile".to_string(), "riscv64".to_string()],
+        ] {
+            assert_eq!(worker_dispatch_tiers(&primary, &req), (0, 0));
+            assert_eq!(worker_dispatch_tiers(&aux_low_ram, &req), (0, 1));
+            assert_eq!(worker_dispatch_tiers(&hw_riscv64, &req), (1, 0));
+        }
+
+        // Explicit K3 hardware stages promote hw_riscv64 to tier (0, 0)
+        let req_k3 = vec!["k3".to_string(), "native".to_string()];
+        assert_eq!(worker_dispatch_tiers(&hw_riscv64, &req_k3), (0, 0));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_low_ram_overflow_compilation_and_riscv64_cross_compile() {
+        let cluster = ClusterRegistry::new();
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let (tx_aux, _rx_aux) = mpsc::channel(8);
+        let (tx_k3, _rx_k3) = mpsc::channel(8);
+
+        let mut reg_a = make_reg(
+            "node-a",
+            &[
+                "x86_64",
+                "linux",
+                "fmt",
+                "audit",
+                "docs",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+            ],
+            1,
+        );
+        reg_a.ram_total_mb = 16384;
+        cluster.register(reg_a, tx_a).await;
+
+        let mut reg_b = make_reg(
+            "node-b",
+            &[
+                "x86_64",
+                "linux",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+            ],
+            1,
+        );
+        reg_b.ram_total_mb = 32768;
+        cluster.register(reg_b, tx_b).await;
+
+        let mut reg_aux = make_reg(
+            "worker-aarch64",
+            &[
+                "aarch64",
+                "arm64",
+                "linux",
+                "rpi4",
+                "fmt",
+                "docs",
+                "audit",
+                "clippy",
+                "cross-compile",
+                "riscv64",
+                "build",
+                "test",
+                "sccache",
+            ],
+            1,
+        );
+        reg_aux.arch = "aarch64".to_string();
+        reg_aux.ram_total_mb = 3793;
+        cluster.register(reg_aux, tx_aux).await;
+
+        let mut reg_k3 = make_reg(
+            "worker-riscv64",
+            &["riscv64", "spacemit", "k3", "x100", "a100", "native"],
+            1,
+        );
+        reg_k3.arch = "riscv64gc".to_string();
+        reg_k3.ram_total_mb = 32768;
+        cluster.register(reg_k3, tx_k3).await;
+
+        // 1. When primary >= 8 GiB nodes are idle, tagged build/clippy/riscv64 stages use node-a & node-b first
+        let req_riscv64 = vec!["cross-compile".to_string(), "riscv64".to_string()];
+        let l1 = cluster
+            .lease_slot("job-1", "riscv64-build-1", &req_riscv64, None, false)
+            .await
+            .expect("primary node-a");
+        assert_eq!(l1.0, "node-a");
+
+        let l2 = cluster
+            .lease_slot("job-2", "riscv64-build-2", &req_riscv64, None, false)
+            .await
+            .expect("primary node-b");
+        assert_eq!(l2.0, "node-b");
+
+        // 2. Once both >= 8 GiB x86_64 nodes are occupied, worker-aarch64 absorbs overflow
+        //    for riscv64 cross-compile / build / clippy / test BEFORE touching K3 silicon!
+        let l3 = cluster
+            .lease_slot("job-3", "riscv64-build-3", &req_riscv64, None, false)
+            .await
+            .expect("overflow worker-aarch64");
+        assert_eq!(l3.0, "worker-aarch64");
+
+        // 3. If a 4th riscv64 stage arrives while node-a, node-b, and worker-aarch64 are all busy,
+        //    worker-riscv64 takes last-resort overflow when tags match ("riscv64").
+        let l4 = cluster
+            .lease_slot(
+                "job-4",
+                "riscv64-only-4",
+                &["riscv64".to_string()],
+                None,
+                false,
+            )
+            .await
+            .expect("last-resort worker-riscv64");
+        assert_eq!(l4.0, "worker-riscv64");
+
+        cluster
+            .release_stage_slot("node-a", "job-1", "riscv64-build-1")
+            .await;
+        cluster
+            .release_stage_slot("node-b", "job-2", "riscv64-build-2")
+            .await;
+        cluster
+            .release_stage_slot("worker-aarch64", "job-3", "riscv64-build-3")
+            .await;
+        cluster
+            .release_stage_slot("worker-riscv64", "job-4", "riscv64-only-4")
+            .await;
+
+        // 4. Verify sync_and_try_reserve_for_claim mirrors the exact same primary -> low-RAM overflow tiering
+        let build_stages = vec![crate::job::StageRecord {
+            id: "build-check".to_string(),
+            name: "Build Workspace".to_string(),
+            tags: vec!["build".to_string()],
+            threads: 2,
+            toolchain: None,
+            depends_on: Vec::new(),
+            status: crate::job::StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+        }];
+        let mut active_unleased = HashSet::new();
+        for jid in ["claim-1", "claim-2", "claim-3"] {
+            active_unleased.insert(jid.to_string());
+            assert!(
+                cluster
+                    .sync_and_try_reserve_for_claim(&active_unleased, jid, &build_stages)
+                    .await,
+                "{jid} should reserve an available build slot"
+            );
+        }
+        // All 3 build-capable nodes (node-a, node-b, worker-aarch64) now hold pending claims;
+        // worker-riscv64 lacks the "build" tag, so a 4th claim returns false.
+        active_unleased.insert("claim-4".to_string());
+        assert!(
+            !cluster
+                .sync_and_try_reserve_for_claim(&active_unleased, "claim-4", &build_stages)
+                .await
+        );
     }
 }
