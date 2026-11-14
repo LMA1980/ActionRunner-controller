@@ -190,6 +190,7 @@ on_action:
         toolchains: vec!["system".to_string()],
         use_btrfs: false,
         isolation_mode: IsolationMode::None,
+        rust_semver: None,
     };
 
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -233,6 +234,7 @@ on_action:
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
 
     let log_file = PathBuf::from(format!("logs/{}/{}.log", repo_name, job.id));
@@ -491,6 +493,7 @@ edition = "2021"
             toolchains: vec!["system".to_string()],
             use_btrfs: false,
             isolation_mode: IsolationMode::None,
+            rust_semver: None,
         };
         let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let worker = WorkerAgent::new(worker_config);
@@ -530,6 +533,7 @@ edition = "2021"
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let log_file = PathBuf::from(format!("logs/{}/{}.log", repo_name, job.id));
         job_store.enqueue_job(job, log_file).await;
@@ -845,6 +849,7 @@ edition = "2021"
         toolchains: vec!["system".to_string()],
         use_btrfs: false,
         isolation_mode: IsolationMode::None,
+        rust_semver: None,
     };
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let worker = WorkerAgent::new(worker_config);
@@ -871,6 +876,7 @@ edition = "2021"
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     job_store
         .enqueue_job(job1, PathBuf::from("logs/job1.log"))
@@ -887,6 +893,7 @@ edition = "2021"
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     job_store
         .enqueue_job(job2, PathBuf::from("logs/job2.log"))

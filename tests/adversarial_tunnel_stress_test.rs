@@ -181,6 +181,7 @@ async fn test_adversarial_leader_demotion_evicts_concurrent_workers_within_500ms
             ram_total_mb: 8192,
             toolchains: vec!["system".to_string()],
             btrfs_enabled: false,
+            rust_semver: None,
         };
         let payload = fory.serialize(&reg).unwrap();
         let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
@@ -314,6 +315,7 @@ async fn test_adversarial_demoted_controller_suppresses_pong_on_ping() {
         ram_total_mb: 4096,
         toolchains: vec!["system".to_string()],
         btrfs_enabled: false,
+        rust_semver: None,
     };
     let payload = fory.serialize(&reg).unwrap();
     let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
@@ -386,6 +388,7 @@ async fn test_adversarial_demoted_controller_suppresses_heartbeat_pong() {
         ram_total_mb: 4096,
         toolchains: vec!["system".to_string()],
         btrfs_enabled: false,
+        rust_semver: None,
     };
     let payload = fory.serialize(&reg).unwrap();
     let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
@@ -476,6 +479,7 @@ async fn test_adversarial_disconnect_flood_no_leaks() {
                 ram_total_mb: 1024,
                 toolchains: vec!["system".to_string()],
                 btrfs_enabled: false,
+                rust_semver: None,
             };
             let payload = fory.serialize(&reg).unwrap();
             let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
@@ -583,6 +587,7 @@ async fn test_adversarial_demotion_eviction_under_channel_backpressure() {
         ram_total_mb: 8192,
         toolchains: vec!["system".to_string()],
         btrfs_enabled: false,
+        rust_semver: None,
     };
     let payload = fory.serialize(&reg).unwrap();
     let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);

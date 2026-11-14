@@ -235,6 +235,7 @@ async fn test_unauthenticated_cluster_nodes_redacts_all_registered_workers() {
             toolchains: vec![],
             ram_total_mb: 32768,
             btrfs_enabled: true,
+            rust_semver: None,
         };
         state.cluster.register(reg, cmd_tx).await;
     }
@@ -380,6 +381,7 @@ async fn test_unauthenticated_queue_and_jobs_redacts_node_and_stage_metadata() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store
@@ -400,6 +402,9 @@ async fn test_unauthenticated_queue_and_jobs_redacts_node_and_stage_metadata() {
         },
         assigned_node: Some(node_a.clone()),
         exclusive: false,
+        skip_if_unavailable: false,
+        skip_reason_code: None,
+        skip_capability: None,
     };
     state.job_store.set_stages(job_id, vec![stage]).await;
 
@@ -584,6 +589,7 @@ async fn test_adversarial_mixed_case_and_fqdn_sanitization() {
                 toolchains: vec![],
                 ram_total_mb: 16384,
                 btrfs_enabled: false,
+                rust_semver: None,
             };
             state.cluster.register(reg, cmd_tx).await;
         }
@@ -676,6 +682,7 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
                 toolchains: vec![],
                 ram_total_mb: 32768,
                 btrfs_enabled: true,
+                rust_semver: None,
             },
             cmd_tx1,
         )
@@ -693,6 +700,7 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
                 toolchains: vec![],
                 ram_total_mb: 8192,
                 btrfs_enabled: false,
+                rust_semver: None,
             },
             cmd_tx2,
         )
@@ -709,6 +717,7 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store
@@ -729,6 +738,9 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
             },
             assigned_node: Some(raw_node_e.clone()),
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         },
         StageRecord {
             id: "stage-tb".to_string(),
@@ -744,6 +756,9 @@ async fn test_adversarial_endpoints_privacy_across_all_routes() {
             },
             assigned_node: Some(raw_node_tb.clone()),
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         },
     ];
     state.job_store.set_stages(job_id, stages).await;
@@ -908,6 +923,7 @@ async fn test_unauthenticated_events_stream_sanitization_in_open_mode() {
                 toolchains: vec![],
                 ram_total_mb: 8192,
                 btrfs_enabled: false,
+                rust_semver: None,
             },
             cmd_tx,
         )
@@ -923,6 +939,7 @@ async fn test_unauthenticated_events_stream_sanitization_in_open_mode() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store
@@ -945,6 +962,9 @@ async fn test_unauthenticated_events_stream_sanitization_in_open_mode() {
                 },
                 assigned_node: Some(raw_node_tb.clone()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         )
         .await;
@@ -1000,6 +1020,7 @@ async fn test_adversarial_bare_domain_check() {
                 toolchains: vec![],
                 ram_total_mb: 16384,
                 btrfs_enabled: false,
+                rust_semver: None,
             },
             cmd_tx,
         )

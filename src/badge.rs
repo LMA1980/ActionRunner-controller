@@ -706,6 +706,7 @@ mod tests {
             commit_sha: "22c90697a3708061bdae86c4e8cc91094ec297bc".to_string(),
             ref_name: ref_name.to_string(),
             sender: "LMA1980".to_string(),
+            pr_number: None,
             queued_at: Utc::now(),
         }
     }

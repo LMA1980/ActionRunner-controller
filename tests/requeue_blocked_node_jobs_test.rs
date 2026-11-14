@@ -20,6 +20,7 @@ fn make_worker_reg(node_id: &str, arch: &str, tags: &[&str], max_slots: u32) -> 
         ram_total_mb: 32768,
         btrfs_enabled: false,
         toolchains: vec!["system".to_string()],
+        rust_semver: None,
     }
 }
 
@@ -219,6 +220,7 @@ on_action:
             ref_name: "refs/heads/main".to_string(),
             sender: "ci-bot".to_string(),
             queued_at: t0 + ChronoDuration::seconds((idx as i64) * 10),
+            pr_number: None,
         };
         job_store
             .enqueue_job(job, PathBuf::from(format!("logs/{repo_name}/{job_id}.log")))
@@ -244,6 +246,7 @@ on_action:
             ref_name: "refs/heads/main".to_string(),
             sender: "ci-bot".to_string(),
             queued_at: t0 + ChronoDuration::seconds(100 + (idx as i64) * 10),
+            pr_number: None,
         };
         job_store
             .enqueue_job(job, PathBuf::from(format!("logs/{repo_name}/{job_id}.log")))
@@ -430,6 +433,7 @@ async fn test_orphan_running_jobs_self_heal_to_queued_and_unblock_capacity() {
             ref_name: "refs/heads/main".to_string(),
             sender: "ci-bot".to_string(),
             queued_at: t0 + ChronoDuration::seconds((idx as i64) * 5),
+            pr_number: None,
         };
         store
             .enqueue_job(job, PathBuf::from(format!("logs/orphan-{idx}.log")))
@@ -451,6 +455,9 @@ async fn test_orphan_running_jobs_self_heal_to_queued_and_unblock_capacity() {
                         },
                         assigned_node: Some("node-a".to_string()),
                         exclusive: false,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                     StageRecord {
                         id: "stage-k3".to_string(),
@@ -462,6 +469,9 @@ async fn test_orphan_running_jobs_self_heal_to_queued_and_unblock_capacity() {
                         status: StageStatus::Pending,
                         assigned_node: None,
                         exclusive: true,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                 ],
             )
@@ -487,6 +497,7 @@ async fn test_orphan_running_jobs_self_heal_to_queued_and_unblock_capacity() {
         ref_name: "refs/heads/main".to_string(),
         sender: "ci-bot".to_string(),
         queued_at: t0 + ChronoDuration::seconds(50),
+        pr_number: None,
     };
     store
         .enqueue_job(runnable, PathBuf::from("logs/runnable-4.log"))
@@ -504,6 +515,9 @@ async fn test_orphan_running_jobs_self_heal_to_queued_and_unblock_capacity() {
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         )
         .await;
@@ -560,6 +574,7 @@ async fn test_claim_and_lease_eligibility_parity_for_stage_concurrency_limit() {
         ref_name: "refs/heads/main".to_string(),
         sender: "ci-bot".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     store
         .enqueue_job(job2, PathBuf::from("logs/limited-2.log"))
@@ -577,6 +592,9 @@ async fn test_claim_and_lease_eligibility_parity_for_stage_concurrency_limit() {
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         )
         .await;
@@ -680,6 +698,7 @@ on_action:
         ref_name: "refs/heads/main".to_string(),
         sender: "ci-bot".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     job_store
         .enqueue_job(job, PathBuf::from("logs/closed-chan-1.log"))

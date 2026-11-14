@@ -6,6 +6,10 @@ use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
@@ -15,6 +19,8 @@ pub struct Job {
     pub commit_sha: String,
     pub ref_name: String,
     pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
     pub queued_at: DateTime<Utc>,
 }
 
@@ -106,6 +112,12 @@ pub struct StageRecord {
     pub assigned_node: Option<String>,
     #[serde(default)]
     pub exclusive: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_if_unavailable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1384,25 +1396,52 @@ impl JobStore {
     }
 
     pub async fn update_stage_status(&self, job_id: &str, stage_id: &str, status: StageStatus) {
+        self.mutate_stage(job_id, stage_id, |stage, record_status| {
+            if let StageStatus::Assigned { ref node_id, .. }
+            | StageStatus::Running { ref node_id, .. } = status
+            {
+                stage.assigned_node = Some(node_id.clone());
+            }
+            stage.status = status;
+            if matches!(
+                stage.status,
+                StageStatus::Assigned { .. } | StageStatus::Running { .. }
+            ) && matches!(*record_status, JobStatus::Queued)
+            {
+                *record_status = JobStatus::Running {
+                    started_at: Utc::now(),
+                };
+            }
+        })
+        .await;
+    }
+
+    /// Transitions a stage to `StageStatus::Skipped` with structured observability fields.
+    pub async fn mark_stage_skipped_unavailable(
+        &self,
+        job_id: &str,
+        stage_id: &str,
+        reason: String,
+        reason_code: String,
+        capability: String,
+    ) {
+        self.mutate_stage(job_id, stage_id, |stage, _| {
+            stage.status = StageStatus::Skipped { reason };
+            stage.skip_reason_code = Some(reason_code);
+            stage.skip_capability = Some(capability);
+        })
+        .await;
+    }
+
+    async fn mutate_stage<F>(&self, job_id: &str, stage_id: &str, f: F)
+    where
+        F: FnOnce(&mut StageRecord, &mut JobStatus),
+    {
         let updated = {
             let mut store = self.inner.write().await;
             if let Some(record) = store.iter_mut().find(|r| r.job.id == job_id) {
                 if let Some(stage) = record.stages.iter_mut().find(|s| s.id == stage_id) {
-                    if let StageStatus::Assigned { ref node_id, .. }
-                    | StageStatus::Running { ref node_id, .. } = status
-                    {
-                        stage.assigned_node = Some(node_id.clone());
-                    }
-                    stage.status = status;
-                    if matches!(
-                        stage.status,
-                        StageStatus::Assigned { .. } | StageStatus::Running { .. }
-                    ) && matches!(record.status, JobStatus::Queued)
-                    {
-                        record.status = JobStatus::Running {
-                            started_at: Utc::now(),
-                        };
-                    }
+                    f(stage, &mut record.status);
                     record.updated_at = Utc::now();
                 }
                 Some(record.clone())
@@ -1790,6 +1829,7 @@ pub fn extract_submodule_job(parent_record: &JobRecord, submodule: &str) -> Opti
                 commit_sha: parent_record.job.commit_sha.clone(),
                 ref_name: parent_record.job.ref_name.clone(),
                 sender: parent_record.job.sender.clone(),
+                pr_number: parent_record.job.pr_number,
                 queued_at: parent_record.job.queued_at,
             };
             return Some(JobRecord {
@@ -1997,6 +2037,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
 
         let mut submodules = BTreeMap::new();
@@ -2094,6 +2135,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res1 = store
             .enqueue_job(job1.clone(), PathBuf::from("logs/job1.log"))
@@ -2115,6 +2157,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res2 = store
             .enqueue_job(job2_old.clone(), PathBuf::from("logs/job2.log"))
@@ -2131,6 +2174,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res3 = store
             .enqueue_job(job3_other.clone(), PathBuf::from("logs/job3.log"))
@@ -2147,6 +2191,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res4 = store
             .enqueue_job(job4_new.clone(), PathBuf::from("logs/job4.log"))
@@ -2188,6 +2233,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let job_repo_a2 = Job {
             id: "job-a2".to_string(),
@@ -2198,6 +2244,7 @@ mod tests {
             ref_name: "refs/heads/feat/branch-2".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let job_repo_b1 = Job {
             id: "job-b1".to_string(),
@@ -2208,6 +2255,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
 
         store
@@ -2277,6 +2325,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_merge = store
             .enqueue_job(merge_job, PathBuf::from("logs/merge.log"))
@@ -2294,6 +2343,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_push = store
             .enqueue_job(push_job, PathBuf::from("logs/push.log"))
@@ -2316,6 +2366,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_push_first = store
             .enqueue_job(push_first, PathBuf::from("logs/push2.log"))
@@ -2332,6 +2383,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_merge_second = store
             .enqueue_job(merge_second, PathBuf::from("logs/merge2.log"))
@@ -2363,6 +2415,7 @@ mod tests {
             ref_name: "feat/my-feature".to_string(), // PR format
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_pr = store
             .enqueue_job(pr_first, PathBuf::from("logs/pr1.log"))
@@ -2379,6 +2432,7 @@ mod tests {
             ref_name: "refs/heads/feat/my-feature".to_string(), // push format
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_push = store
             .enqueue_job(push_second, PathBuf::from("logs/push_sec.log"))
@@ -2401,6 +2455,7 @@ mod tests {
             ref_name: "refs/heads/feat/another".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_push_q = store
             .enqueue_job(push_queued, PathBuf::from("logs/push_q.log"))
@@ -2417,6 +2472,7 @@ mod tests {
             ref_name: "feat/another".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_pr_wins = store
             .enqueue_job(pr_second, PathBuf::from("logs/pr_wins.log"))
@@ -2450,6 +2506,7 @@ mod tests {
             ref_name: "refs/heads/feat/hotfix".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         store
             .enqueue_job(push_running, PathBuf::from("logs/push_act.log"))
@@ -2467,6 +2524,7 @@ mod tests {
             ref_name: "feat/hotfix".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res = store
             .enqueue_job(pr_incoming, PathBuf::from("logs/pr_ovr.log"))
@@ -2497,6 +2555,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res1 = store.enqueue_job(job1, PathBuf::from("logs/j1.log")).await;
         assert!(!res1.ignored);
@@ -2510,6 +2569,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res2 = store.enqueue_job(job2, PathBuf::from("logs/j2.log")).await;
         assert!(res2.ignored);
@@ -2536,6 +2596,7 @@ mod tests {
             ref_name: "feat/cool-thing".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         store
             .enqueue_job(pr_job, PathBuf::from("logs/pr.log"))
@@ -2561,6 +2622,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_merge = store
             .enqueue_job(merge_main, PathBuf::from("logs/merge.log"))
@@ -2582,6 +2644,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         let res_push = store
             .enqueue_job(push_main, PathBuf::from("logs/push.log"))
@@ -2606,6 +2669,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
 
         store
@@ -2625,6 +2689,9 @@ mod tests {
                 },
                 assigned_node: Some("node-1".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
             StageRecord {
                 id: "test".to_string(),
@@ -2638,6 +2705,9 @@ mod tests {
                 },
                 assigned_node: Some("node-2".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
             StageRecord {
                 id: "bench".to_string(),
@@ -2649,6 +2719,9 @@ mod tests {
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
         ];
         store.set_stages(&job.id, stages).await;
@@ -2706,6 +2779,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(100),
+            pr_number: None,
         };
         let job2 = Job {
             id: "job-2-queued".to_string(),
@@ -2716,6 +2790,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(50),
+            pr_number: None,
         };
 
         store
@@ -2759,6 +2834,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
 
         store
@@ -2787,6 +2863,9 @@ mod tests {
                 },
                 assigned_node: Some("worker-riscv64".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
             StageRecord {
                 id: "stage-2".to_string(),
@@ -2801,6 +2880,9 @@ mod tests {
                 },
                 assigned_node: Some("storage-node".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
         ];
         store.set_stages(&job.id, stages).await;
@@ -2842,6 +2924,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(500),
+            pr_number: None,
         };
         store
             .enqueue_job(quiet_job.clone(), PathBuf::from("logs/ipc.log"))
@@ -2883,6 +2966,7 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
                 sender: "LMA1980".to_string(),
                 queued_at: Utc::now() - chrono::Duration::seconds(400 - i * 10),
+                pr_number: None,
             };
             store
                 .enqueue_job(noisy_job.clone(), PathBuf::from("logs/noisy.log"))
@@ -2924,6 +3008,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(20),
+            pr_number: None,
         };
         store
             .enqueue_job(queued_1.clone(), PathBuf::from("logs/q1.log"))
@@ -2938,6 +3023,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(10),
+            pr_number: None,
         };
         let enq_res = store
             .enqueue_job(queued_2.clone(), PathBuf::from("logs/q2.log"))
@@ -3016,6 +3102,7 @@ mod tests {
                     ram_total_mb: 32768,
                     btrfs_enabled: true,
                     toolchains: vec!["system".to_string()],
+                    rust_semver: None,
                 },
                 tx_x86,
             )
@@ -3032,6 +3119,7 @@ mod tests {
                     ram_total_mb: 32768,
                     btrfs_enabled: false,
                     toolchains: vec!["system".to_string()],
+                    rust_semver: None,
                 },
                 tx_rv,
             )
@@ -3052,6 +3140,7 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
                 sender: "LMA1980".to_string(),
                 queued_at: t0 + chrono::Duration::seconds((idx as i64) * 10),
+                pr_number: None,
             };
             store
                 .enqueue_job(job, PathBuf::from(format!("logs/{}.log", idx + 1)))
@@ -3086,6 +3175,9 @@ mod tests {
                         },
                         assigned_node: Some("node-a".to_string()),
                         exclusive: false,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                     StageRecord {
                         id: "test-check".to_string(),
@@ -3101,6 +3193,9 @@ mod tests {
                         },
                         assigned_node: Some("worker-riscv64".to_string()),
                         exclusive: true,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                 ],
             )
@@ -3130,6 +3225,9 @@ mod tests {
                         },
                         assigned_node: Some("node-a".to_string()),
                         exclusive: false,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                     StageRecord {
                         id: "test-check".to_string(),
@@ -3141,6 +3239,9 @@ mod tests {
                         status: StageStatus::Pending,
                         assigned_node: None,
                         exclusive: true,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                 ],
             )
@@ -3202,6 +3303,7 @@ mod tests {
                     ram_total_mb: 32768,
                     btrfs_enabled: false,
                     toolchains: vec!["system".to_string()],
+                    rust_semver: None,
                 },
                 tx,
             )
@@ -3218,6 +3320,7 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
                 sender: "LMA1980".to_string(),
                 queued_at: t0 + chrono::Duration::seconds((idx as i64) * 10),
+                pr_number: None,
             };
             store
                 .enqueue_job(job, PathBuf::from(format!("logs/{}.log", idx)))
@@ -3240,6 +3343,9 @@ mod tests {
                             },
                             assigned_node: Some("node-x".to_string()),
                             exclusive: false,
+                            skip_if_unavailable: false,
+                            skip_reason_code: None,
+                            skip_capability: None,
                         },
                         StageRecord {
                             id: "test-check".to_string(),
@@ -3251,6 +3357,9 @@ mod tests {
                             status: StageStatus::Pending,
                             assigned_node: None,
                             exclusive: true,
+                            skip_if_unavailable: false,
+                            skip_reason_code: None,
+                            skip_capability: None,
                         },
                     ],
                 )
@@ -3308,6 +3417,7 @@ mod tests {
                     ram_total_mb: 32768,
                     btrfs_enabled: false,
                     toolchains: vec!["system".to_string()],
+                    rust_semver: None,
                 },
                 tx,
             )
@@ -3336,6 +3446,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now(),
+            pr_number: None,
         };
         store
             .enqueue_job(job, PathBuf::from("logs/exclusive.log"))
@@ -3354,6 +3465,9 @@ mod tests {
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: true,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -3393,6 +3507,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(30),
+            pr_number: None,
         };
         store
             .enqueue_job(job.clone(), PathBuf::from("logs/test.log"))
@@ -3408,6 +3523,9 @@ mod tests {
             status: StageStatus::Pending,
             assigned_node: None,
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         };
         store.set_stages(&job.id, vec![stage]).await;
 
@@ -3475,6 +3593,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(60),
+            pr_number: None,
         };
         store
             .enqueue_job(job1.clone(), PathBuf::from("logs/job1.log"))
@@ -3492,6 +3611,9 @@ mod tests {
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -3523,6 +3645,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: Utc::now() - chrono::Duration::seconds(45),
+            pr_number: None,
         };
         store
             .enqueue_job(job2.clone(), PathBuf::from("logs/job2.log"))
@@ -3546,6 +3669,9 @@ mod tests {
                         },
                         assigned_node: Some("worker-b".to_string()),
                         exclusive: false,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                     StageRecord {
                         id: "stage-bench".to_string(),
@@ -3557,6 +3683,9 @@ mod tests {
                         status: StageStatus::Pending,
                         assigned_node: None,
                         exclusive: false,
+                        skip_if_unavailable: false,
+                        skip_reason_code: None,
+                        skip_capability: None,
                     },
                 ],
             )
@@ -3586,6 +3715,9 @@ mod tests {
                 status: StageStatus::Pending, // stale: not running, no PID
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         };
         store.storage().upsert_record(&stale_j1);
@@ -3608,6 +3740,9 @@ mod tests {
                 status: StageStatus::Pending, // stale: not completed
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         };
         store.storage().upsert_record(&stale_j2);
@@ -3670,6 +3805,7 @@ mod tests {
                     ref_name: "refs/heads/main".to_string(),
                     sender: "LMA1980".to_string(),
                     queued_at: t0,
+                    pr_number: None,
                 },
                 log_file: PathBuf::from("logs/test.log"),
                 status,
@@ -3698,6 +3834,9 @@ mod tests {
             status: StageStatus::Pending,
             assigned_node: None,
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         };
         let local_queued_with_stages =
             make_rec("j2", JobStatus::Queued, t0, vec![stage_pending.clone()]);
@@ -3751,6 +3890,9 @@ mod tests {
             },
             assigned_node: Some("worker-1".to_string()),
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         };
         let local_active_stage = make_rec(
             "j6",
@@ -3784,6 +3926,9 @@ mod tests {
             },
             assigned_node: Some("worker-1".to_string()),
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         };
         let local_completed_more = make_rec(
             "j7",
@@ -3816,6 +3961,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now,
+            pr_number: None,
         };
         store.enqueue_job(job1, PathBuf::from("/tmp/j1.log")).await;
 
@@ -3839,6 +3985,9 @@ mod tests {
                     },
                     assigned_node: Some("node-1".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -3883,6 +4032,7 @@ mod tests {
             ref_name: "refs/heads/feat".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now + chrono::Duration::seconds(5),
+            pr_number: None,
         };
         store.enqueue_job(job2, PathBuf::from("/tmp/j2.log")).await;
 
@@ -3909,6 +4059,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now + chrono::Duration::seconds(10),
+            pr_number: None,
         };
         store.enqueue_job(job3, PathBuf::from("/tmp/j3.log")).await;
 
@@ -3935,6 +4086,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now,
+            pr_number: None,
         };
         store.enqueue_job(job1, PathBuf::from("/tmp/p1.log")).await;
         store
@@ -3950,6 +4102,9 @@ mod tests {
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -3984,6 +4139,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now,
+            pr_number: None,
         };
         store.enqueue_job(job2, PathBuf::from("/tmp/p2.log")).await;
         store
@@ -3999,6 +4155,9 @@ mod tests {
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -4031,6 +4190,7 @@ mod tests {
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now,
+            pr_number: None,
         };
         store.enqueue_job(job, PathBuf::from("/tmp/f1.log")).await;
 
@@ -4128,6 +4288,7 @@ mod tests {
             ref_name: "feat/issue-40-matvec-q5k".to_string(),
             sender: "LMA1980".to_string(),
             queued_at: now,
+            pr_number: None,
         };
         store.enqueue_job(job, PathBuf::from("/tmp/7of7.log")).await;
 
@@ -4153,6 +4314,9 @@ mod tests {
                     },
                     assigned_node: Some("worker-riscv64".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 }],
             )
             .await;
@@ -4197,6 +4361,7 @@ mod tests {
                 ref_name: "main".to_string(),
                 sender: "LMA1980".to_string(),
                 queued_at: now,
+                pr_number: None,
             },
             status: JobStatus::Running { started_at: now },
             log_file: PathBuf::from("logs/s1.log"),
@@ -4216,6 +4381,9 @@ mod tests {
                 },
                 assigned_node: Some("node-a".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         };
         let mut remote_completed = local_running_stage.clone();

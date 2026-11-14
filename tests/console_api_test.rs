@@ -231,6 +231,7 @@ async fn completed_job(
         ref_name: ref_name.to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now() - ChronoDuration::minutes(age_mins),
+        pr_number: None,
     };
     store
         .enqueue_job(job, PathBuf::from(format!("logs/{id}.log")))
@@ -558,6 +559,9 @@ async fn topology_tracks_simulated_webhooks() {
         status: StageStatus::Pending,
         assigned_node: None,
         exclusive: false,
+        skip_if_unavailable: false,
+        skip_reason_code: None,
+        skip_capability: None,
     };
     state
         .job_store
@@ -788,6 +792,9 @@ async fn sse_emits_additive_console_kinds_and_filters_private() {
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         )
         .await;
@@ -832,6 +839,7 @@ async fn sse_emits_additive_console_kinds_and_filters_private() {
                 ram_total_mb: 1024,
                 btrfs_enabled: false,
                 toolchains: vec!["system".to_string()],
+                rust_semver: None,
             },
             cmd_tx,
         )
@@ -1796,6 +1804,7 @@ async fn anonymous_job_sse_streams_sanitized_log_init_and_shared_storage_deltas(
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store

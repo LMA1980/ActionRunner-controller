@@ -10,7 +10,7 @@ use crate::cluster::{ClusterRegistry, WorkerCommand};
 use crate::config::Config;
 use crate::job::{Job, JobStatus, JobStore, StageRecord, StageStatus};
 use crate::storage_backend::job_root_trace_context;
-use crate::workflow::{ActionRunnerWorkflow, StageConfig};
+use crate::workflow::{ActionRunnerWorkflow, StageConfig, UnavailableAction};
 use mu_ci_ipc::{
     NetworkEgressMode, SandboxBackendKind, SandboxConstraintSpec, SccacheMode, StageDispatchTask,
     TypedTaskInvocation,
@@ -440,6 +440,78 @@ impl DAGScheduler {
             }
         };
 
+        // 1b. Validate v4 toolchain.min_version against canonical cluster Rust semver (#185)
+        if let Some(min_ver) = workflow
+            .toolchain
+            .as_ref()
+            .and_then(|t| t.min_version.as_deref())
+        {
+            match self.cluster.validate_workflow_min_version(min_ver).await {
+                Ok(tc_snap) => {
+                    if tc_snap.drift_detected {
+                        let drift_summary: Vec<String> = tc_snap
+                            .drift_details
+                            .iter()
+                            .map(|d| format!("{}: {}", d.node_id, d.reason))
+                            .collect();
+                        warn!(
+                            job_id = %job.id,
+                            min_version = %min_ver,
+                            canonical_semver = ?tc_snap.canonical_semver,
+                            drift = %drift_summary.join("; "),
+                            "Cluster Rust toolchain drift detected while validating workflow min_version"
+                        );
+                        self.job_store.append_job_log(
+                            &job.id,
+                            &format!(
+                                "[controller] warning=toolchain_drift canonical={:?} details=\"{}\"\n",
+                                tc_snap.canonical_semver,
+                                drift_summary.join("; ")
+                            ),
+                        );
+                    }
+                }
+                Err(crate::cluster::ClusterToolchainError::MissingWorkerSemver { .. }) => {
+                    warn!(
+                        job_id = %job.id,
+                        min_version = %min_ver,
+                        "No live worker reported rust_semver; proceeding under 3-phase migration compatibility"
+                    );
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    warn!(
+                        job_id = %job.id,
+                        min_version = %min_ver,
+                        error = %err_msg,
+                        "Failing job fast due to workflow toolchain.min_version check"
+                    );
+                    self.job_store.append_job_log(
+                        &job.id,
+                        &format!("[controller] status=failed error=\"{}\"\n", err_msg),
+                    );
+                    self.job_store
+                        .update_status(
+                            &job.id,
+                            JobStatus::Failed {
+                                error: err_msg.clone(),
+                            },
+                        )
+                        .await;
+                    self.report_github_status(
+                        &job.repo_name,
+                        &job.commit_sha,
+                        "failure",
+                        &err_msg,
+                        Some(&target_url),
+                    )
+                    .await;
+                    self.job_store.flush_job_log(Some(&job.id));
+                    return;
+                }
+            }
+        }
+
         // 2. Initialize or preserve existing stage records in job store
         let existing_stages = self.job_store.get_stages(&job.id).await;
         let stage_records: Vec<StageRecord> = if !existing_stages.is_empty() {
@@ -466,6 +538,10 @@ impl DAGScheduler {
                         }
                         existing.tags = workflow.effective_stage_tags(s);
                         existing.exclusive = s.exclusive;
+                        existing.skip_if_unavailable = s
+                            .if_unavailable
+                            .as_ref()
+                            .is_some_and(|p| p.policy == UnavailableAction::Skip);
                         existing
                     } else {
                         StageRecord {
@@ -478,6 +554,12 @@ impl DAGScheduler {
                             status: StageStatus::Pending,
                             assigned_node: None,
                             exclusive: s.exclusive,
+                            skip_if_unavailable: s
+                                .if_unavailable
+                                .as_ref()
+                                .is_some_and(|p| p.policy == UnavailableAction::Skip),
+                            skip_reason_code: None,
+                            skip_capability: None,
                         }
                     }
                 })
@@ -496,6 +578,12 @@ impl DAGScheduler {
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: s.exclusive,
+                    skip_if_unavailable: s
+                        .if_unavailable
+                        .as_ref()
+                        .is_some_and(|p| p.policy == UnavailableAction::Skip),
+                    skip_reason_code: None,
+                    skip_capability: None,
                 })
                 .collect()
         };
@@ -608,6 +696,7 @@ impl DAGScheduler {
             let mut all_completed = true;
             let mut any_failed = false;
             let mut failure_error = String::new();
+            let mut skipped_any_stage_this_pass = false;
 
             for stage in &job_record.stages {
                 match &stage.status {
@@ -626,13 +715,14 @@ impl DAGScheduler {
                     }
                     StageStatus::Pending => {
                         all_completed = false;
-                        // Check if dependencies are satisfied
+                        // Check if dependencies are satisfied (completed cleanly or skipped)
                         let deps_satisfied = stage.depends_on.iter().all(|dep_id| {
                             job_record.stages.iter().any(|s| {
                                 s.id == *dep_id
                                     && matches!(
                                         s.status,
                                         StageStatus::Completed { exit_code: 0, .. }
+                                            | StageStatus::Skipped { .. }
                                     )
                             })
                         });
@@ -658,6 +748,13 @@ impl DAGScheduler {
                                 continue;
                             };
                             let required_tags = workflow.effective_stage_tags(stage_cfg);
+                            if self
+                                .try_skip_unavailable_stage(&job, stage_cfg, &required_tags)
+                                .await
+                            {
+                                skipped_any_stage_this_pass = true;
+                                continue;
+                            }
                             // Attempt to lease a slot (respecting node capacity, per-stage limits, and exclusive stage locks)
                             if let Some((node_id, cmd_tx)) = self
                                 .cluster
@@ -721,6 +818,8 @@ impl DAGScheduler {
                                                 },
                                             )
                                             .await;
+                                        any_failed = true;
+                                        failure_error = e.to_string();
                                         continue;
                                     }
                                 };
@@ -966,7 +1065,7 @@ impl DAGScheduler {
                             | StageStatus::Running { .. }
                     )
                 });
-            if all_latest_terminal {
+            if all_latest_terminal || skipped_any_stage_this_pass {
                 continue;
             }
             let has_active_stages = !leased_slots.is_empty()
@@ -1128,6 +1227,108 @@ impl DAGScheduler {
     ) {
         report_github_commit_status(&self.config, repo, sha, state, description, target_url).await;
     }
+
+    async fn try_skip_unavailable_stage(
+        &self,
+        job: &Job,
+        stage_cfg: &StageConfig,
+        required_tags: &[String],
+    ) -> bool {
+        let Some(ref unavailable_policy) = stage_cfg.if_unavailable else {
+            return false;
+        };
+        if unavailable_policy.policy != UnavailableAction::Skip {
+            return false;
+        }
+        if self
+            .cluster
+            .has_live_capable_worker(required_tags, stage_cfg.toolchain.as_deref())
+            .await
+        {
+            return false;
+        }
+
+        let capability_label = ActionRunnerWorkflow::stage_capability_label(stage_cfg);
+        let reason_code = "no_capable_node";
+        let sha7: String = job.commit_sha.chars().take(7).collect();
+        let skip_reason = format!(
+            "Stage '{}' skipped for {}: No {} node accessible.",
+            stage_cfg.id, sha7, capability_label
+        );
+
+        warn!(
+            job_id = %job.id,
+            stage = %stage_cfg.id,
+            reason_code = reason_code,
+            capability = %capability_label,
+            "Skipping optional stage immediately because zero capable live workers exist"
+        );
+
+        self.job_store
+            .mark_stage_skipped_unavailable(
+                &job.id,
+                &stage_cfg.id,
+                skip_reason.clone(),
+                reason_code.to_string(),
+                capability_label.clone(),
+            )
+            .await;
+
+        self.job_store.append_job_log(
+            &job.id,
+            &format!(
+                "[controller] stage={} status=skipped reason_code={} capability={} message=\"{}\"\n",
+                stage_cfg.id, reason_code, capability_label, skip_reason
+            ),
+        );
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let root_ctx = job_root_trace_context(&job.id, &job.commit_sha);
+        let skip_attrs = serde_json::json!({
+            "job_id": job.id,
+            "repo": job.repo_name,
+            "stage": stage_cfg.id,
+            "reason_code": reason_code,
+            "capability": capability_label,
+            "sha": job.commit_sha,
+        })
+        .to_string();
+        let span_entry = OtelSpanEntry {
+            trace_id: encode_hex(&root_ctx.trace_id),
+            span_id: encode_hex(&root_ctx.span_id),
+            parent_span_id: Some(encode_hex(&root_ctx.span_id)),
+            service_name: "mu-ci-controller".to_string(),
+            node_id: "controller".to_string(),
+            span_name: format!("ci.stage.skipped:{}", stage_cfg.id),
+            span_kind: "INTERNAL".to_string(),
+            start_time_unix_nano: now_ns,
+            end_time_unix_nano: now_ns,
+            duration_ns: 0,
+            status_code: "OK".to_string(),
+            status_message: Some(skip_reason),
+            attributes_json: skip_attrs,
+        };
+        self.job_store.emit_trace_spans(&[span_entry]);
+
+        if unavailable_policy.pr_comment && job.event_type == "pull_request" {
+            if let Some(pr_number) = job.pr_number {
+                upsert_pr_skip_comment(
+                    &self.config,
+                    &job.repo_name,
+                    pr_number,
+                    &stage_cfg.id,
+                    &job.commit_sha,
+                    &capability_label,
+                )
+                .await;
+            }
+        }
+
+        true
+    }
 }
 
 /// Returns the canonical dashboard deep-link URL for a job.
@@ -1183,6 +1384,192 @@ pub async fn report_github_commit_status(
     .await;
 }
 
+fn resolve_github_token_and_base_url<'a>(
+    config: &'a Config,
+    api_base_url: &str,
+) -> Option<(&'a str, String)> {
+    let raw_token = config
+        .github_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let (token, resolved_base_url) = match raw_token.split_once("@http") {
+        Some((tok, rest)) => (tok, format!("http{rest}")),
+        None => (raw_token, api_base_url.trim_end_matches('/').to_string()),
+    };
+    Some((token, resolved_base_url.trim_end_matches('/').to_string()))
+}
+
+fn github_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "ActionRunner-Controller/0.1.0")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+}
+
+/// Upserts a deduplicated sticky GitHub PR comment when an optional stage is skipped due to no
+/// capable live worker nodes (`<!-- mu-ci-skip:<stage> -->`).
+pub async fn upsert_pr_skip_comment(
+    config: &Config,
+    repo: &str,
+    pr_number: u64,
+    stage_id: &str,
+    commit_sha: &str,
+    capability_label: &str,
+) {
+    let base_url = std::env::var("GITHUB_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_string());
+    upsert_pr_skip_comment_with_base_url(
+        &base_url,
+        config,
+        repo,
+        pr_number,
+        stage_id,
+        commit_sha,
+        capability_label,
+    )
+    .await;
+}
+
+/// Upserts a sticky PR comment against a configurable GitHub REST API base URL.
+pub async fn upsert_pr_skip_comment_with_base_url(
+    api_base_url: &str,
+    config: &Config,
+    repo: &str,
+    pr_number: u64,
+    stage_id: &str,
+    commit_sha: &str,
+    capability_label: &str,
+) {
+    let Some((token, resolved_base_url)) = resolve_github_token_and_base_url(config, api_base_url)
+    else {
+        return;
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to create HTTP client for GitHub PR comment upsert");
+            return;
+        }
+    };
+
+    let marker = format!("<!-- mu-ci-skip:{stage_id} -->");
+    let sha7: String = commit_sha.chars().take(7).collect();
+    let comment_body = format!(
+        "{marker}\nStage '{stage_id}' skipped for {sha7}: No {capability_label} node accessible."
+    );
+
+    let mut existing_comment_id: Option<u64> = None;
+    for page in 1..=10u32 {
+        let list_url = format!(
+            "{resolved_base_url}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}"
+        );
+        let resp = match github_request(&client, reqwest::Method::GET, &list_url, token)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(repo = %repo, pr = pr_number, error = %err, "Failed to list PR comments");
+                return;
+            }
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(
+                repo = %repo,
+                pr = pr_number,
+                status = %status,
+                body = %text,
+                "GitHub PR comment list API responded with error"
+            );
+            return;
+        }
+        let items: Vec<serde_json::Value> = match resp.json().await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(repo = %repo, pr = pr_number, error = %err, "Invalid PR comment list JSON");
+                return;
+            }
+        };
+        if let Some(found_id) = items.iter().find_map(|item| {
+            let body = item.get("body").and_then(|b| b.as_str())?;
+            if body.contains(&marker) {
+                item.get("id").and_then(|id| id.as_u64())
+            } else {
+                None
+            }
+        }) {
+            existing_comment_id = Some(found_id);
+            break;
+        }
+        if items.len() < 100 {
+            break;
+        }
+    }
+
+    let payload = serde_json::json!({ "body": comment_body });
+    let (method, url) = match existing_comment_id {
+        Some(comment_id) => (
+            reqwest::Method::PATCH,
+            format!("{resolved_base_url}/repos/{repo}/issues/comments/{comment_id}"),
+        ),
+        None => (
+            reqwest::Method::POST,
+            format!("{resolved_base_url}/repos/{repo}/issues/{pr_number}/comments"),
+        ),
+    };
+
+    match github_request(&client, method.clone(), &url, token)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                repo = %repo,
+                pr = pr_number,
+                stage = %stage_id,
+                method = %method,
+                "Upserted sticky PR skip comment"
+            );
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(
+                repo = %repo,
+                pr = pr_number,
+                stage = %stage_id,
+                status = %status,
+                body = %text,
+                "GitHub PR comment upsert API responded with error"
+            );
+        }
+        Err(err) => {
+            warn!(
+                repo = %repo,
+                pr = pr_number,
+                stage = %stage_id,
+                error = %err,
+                "Failed to upsert PR skip comment"
+            );
+        }
+    }
+}
+
 /// Reports a `continuous integration` commit status against a configurable GitHub API base URL.
 pub async fn report_github_commit_status_with_base_url(
     api_base_url: &str,
@@ -1193,13 +1580,9 @@ pub async fn report_github_commit_status_with_base_url(
     description: &str,
     target_url: Option<&str>,
 ) {
-    let raw_token = match &config.github_token {
-        Some(t) if !t.trim().is_empty() => t.trim(),
-        _ => return,
-    };
-    let (token, resolved_base_url) = match raw_token.split_once("@http") {
-        Some((tok, rest)) => (tok, format!("http{rest}")),
-        None => (raw_token, api_base_url.to_string()),
+    let Some((token, resolved_base_url)) = resolve_github_token_and_base_url(config, api_base_url)
+    else {
+        return;
     };
 
     let mut desc = description.to_string();
@@ -1208,12 +1591,7 @@ pub async fn report_github_commit_status_with_base_url(
         desc.push_str("...");
     }
 
-    let url = format!(
-        "{}/repos/{}/statuses/{}",
-        resolved_base_url.trim_end_matches('/'),
-        repo,
-        sha
-    );
+    let url = format!("{}/repos/{}/statuses/{}", resolved_base_url, repo, sha);
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -1239,12 +1617,7 @@ pub async fn report_github_commit_status_with_base_url(
             "context": ctx,
         });
 
-        match client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "ActionRunner-Controller/0.1.0")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+        match github_request(&client, reqwest::Method::POST, &url, token)
             .json(&payload)
             .send()
             .await
@@ -1591,11 +1964,13 @@ mod tests {
             exclusive: true,
             max_concurrent_per_node: 1,
             sccache: None,
+            if_unavailable: None,
         };
 
         let wf = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Test Pipeline".to_string(),
+            toolchain: None,
             env: HashMap::from([("CI".to_string(), "true".to_string())]),
             sccache: None,
             tasks,
@@ -1659,11 +2034,13 @@ mod tests {
             exclusive: false,
             max_concurrent_per_node: 1,
             sccache: None,
+            if_unavailable: None,
         };
 
         let wf_bash = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Malicious Pipeline".to_string(),
+            toolchain: None,
             env: HashMap::new(),
             sccache: None,
             tasks: tasks_bash,
@@ -1714,10 +2091,12 @@ mod tests {
             exclusive: false,
             max_concurrent_per_node: 1,
             sccache: None,
+            if_unavailable: None,
         };
         let wf_sh = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Sh Pipeline".to_string(),
+            toolchain: None,
             env: HashMap::new(),
             sccache: None,
             tasks: tasks_sh,
@@ -1759,10 +2138,12 @@ mod tests {
             exclusive: false,
             max_concurrent_per_node: 1,
             sccache: None,
+            if_unavailable: None,
         };
         let wf_semi = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Semi Pipeline".to_string(),
+            toolchain: None,
             env: HashMap::new(),
             sccache: None,
             tasks: tasks_semi,
@@ -1799,10 +2180,12 @@ mod tests {
             exclusive: false,
             max_concurrent_per_node: 1,
             sccache: None,
+            if_unavailable: None,
         };
         let wf_sub = ActionRunnerWorkflow {
             version: "3".to_string(),
             name: "Subshell Pipeline".to_string(),
+            toolchain: None,
             env: HashMap::new(),
             sccache: None,
             tasks: tasks_sub,
@@ -2043,6 +2426,7 @@ on_action:
             commit_sha: "abcdef1234567890".to_string(),
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
+            pr_number: None,
             queued_at: Utc::now(),
         };
         assert!(is_main_push_or_merge(&job));
@@ -2165,6 +2549,7 @@ on_action:
             commit_sha: "deadbeefcafe1234".to_string(),
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
+            pr_number: None,
             queued_at: Utc::now(),
         };
 

@@ -315,6 +315,7 @@ fn sample_job_record(
             ref_name: ref_name.to_string(),
             sender: "LMA1980".to_string(),
             queued_at: ts,
+            pr_number: None,
         },
         status,
         log_file: PathBuf::from(format!("logs/{repo_name}/{id}.log")),
@@ -461,10 +462,12 @@ fn test_w3c_root_traceparent_and_stage_dispatch_propagation_subtask_44() {
         max_concurrent_per_node: 1,
         tasks: vec!["clippy".to_string()],
         sccache: None,
+        if_unavailable: None,
     };
     let workflow = ActionRunnerWorkflow {
         version: "3".to_string(),
         name: "CI".to_string(),
+        toolchain: None,
         env: std::collections::HashMap::new(),
         sccache: None,
         tasks: tasks_map,

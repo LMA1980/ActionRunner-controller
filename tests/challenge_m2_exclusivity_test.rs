@@ -15,6 +15,7 @@ fn make_worker_reg(node_id: &str, tags: &[&str], max_slots: u32) -> WorkerRegist
         ram_total_mb: 32768,
         btrfs_enabled: true,
         toolchains: vec!["system".to_string(), "rust-nightly".to_string()],
+        rust_semver: None,
     }
 }
 

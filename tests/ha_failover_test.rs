@@ -105,6 +105,7 @@ async fn test_active_standby_lease_acquisition_and_standby_gate() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -129,6 +130,7 @@ async fn test_active_standby_lease_acquisition_and_standby_gate() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -260,6 +262,7 @@ async fn test_standby_promotion_rehydrates_job_store_and_console_state() {
         ref_name: "refs/heads/feat/ha-failover-drill".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -287,6 +290,9 @@ async fn test_standby_promotion_rehydrates_job_store_and_console_state() {
                     },
                     assigned_node: Some("node-a".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
                 StageRecord {
                     id: "native-k3".to_string(),
@@ -302,6 +308,9 @@ async fn test_standby_promotion_rehydrates_job_store_and_console_state() {
                     },
                     assigned_node: Some("worker-riscv64".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
             ],
         )
@@ -441,6 +450,7 @@ async fn test_shared_job_log_persistence_and_fallback_after_failover() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -730,6 +740,7 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
                 max_slots: 1,
                 ram_total_mb: 32768,
                 btrfs_enabled: false,
+                rust_semver: None,
             },
             cmd_tx,
         )
@@ -749,6 +760,7 @@ async fn test_ha_failback_prevents_standby_queue_stall() {
                 max_slots: 1,
                 ram_total_mb: 32768,
                 btrfs_enabled: true,
+                rust_semver: None,
             },
             cmd_tx_b,
         )
@@ -821,6 +833,7 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now() - chrono::Duration::seconds(30),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -843,6 +856,9 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             }],
         )
         .await;
@@ -876,6 +892,7 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now() - chrono::Duration::seconds(20),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -909,6 +926,9 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
                     },
                     assigned_node: Some("worker-b".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
                 StageRecord {
                     id: "stage-bench".to_string(),
@@ -920,6 +940,9 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
                     status: StageStatus::Pending,
                     assigned_node: None,
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
             ],
         )
@@ -950,6 +973,9 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
             status: StageStatus::Pending,
             assigned_node: None,
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         }],
     };
     shared_storage.upsert_record(&stale_j1);
@@ -972,6 +998,9 @@ async fn test_leader_rehydrate_from_storage_never_clobbers_inflight_or_requeued_
             status: StageStatus::Pending,
             assigned_node: None,
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         }],
     };
     shared_storage.upsert_record(&stale_j2);
@@ -1045,6 +1074,7 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now() - chrono::Duration::seconds(60),
+        pr_number: None,
     };
     state_a
         .job_store
@@ -1074,6 +1104,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                     },
                     assigned_node: Some("node-a".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
                 StageRecord {
                     id: "miri-check".to_string(),
@@ -1089,6 +1122,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                     },
                     assigned_node: Some("worker-riscv64".to_string()),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 },
             ],
         )
@@ -1116,6 +1152,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                 },
                 assigned_node: Some("node-a".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
             StageRecord {
                 id: "miri-check".to_string(),
@@ -1127,6 +1166,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                 status: StageStatus::Pending,
                 assigned_node: None,
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
         ],
     });
@@ -1141,6 +1183,7 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now() - chrono::Duration::seconds(45),
+        pr_number: None,
     };
     shared_storage.upsert_record(&JobRecord {
         job: job2.clone(),
@@ -1162,6 +1205,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                 },
                 assigned_node: Some("node-a".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
             StageRecord {
                 id: "audit-check".to_string(),
@@ -1177,6 +1223,9 @@ async fn test_recover_running_preserves_in_flight_jobs_and_heals_queued_jobs_wit
                 },
                 assigned_node: Some("node-a".to_string()),
                 exclusive: false,
+                skip_if_unavailable: false,
+                skip_reason_code: None,
+                skip_capability: None,
             },
         ],
     });

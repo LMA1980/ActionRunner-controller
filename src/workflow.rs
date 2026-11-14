@@ -1,15 +1,228 @@
 use mu_ci_ipc::SccacheMode;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 
 // ============================================================================
-// v3 3-Tier Declarative Configuration Models (Sub-task #20)
+// v3 / v4 3-Tier Declarative Configuration Models (#20, #184)
 // ============================================================================
+
+/// Parsed Rust compiler semantic version (`major.minor[.patch][-prerelease]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustSemver {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pub prerelease: Option<String>,
+}
+
+impl fmt::Display for RustSemver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(ref pre) = self.prerelease {
+            write!(f, "-{}", pre)?;
+        }
+        Ok(())
+    }
+}
+
+impl Ord for RustSemver {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(a), Some(b)) => compare_prerelease(a, b),
+            })
+    }
+}
+
+impl PartialOrd for RustSemver {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_prerelease(a: &str, b: &str) -> Ordering {
+    let mut a_parts = a.split('.');
+    let mut b_parts = b.split('.');
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ap), Some(bp)) => {
+                let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
+                    (Ok(an), Ok(bn)) => an.cmp(&bn),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => ap.cmp(bp),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// Parse a Rust semantic version string (e.g. `"1.86.0"`, `"1.86"`, `"1.86.0-nightly"`).
+pub fn parse_rust_semver(raw: &str) -> Result<RustSemver, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty Rust semver string".to_string());
+    }
+    let without_build = trimmed.split('+').next().unwrap_or(trimmed);
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((c, p)) => {
+            if p.is_empty() {
+                return Err(format!("invalid empty prerelease suffix in '{}'", raw));
+            }
+            (c, Some(p.to_string()))
+        }
+        None => (without_build, None),
+    };
+
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(format!(
+            "invalid Rust semver '{}': expected 'major.minor' or 'major.minor.patch'",
+            raw
+        ));
+    }
+
+    let parse_num = |s: &str| -> Result<u64, String> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!(
+                "invalid numeric component '{}' in semver '{}'",
+                s, raw
+            ));
+        }
+        s.parse::<u64>()
+            .map_err(|_| format!("overflow in semver '{}'", raw))
+    };
+
+    let major = parse_num(parts[0])?;
+    let minor = parse_num(parts[1])?;
+    let patch = if parts.len() == 3 {
+        parse_num(parts[2])?
+    } else {
+        0
+    };
+
+    Ok(RustSemver {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
+}
+
+/// Structured compiler and C-toolchain requirements declared in `version: "4"` workflows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolchainRequirement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c_toolchain: Option<String>,
+}
+
+/// Action taken when zero live workers satisfy a stage's capability requirements.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableAction {
+    #[default]
+    Queue,
+    Skip,
+}
+
+/// Optional fallback policy on a stage when zero capable live workers exist.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct StageUnavailablePolicy {
+    #[serde(default)]
+    pub policy: UnavailableAction,
+    #[serde(default)]
+    pub pr_comment: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StageUnavailablePolicyRaw {
+    #[serde(default)]
+    policy: UnavailableAction,
+    #[serde(default)]
+    pr_comment: bool,
+    #[serde(default)]
+    capability_label: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for StageUnavailablePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PolicyVisitor;
+
+        impl<'de> Visitor<'de> for PolicyVisitor {
+            type Value = StageUnavailablePolicy;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a policy string ('queue' or 'skip') or an if_unavailable map")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let policy = match v.trim().to_ascii_lowercase().as_str() {
+                    "queue" => UnavailableAction::Queue,
+                    "skip" => UnavailableAction::Skip,
+                    other => {
+                        return Err(E::custom(format!(
+                            "invalid if_unavailable policy '{}', expected 'queue' or 'skip'",
+                            other
+                        )));
+                    }
+                };
+                Ok(StageUnavailablePolicy {
+                    policy,
+                    pr_comment: false,
+                    capability_label: None,
+                })
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let raw = StageUnavailablePolicyRaw::deserialize(
+                    de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(StageUnavailablePolicy {
+                    policy: raw.policy,
+                    pr_comment: raw.pr_comment,
+                    capability_label: raw.capability_label,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(PolicyVisitor)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionRunnerWorkflow {
-    pub version: String, // must be "3"
+    pub version: String, // "3" or "4"
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<ToolchainRequirement>,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
@@ -59,12 +272,16 @@ pub struct StageConfig {
     pub max_concurrent_per_node: u32,
     #[serde(default)]
     pub sccache: Option<SccacheMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_unavailable: Option<StageUnavailablePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WorkflowValidationError {
-    #[error("Unsupported workflow version '{0}', expected '3'")]
+    #[error("Unsupported workflow version '{0}', expected '3' or '4'")]
     UnsupportedVersion(String),
+    #[error("Invalid workflow toolchain requirement: {0}")]
+    InvalidToolchainRequirement(String),
     #[error("Unknown task reference '{task_id}' in stage '{stage_id}'")]
     UnknownTaskReference { stage_id: String, task_id: String },
     #[error("Unknown stage reference '{stage_id}' in context '{context}'")]
@@ -80,18 +297,40 @@ pub enum WorkflowValidationError {
 impl ActionRunnerWorkflow {
     pub fn from_yaml(content: &str) -> Result<Self, String> {
         let wf: ActionRunnerWorkflow = serde_yaml::from_str(content)
-            .map_err(|e| format!("Failed to parse 3-tier ActionRunner.yml: {}", e))?;
+            .map_err(|e| format!("Failed to parse ActionRunner/mu-ci YAML workflow: {}", e))?;
         wf.validate().map_err(|e| e.to_string())?;
         Ok(wf)
     }
 
     /// Validate the workflow and return stage IDs in topological execution order.
     pub fn validate(&self) -> Result<Vec<String>, WorkflowValidationError> {
-        // 1. Reject version != "3"
-        if self.version != "3" {
+        // 1. Reject version not in {"3", "4"}
+        if self.version != "3" && self.version != "4" {
             return Err(WorkflowValidationError::UnsupportedVersion(
                 self.version.clone(),
             ));
+        }
+
+        // Validate structured toolchain requirements when provided
+        if let Some(ref tc) = self.toolchain {
+            if let Some(ref min_ver) = tc.min_version {
+                parse_rust_semver(min_ver)
+                    .map_err(WorkflowValidationError::InvalidToolchainRequirement)?;
+            }
+            if let Some(ref channel) = tc.channel {
+                if channel.trim().is_empty() {
+                    return Err(WorkflowValidationError::InvalidToolchainRequirement(
+                        "toolchain.channel must not be blank".to_string(),
+                    ));
+                }
+            }
+            if let Some(ref c_tc) = tc.c_toolchain {
+                if c_tc.trim().is_empty() {
+                    return Err(WorkflowValidationError::InvalidToolchainRequirement(
+                        "toolchain.c_toolchain must not be blank".to_string(),
+                    ));
+                }
+            }
         }
 
         // 2. Reject empty stages
@@ -201,6 +440,7 @@ impl ActionRunnerWorkflow {
                 return Ok(ActionRunnerWorkflow {
                     version: self.version.clone(),
                     name: self.name.clone(),
+                    toolchain: self.toolchain.clone(),
                     env: self.env.clone(),
                     sccache: self.sccache,
                     tasks: HashMap::new(),
@@ -257,12 +497,47 @@ impl ActionRunnerWorkflow {
         Ok(ActionRunnerWorkflow {
             version: self.version.clone(),
             name: self.name.clone(),
+            toolchain: self.toolchain.clone(),
             env: self.env.clone(),
             sccache: self.sccache,
             tasks: filtered_tasks,
             stages: filtered_stages,
             on_action: filtered_on_action,
         })
+    }
+
+    /// Resolve a human-readable capability label for an optional `if_unavailable` stage.
+    pub fn stage_capability_label(stage: &StageConfig) -> String {
+        if let Some(label) = stage
+            .if_unavailable
+            .as_ref()
+            .and_then(|p| p.capability_label.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return label.to_string();
+        }
+        if let Some(tag) = stage
+            .tags
+            .iter()
+            .map(|t| t.trim())
+            .find(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"))
+        {
+            return if tag.eq_ignore_ascii_case("kva23") {
+                "KVA23".to_string()
+            } else {
+                tag.to_string()
+            };
+        }
+        if let Some(tc) = stage
+            .toolchain
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return tc.to_string();
+        }
+        "capable".to_string()
     }
 
     /// Resolve effective `SccacheMode` for a stage (`StageConfig.sccache -> ActionRunnerWorkflow.sccache -> SccacheMode::Try`).
@@ -874,5 +1149,149 @@ on_action:
             vec!["build".to_string(), "sccache".to_string()],
             "Must not duplicate existing sccache tag"
         );
+    }
+
+    #[test]
+    fn test_v4_workflow_toolchain_and_if_unavailable_parsing_and_v3_side_by_side() {
+        let v3_yaml = r#"
+version: "3"
+name: "Legacy v3 Pipeline"
+tasks:
+  check:
+    tool: "cargo-check"
+stages:
+  - id: check
+    name: "Check"
+    tasks: ["check"]
+    toolchain: "stable"
+on_action:
+  pull_request: ["check"]
+"#;
+        let v3_wf = ActionRunnerWorkflow::from_yaml(v3_yaml).expect("v3 workflow parses");
+        assert_eq!(v3_wf.version, "3");
+        assert_eq!(v3_wf.toolchain, None);
+        assert_eq!(v3_wf.stages[0].toolchain.as_deref(), Some("stable"));
+        assert_eq!(v3_wf.stages[0].if_unavailable, None);
+
+        let v4_yaml = r#"
+version: "4"
+name: "v4 Toolchain & KVA23 Skip Pipeline"
+toolchain:
+  min_version: "1.82.0"
+  channel: "stable"
+  c_toolchain: "gcc"
+tasks:
+  check:
+    tool: "cargo-check"
+  bench:
+    tool: "cargo-bench"
+stages:
+  - id: check
+    name: "Check"
+    tasks: ["check"]
+    tags: ["rust"]
+    toolchain: "stable"
+  - id: bench_kva23
+    name: "KVA23 Benchmark"
+    tasks: ["bench"]
+    depends_on: ["check"]
+    tags: ["kva23"]
+    if_unavailable:
+      policy: skip
+      pr_comment: true
+      capability_label: "KVA23"
+  - id: bench_shorthand
+    name: "Optional Shorthand Bench"
+    tasks: ["bench"]
+    tags: ["kva23"]
+    if_unavailable: "skip"
+on_action:
+  pull_request: ["bench_kva23", "bench_shorthand"]
+"#;
+        let v4_wf = ActionRunnerWorkflow::from_yaml(v4_yaml).expect("v4 workflow parses");
+        assert_eq!(v4_wf.version, "4");
+        assert_eq!(
+            v4_wf.toolchain,
+            Some(ToolchainRequirement {
+                min_version: Some("1.82.0".to_string()),
+                channel: Some("stable".to_string()),
+                c_toolchain: Some("gcc".to_string()),
+            })
+        );
+        let kva_stage = &v4_wf.stages[1];
+        assert_eq!(
+            kva_stage.if_unavailable,
+            Some(StageUnavailablePolicy {
+                policy: UnavailableAction::Skip,
+                pr_comment: true,
+                capability_label: Some("KVA23".to_string()),
+            })
+        );
+        assert_eq!(
+            ActionRunnerWorkflow::stage_capability_label(kva_stage),
+            "KVA23"
+        );
+
+        let shorthand_stage = &v4_wf.stages[2];
+        assert_eq!(
+            shorthand_stage.if_unavailable,
+            Some(StageUnavailablePolicy {
+                policy: UnavailableAction::Skip,
+                pr_comment: false,
+                capability_label: None,
+            })
+        );
+        assert_eq!(
+            ActionRunnerWorkflow::stage_capability_label(shorthand_stage),
+            "KVA23"
+        );
+
+        let sub = v4_wf
+            .subgraph_for_event("pull_request")
+            .expect("subgraph builds");
+        assert_eq!(sub.toolchain, v4_wf.toolchain);
+        assert_eq!(sub.stages.len(), 3);
+    }
+
+    #[test]
+    fn test_v4_invalid_min_version_rejected_in_validation() {
+        let bad_yaml = r#"
+version: "4"
+name: "Bad Toolchain Semver"
+toolchain:
+  min_version: "1.invalid.0"
+tasks:
+  check:
+    tool: "cargo-check"
+stages:
+  - id: check
+    name: "Check"
+    tasks: ["check"]
+on_action:
+  push: ["check"]
+"#;
+        let wf: ActionRunnerWorkflow = serde_yaml::from_str(bad_yaml).expect("YAML syntax ok");
+        match wf.validate() {
+            Err(WorkflowValidationError::InvalidToolchainRequirement(msg)) => {
+                assert!(msg.contains("1.invalid.0"), "unexpected error: {msg}");
+            }
+            other => panic!("Expected InvalidToolchainRequirement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_rust_semver_ordering() {
+        let a = parse_rust_semver("1.82").expect("major.minor");
+        let b = parse_rust_semver("1.82.0").expect("exact patch");
+        let c = parse_rust_semver("1.86.0-nightly").expect("prerelease");
+        let d = parse_rust_semver("1.86.0").expect("stable release");
+        let e = parse_rust_semver("1.86.1+abcdef").expect("build metadata");
+        assert_eq!(a, b);
+        assert!(b < c);
+        assert!(c < d);
+        assert!(d < e);
+        assert!(parse_rust_semver("latest").is_err());
+        assert!(parse_rust_semver("1").is_err());
+        assert!(parse_rust_semver("1.2.3.4").is_err());
     }
 }
