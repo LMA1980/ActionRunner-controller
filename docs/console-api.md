@@ -221,3 +221,29 @@ Each frame is `event: <kind>` followed by `data: <json>`. Every payload carries 
 | `GITHUB_TOKEN` | unset | Reused for read-only metadata, `.gitmodules` and workflow lookups |
 | `ACTION_RUNNER_GITHUB_API_URL` | `https://api.github.com` | GitHub REST base URL. `off` disables API lookups (local-clone fallback only) |
 | `ACTION_RUNNER_CONSOLE_METADATA_TTL_SECS` | `21600` | Freshness window for cached metadata and submodules |
+| `ACTION_RUNNER_PROXY_SECRET` | unset | Shared secret validating trusted edge OAuth headers (`X-Proxy-Secret`, `X-Forwarded-User`) |
+| `ACTION_RUNNER_INVITE_SIGNING_KEY` | unset | HMAC key signing single-use `PinnedBaseline` invite tokens |
+| `ACTION_RUNNER_BOOTSTRAP_ADMINS` | unset | Comma-separated GitHub logins seeded with dormant `platform-admin` rights |
+| `ACTION_RUNNER_WEBAUTHN_RP_ID` | `localhost` | WebAuthn Relying Party ID |
+| `ACTION_RUNNER_WEBAUTHN_RP_NAME` | `MuConsole Platform` | WebAuthn Relying Party display name |
+| `ACTION_RUNNER_WEBAUTHN_ORIGIN` | `http://localhost` | Allowed WebAuthn origin URL (or comma-separated URLs) |
+| `ACTION_RUNNER_HOST_ELEVATION_SECRET` | unset | Dedicated HMAC secret for `__Host-mu_elevated` step-up cookies (falls back to `invite_signing_key`) |
+| `ACTION_RUNNER_AUTH_STATE_FILE` | `<workspace>/logs/platform_auth.json` | Persistent JSON state path for platform auth, folios, roles, users, invites, and Passkeys |
+
+## Platform Auth, Policy Folios & Passkeys
+
+- **Canonical Folios & Roles (`mu-auth`)**: Default baseline access binds invited and bootstrapped users to canonical `PinnedBaseline` (`operator`), elective `ci-operator` for CI control actions, and timed `platform-admin` (`900s` hard / `300s` idle) requiring Passkey step-up.
+- **Anonymous Lockdown (`RoleFolioIndex["anonymous"]`)**: Setting `anonymous = []` via `PUT|POST /api/auth/role-folio-index` enforces login-only lockdown (`401` on `/api/queue` and `/api/repos`, while `/api/health`, `/webhook`, `/api/auth/session`, and `/api/auth/redeem` stay reachable).
+- **Mandatory Post-Login Passkey Gate**: Bound accounts with zero enrolled Passkeys receive `passkey_enrollment_required: true` and `403 passkey_enrollment_required` on protected console endpoints until enrolling via `/api/auth/passkeys/register/{start,finish}`. Existing accounts with `passkey_count > 0` require a Passkey assertion (`/api/auth/passkeys/assert/{start,finish}`) before adding or deleting Passkeys.
+- **Self-Service & Step-Up Endpoints**:
+  - `GET /api/auth/session`, `POST /api/auth/redeem`, `GET|PUT|PATCH /api/auth/profile`
+  - `GET /api/auth/passkeys`, `POST /api/auth/passkeys/register/{start|challenge,finish|verify}`, `POST /api/auth/passkeys/assert/{start|challenge,finish}`, `DELETE /api/auth/passkeys/{credential_id}`
+  - `POST /api/auth/roles/{role_id}/{enable,disable}`, `POST /api/auth/elevate/{start|challenge,finish|verify,lock-all}`, `POST /api/auth/roles/lock`, `POST /api/auth/activity`
+- **Admin Catalog & User Management (`folio:platform:admin`)**:
+  - `GET|POST|PUT /api/auth/{folios,roles}`, `PUT|DELETE /api/auth/{folios,roles}/{id}`, `GET|PUT|POST /api/auth/role-folio-index`
+  - `GET /api/auth/users`, `PUT|POST /api/auth/users/{github_login}/roles`, `DELETE /api/auth/users/{github_login}`
+  - `DELETE /api/auth/users/{github_login}/passkeys`, `POST|DELETE /api/auth/users/{github_login}/passkeys/reset`
+  - `GET|POST /api/auth/invites`, `DELETE /api/auth/invites/{invite_id}`
+- **Internal Auth Snapshot Feed**: `GET /api/internal/auth/snapshot` returns canonical folios, roles, `role_folio_index`, and bound users with `ETag` (`"rev-<N>"`) and `304 Not Modified` support on matching `If-None-Match`.
+- **Break-Glass Host CLI Reset**: `mu-ci-controller reset-passkeys <github_login>` clears stored Passkeys and active timed/elective leases for `<github_login>` directly against `platform_auth.json`.
+

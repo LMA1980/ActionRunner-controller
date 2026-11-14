@@ -157,6 +157,18 @@ impl ControllerStorage for SlowStorageBackend {
         self.inner.load_console_registry()
     }
 
+    fn configure_auth_state_path(&self, path: &std::path::Path) {
+        self.inner.configure_auth_state_path(path);
+    }
+
+    fn auth_catalog(&self) -> Option<&mu_ci_controller::db::CatalogStore> {
+        self.inner.auth_catalog()
+    }
+
+    fn sync_platform_auth_json(&self, json: &str) {
+        self.inner.sync_platform_auth_json(json);
+    }
+
     fn seed_bootstrap_admins(&self, admins: &[String]) {
         self.inner.seed_bootstrap_admins(admins);
     }

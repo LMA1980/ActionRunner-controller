@@ -11,9 +11,13 @@ default = []
 bundled-duckdb = []
 
 [dependencies]
+mu-auth = { git = "https://github.com/LMA1980/mu-auth.git", rev = "b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951", features = ["github-oauth"] }
 mu-ci-ipc = { git = "https://github.com/LMA1980/mu-ci-ipc.git", branch = "main" }
 mu-ci-tools = { git = "https://github.com/LMA1980/mu-ci-tools.git", branch = "main" }
 mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
+subtle = "2.6"
+url = "2.5"
+uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -46,11 +50,15 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 bytes = "1"
 http = "1"
+webauthn-rs-core = "0.6"
+base64 = "0.21"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
 mu-ci-worker = { git = "https://github.com/LMA1980/mu-ci-worker.git", branch = "main" }
 tempfile = "3"
+p256 = "0.14"
+serde_cbor_2 = "0.13"
 rcgen = "0.14"
 
 

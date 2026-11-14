@@ -275,6 +275,11 @@ impl JobStore {
         config: &crate::config::Config,
         db: Arc<dyn crate::storage_backend::ControllerStorage>,
     ) -> Self {
+        let auth_path = config
+            .auth_state_file
+            .clone()
+            .unwrap_or_else(|| crate::auth::default_auth_state_path(&config.workspace_dir));
+        db.configure_auth_state_path(&auth_path);
         if !config.bootstrap_admins.is_empty() {
             db.seed_bootstrap_admins(&config.bootstrap_admins);
         }
@@ -551,6 +556,27 @@ impl JobStore {
 
     pub fn seed_bootstrap_admins(&self, admins: &[String]) {
         self.db.seed_bootstrap_admins(admins);
+    }
+
+    /// Reads [`crate::auth::PlatformAuthState`] from configured auth catalog (`#172`).
+    pub fn read_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        self.db.auth_catalog()?.read_platform_auth(f)
+    }
+
+    /// Mutates [`crate::auth::PlatformAuthState`], persists locally, and syncs remotely (`#175`).
+    pub fn mutate_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&mut crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        let cat = self.db.auth_catalog()?;
+        let out = cat.mutate_platform_auth(f)?;
+        if let Some(json) = cat.export_platform_auth_json() {
+            self.db.sync_platform_auth_json(&json);
+        }
+        Some(out)
     }
 
     pub fn create_auth_invite(&self, invite: &crate::db::AuthInviteRecord) {

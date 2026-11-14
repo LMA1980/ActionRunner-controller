@@ -79,6 +79,8 @@ fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+type AuthSyncHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Default)]
 struct InMemoryCatalog {
     jobs: BTreeMap<String, CentralJobRecord>,
@@ -89,6 +91,10 @@ struct InMemoryCatalog {
     console_registry_json: Option<String>,
     auth_invites: BTreeMap<String, AuthInviteRecord>,
     auth_users: BTreeMap<String, AuthUserRecord>,
+    platform_auth: crate::auth::PlatformAuthState,
+    auth_state_path: Option<PathBuf>,
+    auth_state_hash: Option<[u8; 32]>,
+    auth_sync_hook: Option<AuthSyncHook>,
 }
 
 /// Pure-Rust in-memory state catalog for test harnesses and log metric extraction
@@ -498,29 +504,181 @@ impl CatalogStore {
         guard.console_registry_json.clone()
     }
 
-    /// Seeds `config.bootstrap_admins` as `role = "admin"`, `invited_by = "bootstrap"` (`#93`).
+    fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().into()
+    }
+
+    fn sync_legacy_mirrors(guard: &mut InMemoryCatalog) {
+        guard.auth_users.clear();
+        for (k, u) in &guard.platform_auth.users {
+            let role = if guard.platform_auth.user_has_platform_admin_binding(k) {
+                "admin"
+            } else {
+                crate::auth::BASELINE_ROLE_ID
+            };
+            guard.auth_users.insert(
+                k.clone(),
+                AuthUserRecord {
+                    github_login: u.github_login.clone(),
+                    role: role.to_string(),
+                    invited_by: u.invited_by.clone(),
+                    invite_id: u.invite_id.clone(),
+                    bound_at: u.bound_at.clone(),
+                    revoked: u8::from(u.revoked),
+                },
+            );
+        }
+        guard.auth_invites.clear();
+        for (k, inv) in &guard.platform_auth.invites {
+            guard.auth_invites.insert(
+                k.clone(),
+                AuthInviteRecord {
+                    invite_id: inv.invite_id.clone(),
+                    token_hmac: inv.token_hmac.clone(),
+                    created_by: inv.created_by.clone(),
+                    note: inv.note.clone(),
+                    created_at: inv.created_at.clone(),
+                    expires_at: inv.expires_at.clone(),
+                    used_by_github_login: inv.used_by_github_login.clone(),
+                    used_at: inv.used_at.clone(),
+                },
+            );
+        }
+    }
+
+    fn sync_auth_from_disk_if_changed(guard: &mut InMemoryCatalog) {
+        let Some(ref path) = guard.auth_state_path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let hash = Self::sha256_bytes(&bytes);
+        if guard.auth_state_hash == Some(hash) {
+            return;
+        }
+        if let Ok(Some(loaded)) = crate::auth::load_auth_state_file(path) {
+            guard.platform_auth = loaded;
+            guard.auth_state_hash = Some(hash);
+            Self::sync_legacy_mirrors(guard);
+        }
+    }
+
+    fn persist_auth_if_configured(guard: &mut InMemoryCatalog) {
+        Self::sync_legacy_mirrors(guard);
+        if let Some(ref path) = guard.auth_state_path {
+            if let Err(err) = crate::auth::save_auth_state_atomic(path, &guard.platform_auth) {
+                warn!(
+                    "Failed to persist platform_auth state to {}: {}",
+                    path.display(),
+                    err
+                );
+            } else if let Ok(bytes) = std::fs::read(path) {
+                guard.auth_state_hash = Some(Self::sha256_bytes(&bytes));
+            }
+        }
+        if let Some(ref hook) = guard.auth_sync_hook {
+            if let Ok(json) = serde_json::to_string(&guard.platform_auth) {
+                hook(&json);
+            }
+        }
+    }
+
+    /// Configures persistent JSON storage for [`crate::auth::PlatformAuthState`],
+    /// loading existing state from disk (or migrating legacy rows) idempotently (`#175`).
+    pub fn configure_auth_state_path(&self, path: PathBuf) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.auth_state_path = Some(path.clone());
+        match crate::auth::load_auth_state_file(&path) {
+            Ok(Some(loaded)) => {
+                guard.platform_auth = loaded;
+                if let Ok(bytes) = std::fs::read(&path) {
+                    guard.auth_state_hash = Some(Self::sha256_bytes(&bytes));
+                }
+                Self::sync_legacy_mirrors(&mut guard);
+            }
+            Ok(None) => {
+                // Migrate any legacy in-memory users/invites if populated prior to config.
+                Self::persist_auth_if_configured(&mut guard);
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to load platform auth state from {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    /// Registers a replication hook invoked with serialized JSON after each auth mutation.
+    pub fn set_auth_sync_hook(&self, hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.auth_sync_hook = Some(hook);
+        }
+    }
+
+    /// Replaces in-memory `PlatformAuthState` from a remote snapshot JSON if its revision is newer.
+    pub fn import_platform_auth_json_if_newer(&self, json: &str) {
+        let Ok(mut remote) = serde_json::from_str::<crate::auth::PlatformAuthState>(json) else {
+            return;
+        };
+        remote.reconcile_after_load();
+        if let Ok(mut guard) = self.inner.lock() {
+            if remote.snapshot_revision > guard.platform_auth.snapshot_revision {
+                guard.platform_auth = remote;
+                Self::sync_legacy_mirrors(&mut guard);
+            }
+        }
+    }
+
+    /// Exports current `PlatformAuthState` as JSON for HA snapshot sync.
+    pub fn export_platform_auth_json(&self) -> Option<String> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        serde_json::to_string(&guard.platform_auth).ok()
+    }
+
+    /// Executes a read-only closure against the synchronized [`crate::auth::PlatformAuthState`].
+    pub fn read_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        Some(f(&guard.platform_auth))
+    }
+
+    /// Executes a mutating closure against [`crate::auth::PlatformAuthState`] and persists changes.
+    pub fn mutate_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&mut crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        let out = f(&mut guard.platform_auth);
+        Self::persist_auth_if_configured(&mut guard);
+        Some(out)
+    }
+
+    /// Seeds `config.bootstrap_admins` as `operator` + dormant `platform-admin` idempotently (`#175`).
     pub fn seed_bootstrap_admins(&self, admins: &[String]) {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
-        let now_str = Utc::now().to_rfc3339();
-        for raw_login in admins {
-            let clean = raw_login.trim();
-            if clean.is_empty() {
-                continue;
-            }
-            let key = clean.to_ascii_lowercase();
-            guard
-                .auth_users
-                .entry(key)
-                .or_insert_with(|| AuthUserRecord {
-                    github_login: clean.to_string(),
-                    role: "admin".to_string(),
-                    invited_by: "bootstrap".to_string(),
-                    invite_id: None,
-                    bound_at: now_str.clone(),
-                    revoked: 0,
-                });
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        if guard
+            .platform_auth
+            .seed_bootstrap_admins(admins, Utc::now())
+        {
+            Self::persist_auth_if_configured(&mut guard);
+        } else {
+            Self::sync_legacy_mirrors(&mut guard);
         }
     }
 

@@ -89,6 +89,16 @@ pub struct Config {
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
     pub tls_ca_path: Option<PathBuf>,
+    /// WebAuthn Relying Party ID (domain, e.g., `localhost` or `console.example.org`).
+    pub webauthn_rp_id: String,
+    /// WebAuthn Relying Party human-readable display name.
+    pub webauthn_rp_name: String,
+    /// WebAuthn expected origin (`http://localhost` or `https://console.example.org`).
+    pub webauthn_rp_origin: String,
+    /// Dedicated HMAC secret for `__Host-mu_elevated` cookies (falls back to `invite_signing_key`).
+    pub host_elevation_secret: Option<String>,
+    /// Optional explicit path for persistent platform auth state JSON.
+    pub auth_state_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -124,6 +134,11 @@ impl Default for Config {
             tls_cert_path: None,
             tls_key_path: None,
             tls_ca_path: None,
+            webauthn_rp_id: "localhost".to_string(),
+            webauthn_rp_name: "MuConsole Platform".to_string(),
+            webauthn_rp_origin: "http://localhost".to_string(),
+            host_elevation_secret: None,
+            auth_state_file: None,
         }
     }
 }
@@ -267,7 +282,48 @@ impl Config {
             tls_cert_path,
             tls_key_path,
             tls_ca_path,
+            webauthn_rp_id: std::env::var("ACTION_RUNNER_WEBAUTHN_RP_ID")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "localhost".to_string()),
+            webauthn_rp_name: std::env::var("ACTION_RUNNER_WEBAUTHN_RP_NAME")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "MuConsole Platform".to_string()),
+            webauthn_rp_origin: std::env::var("ACTION_RUNNER_WEBAUTHN_ORIGIN")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "http://localhost".to_string()),
+            host_elevation_secret: Self::resolve_secret_with_file_var(
+                "ACTION_RUNNER_HOST_ELEVATION_SECRET",
+                "ACTION_RUNNER_HOST_ELEVATION_SECRET_FILE",
+            ),
+            auth_state_file: std::env::var("ACTION_RUNNER_AUTH_STATE_FILE")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
         }
+    }
+
+    /// Returns the HMAC secret used to sign `__Host-mu_elevated` session cookies.
+    /// Prefers `ACTION_RUNNER_HOST_ELEVATION_SECRET`, falls back to `invite_signing_key`,
+    /// or generates an ephemeral per-process secret if neither is configured.
+    #[must_use]
+    pub fn elevation_signing_key(&self) -> String {
+        static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(ref s) = self.host_elevation_secret {
+            return format!("elev:{s}");
+        }
+        if let Some(ref s) = self.invite_signing_key {
+            return format!("elev:{s}");
+        }
+        EPHEMERAL
+            .get_or_init(|| format!("ephemeral:{}", uuid::Uuid::new_v4()))
+            .clone()
     }
 
     pub fn is_repo_allowed(&self, repo: &str) -> bool {

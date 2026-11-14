@@ -1,0 +1,5 @@
+[advisories]
+# webauthn-rs-core 0.6.2 -> crypto-glue 0.2.2 locks rsa 0.10.0-rc.19 (with crypto-bigint
+# constant-time mitigations); rsa 0.10.0 removed the `sha2` feature required by crypto-glue,
+# and mu-ci-controller never performs RSA private-key operations.
+ignore = ["RUSTSEC-2023-0071"]
