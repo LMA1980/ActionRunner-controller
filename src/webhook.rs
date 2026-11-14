@@ -393,7 +393,7 @@ pub async fn handle_webhook(
         .unwrap_or("")
         .to_string();
 
-    let (commit_sha, ref_name, clone_url, event_type, should_run) = if event == "push" {
+    let (commit_sha, ref_name, clone_url, event_type, pr_number, should_run) = if event == "push" {
         let commit_sha = payload
             .get("after")
             .and_then(|s| s.as_str())
@@ -419,6 +419,7 @@ pub async fn handle_webhook(
                 "".to_string(),
                 "".to_string(),
                 "push".to_string(),
+                None,
                 false,
             )
         } else {
@@ -427,11 +428,15 @@ pub async fn handle_webhook(
             } else {
                 "push".to_string()
             };
-            (commit_sha, ref_name, default_clone_url, evt, true)
+            (commit_sha, ref_name, default_clone_url, evt, None, true)
         }
     } else if event == "pull_request" {
         let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
         let pr = payload.get("pull_request");
+        let parsed_pr_number = pr
+            .and_then(|p| p.get("number"))
+            .and_then(|n| n.as_u64())
+            .or_else(|| payload.get("number").and_then(|n| n.as_u64()));
 
         // Inspect PR fork origin and author association
         let head_repo = pr
@@ -490,6 +495,7 @@ pub async fn handle_webhook(
                 format!("refs/heads/{}", base_ref),
                 default_clone_url,
                 "merge".to_string(),
+                parsed_pr_number,
                 true,
             )
         } else if matches!(action, "opened" | "synchronize" | "reopened") {
@@ -558,6 +564,7 @@ pub async fn handle_webhook(
                 ref_name,
                 clone_url,
                 "pull_request".to_string(),
+                parsed_pr_number,
                 true,
             )
         } else {
@@ -567,6 +574,7 @@ pub async fn handle_webhook(
                 "".to_string(),
                 "".to_string(),
                 "pull_request".to_string(),
+                parsed_pr_number,
                 false,
             )
         }
@@ -590,10 +598,18 @@ pub async fn handle_webhook(
                 ref_name,
                 default_clone_url,
                 event.clone(),
+                None,
                 false,
             )
         } else {
-            (commit_sha, ref_name, default_clone_url, event.clone(), true)
+            (
+                commit_sha,
+                ref_name,
+                default_clone_url,
+                event.clone(),
+                None,
+                true,
+            )
         }
     };
 
@@ -644,6 +660,7 @@ pub async fn handle_webhook(
         commit_sha: commit_sha.clone(),
         ref_name: ref_name.clone(),
         sender,
+        pr_number,
         queued_at: Utc::now(),
     };
 
@@ -1167,6 +1184,7 @@ mod tests {
             commit_sha: "deadbeef12345678deadbeef12345678deadbeef".to_string(),
             ref_name: "refs/heads/main".to_string(),
             sender: "LMA1980".to_string(),
+            pr_number: None,
             queued_at: Utc::now(),
         };
         let _ = state_arc
@@ -1187,5 +1205,74 @@ mod tests {
         .await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_pull_request_webhook_captures_pr_number_and_persists_catalog() {
+        let secret = "pr-secret";
+        let (state, mut rx) = make_test_state(Some(secret), false, false);
+        let body_str = serde_json::json!({
+            "action": "opened",
+            "number": 123,
+            "repository": {
+                "full_name": "LMA1980/mu-ci-controller",
+                "clone_url": "https://github.com/LMA1980/mu-ci-controller.git"
+            },
+            "sender": { "login": "LMA1980" },
+            "pull_request": {
+                "number": 123,
+                "author_association": "OWNER",
+                "head": {
+                    "sha": "abcdef1234567890abcdef1234567890abcdef12",
+                    "ref": "feat/workflow-v4",
+                    "repo": {
+                        "full_name": "LMA1980/mu-ci-controller",
+                        "clone_url": "https://github.com/LMA1980/mu-ci-controller.git"
+                    }
+                },
+                "base": {
+                    "ref": "main",
+                    "repo": { "full_name": "LMA1980/mu-ci-controller" }
+                }
+            }
+        })
+        .to_string();
+
+        let body_bytes = body_str.as_bytes();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-hub-signature-256",
+            compute_sig(secret, body_bytes).parse().unwrap(),
+        );
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+
+        let (status, payload) = handle_webhook(
+            State(state.clone()),
+            headers,
+            Bytes::from(body_bytes.to_vec()),
+        )
+        .await
+        .expect("pull_request webhook accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job_id = payload["job_id"].as_str().expect("job_id present");
+
+        let job = rx.try_recv().expect("job dispatched");
+        assert_eq!(job.id, job_id);
+        assert_eq!(job.event_type, "pull_request");
+        assert_eq!(job.pr_number, Some(123));
+
+        let stored = state
+            .job_store
+            .get_job(job_id)
+            .await
+            .expect("job stored in store");
+        assert_eq!(stored.job.pr_number, Some(123));
+
+        let central = crate::db::CatalogStore::to_central_job_record(&stored)
+            .expect("central record serialized");
+        let decoded: crate::job::JobRecord =
+            serde_json::from_str(&central.record_json).expect("decode record_json");
+        assert_eq!(decoded.job.pr_number, Some(123));
     }
 }

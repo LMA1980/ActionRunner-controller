@@ -1,10 +1,12 @@
 use chrono::{DateTime, Utc};
 use mu_ci_ipc::{StageCancelTask, StageDispatchTask, WorkerHeartbeat, WorkerRegistration};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
+
+use crate::workflow::{parse_rust_semver, RustSemver};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterNodeView {
@@ -19,8 +21,153 @@ pub struct ClusterNodeView {
     pub cpu_load_pct: f32,
     pub btrfs_enabled: bool,
     pub toolchains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_semver: Option<String>,
     pub last_seen_secs_ago: u64,
     pub is_online: bool,
+}
+
+/// Diagnostic detail identifying an individual worker whose reported Rust toolchain
+/// diverges from the canonical cluster version (#185).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerToolchainDrift {
+    pub node_id: String,
+    pub reported_semver: Option<String>,
+    pub reason: String,
+}
+
+/// Canonical cluster Rust toolchain evaluation across connected online workers (#185).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterToolchainSnapshot {
+    pub canonical_semver: Option<String>,
+    pub node_versions: Vec<(String, Option<String>)>,
+    pub drift_detected: bool,
+    pub drift_details: Vec<WorkerToolchainDrift>,
+}
+
+/// Fail-fast validation error when a workflow's `toolchain.min_version` cannot be
+/// satisfied by connected live cluster workers (#185).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClusterToolchainError {
+    #[error("Invalid workflow toolchain.min_version '{min_version}': {reason}")]
+    InvalidMinVersion { min_version: String, reason: String },
+    #[error("Unsupported workflow toolchain.min_version '{min_version}': cluster supports '{cluster_version}'")]
+    UnsupportedMinVersion {
+        min_version: String,
+        cluster_version: String,
+    },
+    #[error("Cannot validate workflow toolchain.min_version '{min_version}': no live worker reported a valid rust_semver")]
+    MissingWorkerSemver { min_version: String },
+}
+
+/// Pure, Miri-safe cluster toolchain drift & canonical baseline calculation (#185).
+#[must_use]
+pub fn evaluate_cluster_toolchain_versions(
+    live_nodes: &[(String, Option<String>)],
+) -> ClusterToolchainSnapshot {
+    let mut sorted = live_nodes.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut valid_nodes: Vec<(String, RustSemver, String)> = Vec::new();
+    let mut drift_details: Vec<WorkerToolchainDrift> = Vec::new();
+    let mut missing_nodes: Vec<String> = Vec::new();
+
+    for (node_id, reported) in &sorted {
+        match reported.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => match parse_rust_semver(raw) {
+                Ok(parsed) => valid_nodes.push((node_id.clone(), parsed, raw.to_string())),
+                Err(err) => drift_details.push(WorkerToolchainDrift {
+                    node_id: node_id.clone(),
+                    reported_semver: Some(raw.to_string()),
+                    reason: format!("malformed worker rust_semver: {}", err),
+                }),
+            },
+            None => missing_nodes.push(node_id.clone()),
+        }
+    }
+
+    let canonical_parsed = valid_nodes.iter().map(|(_, v, _)| v).min().cloned();
+    let canonical_semver = canonical_parsed.as_ref().map(|v| v.to_string());
+
+    if !valid_nodes.is_empty() {
+        // Count occurrences per parsed semver to pick expected cluster target (mode, then highest).
+        let mut counts: BTreeMap<String, (usize, RustSemver)> = BTreeMap::new();
+        for (_, ver, _) in &valid_nodes {
+            let key = ver.to_string();
+            let entry = counts.entry(key).or_insert_with(|| (0, ver.clone()));
+            entry.0 += 1;
+        }
+        let target_ver = counts
+            .values()
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, v)| v.clone());
+
+        if let Some(target) = target_ver {
+            for (node_id, ver, raw) in &valid_nodes {
+                if *ver != target {
+                    drift_details.push(WorkerToolchainDrift {
+                        node_id: node_id.clone(),
+                        reported_semver: Some(raw.clone()),
+                        reason: format!(
+                            "worker reports Rust '{}' while expected cluster version is '{}'",
+                            ver, target
+                        ),
+                    });
+                }
+            }
+        }
+
+        for node_id in missing_nodes {
+            drift_details.push(WorkerToolchainDrift {
+                node_id,
+                reported_semver: None,
+                reason: "live worker did not report rust_semver while peer workers did".to_string(),
+            });
+        }
+    }
+
+    let drift_detected = !drift_details.is_empty();
+    ClusterToolchainSnapshot {
+        canonical_semver,
+        node_versions: sorted,
+        drift_detected,
+        drift_details,
+    }
+}
+
+/// Validates a workflow `min_version` string against a [`ClusterToolchainSnapshot`] (#185).
+pub fn validate_min_version_against_snapshot(
+    snapshot: &ClusterToolchainSnapshot,
+    min_version: &str,
+) -> Result<(), ClusterToolchainError> {
+    let required = parse_rust_semver(min_version).map_err(|reason| {
+        ClusterToolchainError::InvalidMinVersion {
+            min_version: min_version.to_string(),
+            reason,
+        }
+    })?;
+
+    let Some(ref canonical_raw) = snapshot.canonical_semver else {
+        return Err(ClusterToolchainError::MissingWorkerSemver {
+            min_version: min_version.to_string(),
+        });
+    };
+
+    let cluster_supported = parse_rust_semver(canonical_raw).map_err(|reason| {
+        ClusterToolchainError::InvalidMinVersion {
+            min_version: canonical_raw.clone(),
+            reason,
+        }
+    })?;
+
+    if required > cluster_supported {
+        return Err(ClusterToolchainError::UnsupportedMinVersion {
+            min_version: min_version.to_string(),
+            cluster_version: canonical_raw.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 pub type NodeView = ClusterNodeView;
@@ -124,6 +271,34 @@ fn worker_dispatch_tiers(worker: &ActiveWorker, required_tags: &[String]) -> (u8
     (hw_tier, low_ram_tier)
 }
 
+fn worker_is_live_and_capable(
+    worker: &ActiveWorker,
+    now: DateTime<Utc>,
+    timeout_secs: i64,
+    required_tags: &[String],
+    required_toolchain: Option<&str>,
+) -> bool {
+    let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
+    if secs_since_seen > timeout_secs {
+        return false;
+    }
+    if let Some(tc) = required_toolchain {
+        if !worker.registration.toolchains.iter().any(|t| t == tc) {
+            return false;
+        }
+    }
+    let node_tags: HashSet<&str> = worker
+        .registration
+        .tags
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    required_tags.is_empty()
+        || required_tags
+            .iter()
+            .all(|req| req == "default" || node_tags.contains(req.as_str()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_can_accept_stage(
     worker: &ActiveWorker,
@@ -135,8 +310,7 @@ fn worker_can_accept_stage(
     max_concurrent_per_node: Option<u32>,
     include_pending_claims: bool,
 ) -> bool {
-    let secs_since_seen = (now - worker.last_heartbeat).num_seconds().max(0);
-    if secs_since_seen > timeout_secs {
+    if !worker_is_live_and_capable(worker, now, timeout_secs, required_tags, required_toolchain) {
         return false;
     }
     if is_worker_memory_exhausted(worker.registration.ram_total_mb, worker.ram_used_mb) {
@@ -164,22 +338,7 @@ fn worker_can_accept_stage(
         }
     }
 
-    if let Some(tc) = required_toolchain {
-        if !worker.registration.toolchains.iter().any(|t| t == tc) {
-            return false;
-        }
-    }
-
-    let node_tags: HashSet<&str> = worker
-        .registration
-        .tags
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    required_tags.is_empty()
-        || required_tags
-            .iter()
-            .all(|req| req == "default" || node_tags.contains(req.as_str()))
+    true
 }
 
 #[derive(Clone, Default)]
@@ -238,12 +397,15 @@ impl ClusterRegistry {
             max_slots = reg.max_slots,
             tags = ?reg.tags,
             toolchains = ?reg.toolchains,
+            rust_semver = ?reg.rust_semver,
             "Worker node connected to cluster"
         );
 
+        let now = Utc::now();
+        let timeout_secs = heartbeat_timeout_secs();
         let mut workers = self.workers.write().await;
         workers.insert(
-            node_id,
+            node_id.clone(),
             ActiveWorker {
                 registration: reg,
                 leased_stages: HashSet::new(),
@@ -252,11 +414,30 @@ impl ClusterRegistry {
                 pending_exclusive_claim: None,
                 cpu_load_pct: 0.0,
                 ram_used_mb: 0,
-                last_heartbeat: Utc::now(),
+                last_heartbeat: now,
                 last_dispatched_seq: 0,
                 command_tx,
             },
         );
+        let live_nodes: Vec<(String, Option<String>)> = workers
+            .values()
+            .filter(|w| (now - w.last_heartbeat).num_seconds().max(0) <= timeout_secs)
+            .map(|w| {
+                (
+                    w.registration.node_id.clone(),
+                    w.registration.rust_semver.clone(),
+                )
+            })
+            .collect();
+        let snapshot = evaluate_cluster_toolchain_versions(&live_nodes);
+        if snapshot.drift_detected {
+            warn!(
+                node_id = %node_id,
+                canonical_semver = ?snapshot.canonical_semver,
+                drift_details = ?snapshot.drift_details,
+                "Cluster Rust toolchain drift detected on worker registration"
+            );
+        }
     }
 
     pub async fn unregister(&self, node_id: &str) {
@@ -526,11 +707,41 @@ impl ClusterRegistry {
                     cpu_load_pct: w.cpu_load_pct,
                     btrfs_enabled: w.registration.btrfs_enabled,
                     toolchains: w.registration.toolchains.clone(),
+                    rust_semver: w.registration.rust_semver.clone(),
                     last_seen_secs_ago,
                     is_online,
                 }
             })
             .collect()
+    }
+
+    /// Evaluates the canonical Rust semver and drift across all currently live workers (#185).
+    pub async fn toolchain_snapshot(&self) -> ClusterToolchainSnapshot {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+        let timeout_secs = heartbeat_timeout_secs();
+        let live_nodes: Vec<(String, Option<String>)> = workers
+            .values()
+            .filter(|w| (now - w.last_heartbeat).num_seconds().max(0) <= timeout_secs)
+            .map(|w| {
+                (
+                    w.registration.node_id.clone(),
+                    w.registration.rust_semver.clone(),
+                )
+            })
+            .collect();
+        evaluate_cluster_toolchain_versions(&live_nodes)
+    }
+
+    /// Validates a workflow `toolchain.min_version` against connected live workers, returning
+    /// the [`ClusterToolchainSnapshot`] (with drift status) on success or failing fast (#185).
+    pub async fn validate_workflow_min_version(
+        &self,
+        min_version: &str,
+    ) -> Result<ClusterToolchainSnapshot, ClusterToolchainError> {
+        let snapshot = self.toolchain_snapshot().await;
+        validate_min_version_against_snapshot(&snapshot, min_version)?;
+        Ok(snapshot)
     }
 
     /// Checks whether at least one online, idle worker node in the cluster can satisfy
@@ -581,6 +792,21 @@ impl ClusterRegistry {
                 max_concurrent_per_node,
                 true,
             )
+        })
+    }
+
+    /// Returns `true` when at least one online (`Live`) worker node satisfies `required_tags`
+    /// and `required_toolchain`, even if its execution slots are currently busy.
+    pub async fn has_live_capable_worker(
+        &self,
+        required_tags: &[String],
+        required_toolchain: Option<&str>,
+    ) -> bool {
+        let workers = self.workers.read().await;
+        let now = Utc::now();
+        let timeout_secs = heartbeat_timeout_secs();
+        workers.values().any(|worker| {
+            worker_is_live_and_capable(worker, now, timeout_secs, required_tags, required_toolchain)
         })
     }
 
@@ -689,6 +915,7 @@ impl ClusterRegistry {
                         && matches!(
                             s.status,
                             crate::job::StageStatus::Completed { exit_code: 0, .. }
+                                | crate::job::StageStatus::Skipped { .. }
                         )
                 })
             });
@@ -734,6 +961,20 @@ impl ClusterRegistry {
                     }
                     return true;
                 }
+            } else if stage.skip_if_unavailable
+                && !workers.values().any(|worker| {
+                    worker_is_live_and_capable(
+                        worker,
+                        now,
+                        timeout_secs,
+                        &stage.tags,
+                        stage.toolchain.as_deref(),
+                    )
+                })
+            {
+                // Zero live capable workers exist for this optional skippable stage; allow the
+                // scheduler to claim the job so `execute_job` immediately marks it skipped.
+                return true;
             }
         }
 
@@ -754,6 +995,7 @@ mod tests {
             ram_total_mb: 32768,
             btrfs_enabled: true,
             toolchains: vec!["system".to_string()],
+            rust_semver: None,
         }
     }
 
@@ -1682,6 +1924,9 @@ mod tests {
             status: crate::job::StageStatus::Pending,
             assigned_node: None,
             exclusive: false,
+            skip_if_unavailable: false,
+            skip_reason_code: None,
+            skip_capability: None,
         }];
         let mut active_unleased = HashSet::new();
         for jid in ["claim-1", "claim-2", "claim-3"] {
@@ -1700,6 +1945,159 @@ mod tests {
             !cluster
                 .sync_and_try_reserve_for_claim(&active_unleased, "claim-4", &build_stages)
                 .await
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_has_live_capable_worker_and_skip_if_unavailable_reservation() {
+        let cluster = ClusterRegistry::new();
+        let (tx_busy, _rx_busy) = mpsc::channel(4);
+        let reg_kva = WorkerRegistration {
+            node_id: "worker-kva23-a".to_string(),
+            arch: "riscv64".to_string(),
+            tags: vec!["kva23".to_string()],
+            max_slots: 1,
+            ram_total_mb: 32768,
+            btrfs_enabled: false,
+            toolchains: vec!["stable".to_string()],
+            rust_semver: None,
+        };
+        cluster.register(reg_kva, tx_busy).await;
+
+        assert!(
+            cluster
+                .has_live_capable_worker(&["kva23".to_string()], Some("stable"))
+                .await
+        );
+        assert!(
+            !cluster
+                .has_live_capable_worker(&["nonexistent-hw".to_string()], Some("stable"))
+                .await
+        );
+
+        // Occupy the lone KVA23 slot so the worker is live but busy.
+        let leased = cluster
+            .lease_slot(
+                "other-job",
+                "other-stage",
+                &["kva23".to_string()],
+                Some("stable"),
+                false,
+            )
+            .await;
+        assert!(leased.is_some());
+        assert!(
+            cluster
+                .has_live_capable_worker(&["kva23".to_string()], Some("stable"))
+                .await,
+            "busy live node must still count as live capable"
+        );
+
+        // Skippable stage targeting KVA23 must NOT bypass queueing when a live KVA23 worker is busy.
+        let kva_skip_stage = vec![crate::job::StageRecord {
+            id: "bench_kva23".to_string(),
+            name: "Bench KVA23".to_string(),
+            tags: vec!["kva23".to_string()],
+            threads: 2,
+            toolchain: Some("stable".to_string()),
+            depends_on: Vec::new(),
+            status: crate::job::StageStatus::Pending,
+            assigned_node: None,
+            exclusive: false,
+            skip_if_unavailable: true,
+            skip_reason_code: None,
+            skip_capability: None,
+        }];
+        let active_unleased = HashSet::from(["claim-busy".to_string()]);
+        assert!(
+            !cluster
+                .sync_and_try_reserve_for_claim(&active_unleased, "claim-busy", &kva_skip_stage)
+                .await,
+            "busy live capable node must keep skip_if_unavailable stage queued"
+        );
+
+        // Remove the KVA23 node so zero live capable nodes exist -> claim is allowed to run immediate skip.
+        cluster.unregister("worker-kva23-a").await;
+        assert!(
+            !cluster
+                .has_live_capable_worker(&["kva23".to_string()], Some("stable"))
+                .await
+        );
+        assert!(
+            cluster
+                .sync_and_try_reserve_for_claim(&active_unleased, "claim-busy", &kva_skip_stage)
+                .await,
+            "zero live capable nodes must allow claiming skip_if_unavailable stage"
+        );
+    }
+
+    #[test]
+    fn test_cluster_toolchain_semver_validation_and_drift_detection() {
+        // 1. Uniform cluster at 1.86.0 accepts 1.82.0 and 1.86.0, rejects 1.87.0.
+        let uniform = vec![
+            ("node-a".to_string(), Some("1.86.0".to_string())),
+            ("node-b".to_string(), Some("1.86.0".to_string())),
+        ];
+        let snap_uniform = evaluate_cluster_toolchain_versions(&uniform);
+        assert_eq!(snap_uniform.canonical_semver.as_deref(), Some("1.86.0"));
+        assert!(!snap_uniform.drift_detected);
+        assert!(snap_uniform.drift_details.is_empty());
+
+        assert!(validate_min_version_against_snapshot(&snap_uniform, "1.82.0").is_ok());
+        assert!(validate_min_version_against_snapshot(&snap_uniform, "1.86.0").is_ok());
+        let err = validate_min_version_against_snapshot(&snap_uniform, "1.87.0").unwrap_err();
+        assert_eq!(
+            err,
+            ClusterToolchainError::UnsupportedMinVersion {
+                min_version: "1.87.0".to_string(),
+                cluster_version: "1.86.0".to_string(),
+            }
+        );
+
+        // 2. Drifted cluster (two 1.86.0 nodes, one older 1.84.0 node) flags drift and uses
+        // lowest common supported semver (1.84.0) as canonical baseline.
+        let drifted = vec![
+            ("node-a".to_string(), Some("1.86.0".to_string())),
+            ("node-b".to_string(), Some("1.84.0".to_string())),
+            ("node-c".to_string(), Some("1.86.0".to_string())),
+        ];
+        let snap_drifted = evaluate_cluster_toolchain_versions(&drifted);
+        assert!(snap_drifted.drift_detected);
+        assert_eq!(snap_drifted.canonical_semver.as_deref(), Some("1.84.0"));
+        assert_eq!(snap_drifted.drift_details.len(), 1);
+        assert_eq!(snap_drifted.drift_details[0].node_id, "node-b");
+
+        assert!(validate_min_version_against_snapshot(&snap_drifted, "1.84.0").is_ok());
+        let err_drifted =
+            validate_min_version_against_snapshot(&snap_drifted, "1.85.0").unwrap_err();
+        assert_eq!(
+            err_drifted,
+            ClusterToolchainError::UnsupportedMinVersion {
+                min_version: "1.85.0".to_string(),
+                cluster_version: "1.84.0".to_string(),
+            }
+        );
+
+        // 3. Mixed missing/malformed semvers also flag drift diagnostics.
+        let mixed = vec![
+            ("node-a".to_string(), Some("1.86.0".to_string())),
+            ("node-legacy".to_string(), None),
+            ("node-bad".to_string(), Some("not-a-semver".to_string())),
+        ];
+        let snap_mixed = evaluate_cluster_toolchain_versions(&mixed);
+        assert!(snap_mixed.drift_detected);
+        assert_eq!(snap_mixed.drift_details.len(), 2);
+
+        // 4. All None returns MissingWorkerSemver error cleanly.
+        let all_none = vec![("node-legacy".to_string(), None)];
+        let snap_none = evaluate_cluster_toolchain_versions(&all_none);
+        assert!(!snap_none.drift_detected);
+        assert_eq!(
+            validate_min_version_against_snapshot(&snap_none, "1.80.0").unwrap_err(),
+            ClusterToolchainError::MissingWorkerSemver {
+                min_version: "1.80.0".to_string(),
+            }
         );
     }
 }

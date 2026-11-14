@@ -1052,6 +1052,9 @@ impl CatalogStore {
                     },
                     assigned_node: Some(node_id),
                     exclusive: false,
+                    skip_if_unavailable: false,
+                    skip_reason_code: None,
+                    skip_capability: None,
                 })
             })
             .collect();
@@ -1090,6 +1093,7 @@ impl CatalogStore {
                 commit_sha: resolved_sha,
                 ref_name: resolved_ref,
                 sender: "LMA1980".to_string(),
+                pr_number: None,
                 queued_at,
             },
             status,

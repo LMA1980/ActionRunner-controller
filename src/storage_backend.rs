@@ -1668,6 +1668,7 @@ pub fn compute_next_submodule_snapshots(
                         commit_sha: record.job.commit_sha.clone(),
                         ref_name: record.job.ref_name.clone(),
                         sender: record.job.sender.clone(),
+                        pr_number: record.job.pr_number,
                         queued_at: record.job.queued_at,
                     };
                     let synth_rec = JobRecord {

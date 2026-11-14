@@ -436,12 +436,19 @@ pub async fn get_cluster_status(
     } else {
         sanitize_public_node_id(&state.config.node_id)
     };
+    let mut toolchain_snap = state.cluster.toolchain_snapshot().await;
     if !is_auth {
         for node in &mut nodes {
             sanitize_cluster_node(node);
         }
         if let Some(ref mut l) = lease {
             l.holder_id = sanitize_public_node_id(&l.holder_id);
+        }
+        for (nid, _) in &mut toolchain_snap.node_versions {
+            *nid = sanitize_public_node_id(nid);
+        }
+        for drift in &mut toolchain_snap.drift_details {
+            drift.node_id = sanitize_public_node_id(&drift.node_id);
         }
     }
     json_response(
@@ -455,6 +462,9 @@ pub async fn get_cluster_status(
             "queue_status": snap.status,
             "queue_depth": snap.queue_depth,
             "online_nodes": online_nodes,
+            "cluster_rust_semver": toolchain_snap.canonical_semver,
+            "toolchain_drift_detected": toolchain_snap.drift_detected,
+            "toolchain_drift_details": toolchain_snap.drift_details,
             "nodes": nodes
         }),
     )

@@ -245,6 +245,7 @@ async fn test_gray_failure_jobstore_reads_never_blocked_by_slow_storage_rpc() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store
@@ -263,6 +264,7 @@ async fn test_gray_failure_jobstore_reads_never_blocked_by_slow_storage_rpc() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
 
     let store_clone = state.job_store.clone();
@@ -512,6 +514,7 @@ async fn test_standby_tunnel_rejection_and_demotion_eviction() {
         ram_total_mb: 32768,
         toolchains: vec!["system".to_string()],
         btrfs_enabled: false,
+        rust_semver: None,
     };
     let payload = fory.serialize(&reg).expect("serialize reg");
     let header = IpcHeader::new(MSG_TYPE_WORKER_REGISTRATION, payload.len() as u32, 0, 1);
@@ -630,6 +633,7 @@ async fn test_stress_concurrent_writers_and_readers_under_slow_storage_rpcs() {
         ref_name: "refs/heads/main".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     state
         .job_store

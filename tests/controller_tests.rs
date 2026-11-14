@@ -145,6 +145,7 @@ async fn test_job_card_svg_route_and_headers() {
         ref_name: "feat/first-view-host-attribution".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     job_store
         .enqueue_job(job, PathBuf::from("logs/test.log"))
@@ -253,6 +254,7 @@ async fn test_sse_dashboard_and_job_events_push() {
         ref_name: "refs/heads/feat/sse-test".to_string(),
         sender: "LMA1980".to_string(),
         queued_at: Utc::now(),
+        pr_number: None,
     };
     job_store.enqueue_job(job, log_file).await;
 
