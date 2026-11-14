@@ -2369,13 +2369,18 @@ impl ControllerStorage for MuObserveRemoteStorage {
 
     fn create_auth_invite(&self, invite: &AuthInviteRecord) {
         self.auth_store.create_auth_invite(invite);
+        if let Some(json) = self.auth_store.export_platform_auth_json() {
+            self.sync_platform_auth_json(&json);
+        }
     }
 
     fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.get_auth_invite(invite_id)
     }
 
     fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.list_auth_invites()
     }
 
@@ -2386,20 +2391,35 @@ impl ControllerStorage for MuObserveRemoteStorage {
         github_login: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<AuthUserRecord, RedeemInviteError> {
-        self.auth_store
-            .redeem_auth_invite(invite_id, presented_hmac, github_login, now)
+        let res = self
+            .auth_store
+            .redeem_auth_invite(invite_id, presented_hmac, github_login, now);
+        if res.is_ok() {
+            if let Some(json) = self.auth_store.export_platform_auth_json() {
+                self.sync_platform_auth_json(&json);
+            }
+        }
+        res
     }
 
     fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.get_auth_user(github_login)
     }
 
     fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.list_auth_users()
     }
 
     fn revoke_auth_user(&self, github_login: &str) -> bool {
-        self.auth_store.revoke_auth_user(github_login)
+        let revoked = self.auth_store.revoke_auth_user(github_login);
+        if revoked {
+            if let Some(json) = self.auth_store.export_platform_auth_json() {
+                self.sync_platform_auth_json(&json);
+            }
+        }
+        revoked
     }
 
     fn emit_trace_spans(&self, spans: &[OtelSpanEntry]) {

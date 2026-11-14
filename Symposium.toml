@@ -2,6 +2,10 @@ name = "mu-ci-controller"
 # Crate-embedded Symposium manifest for mu-ci-controller.
 
 [[plugins]]
+depends-on = ["mu-auth"]
+source.cargo = "mu-auth"
+
+[[plugins]]
 depends-on = ["mu-ci-ipc"]
 source.cargo = "mu-ci-ipc"
 

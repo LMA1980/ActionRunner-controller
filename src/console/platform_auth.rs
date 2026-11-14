@@ -25,7 +25,7 @@ use webauthn_rs_core::proto::{PublicKeyCredential, RegisterPublicKeyCredential};
 use crate::auth::{
     activate_server_role_lease, authenticate_edge_github_login, build_webauthn_service,
     current_epoch_ms, datetime_to_epoch_ms, format_elevated_clear_cookie,
-    format_elevated_set_cookie, normalize_login, payload_has_forbidden_ttl_fields, rid,
+    format_elevated_set_cookie, normalize_login, payload_has_forbidden_ttl_fields,
     sign_baseline_invite_token, sign_elevated_cookie, verify_baseline_invite_token,
     verify_elevated_cookie, AuthReasonCodeDto, AuthSessionDto, ConsoleSkinDto, CrtFontDto,
     ElevatedCookieClaims, PendingAuthenticationState, PendingRegistrationState, PlatformAuthState,
@@ -147,8 +147,7 @@ impl EvaluatedRequestAuth {
                         now_ms,
                     )
                     .is_some(),
-                    (_, _, Some(_)) => false,
-                    (_, _, None) => true,
+                    _ => false,
                 };
 
                 let (principal, leases, eval) =
@@ -1013,7 +1012,7 @@ pub async fn redeem_invite(
             Some(invite_id),
             now,
         );
-        let (_, leases, eval) = st.evaluate_principal(Some(&github_login), true, now_ms);
+        let (_, leases, eval) = st.evaluate_principal(Some(&github_login), false, now_ms);
         Ok(st.build_session_dto(Some(&login_key), &leases, &eval, now_ms))
     });
 
@@ -1362,7 +1361,8 @@ pub async fn passkey_register_finish(
         );
         st.snapshot_revision = st.snapshot_revision.saturating_add(1);
 
-        let (_, leases, eval) = st.evaluate_principal(Some(&login), true, now_ms);
+        let cookie_ok = eval.cookie_valid_for_elevated;
+        let (_, leases, eval) = st.evaluate_principal(Some(&login), cookie_ok, now_ms);
         let session = st.build_session_dto(Some(&login_key), &leases, &eval, now_ms);
         let passkey_count = st.passkey_count_for(&login_key);
         Ok((cred_id_b64, passkey_count, session))
@@ -1623,6 +1623,15 @@ fn issue_step_up_challenge(
         Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, &json!({ "error": e })),
     };
 
+    if purpose == StepUpPurpose::ElevateRole {
+        let target_role = role_id
+            .as_deref()
+            .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
+        if RoleId::new(target_role).is_err() {
+            return bad_request_response("Invalid role_id");
+        }
+    }
+
     let now_ms = current_epoch_ms();
     let res = mutate_auth(&state.job_store, |st| {
         st.prune_challenges(now_ms);
@@ -1630,7 +1639,9 @@ fn issue_step_up_challenge(
             let target_role = role_id
                 .as_deref()
                 .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
-            let parsed_rid = rid(target_role);
+            let Ok(parsed_rid) = RoleId::new(target_role) else {
+                return err_resp(bad_request_response("Invalid role_id"));
+            };
             if st.role_catalog.get(&parsed_rid).is_none() {
                 return err_resp(not_found_response(&format!("Unknown role '{target_role}'")));
             }
@@ -1788,7 +1799,8 @@ pub async fn enable_role(
             None
         };
 
-        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), true, now_ms);
+        let cookie_ok_after = set_cookie.is_some() || eval.cookie_valid_for_elevated;
+        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), cookie_ok_after, now_ms);
         let session = st.build_session_dto(Some(&login_key), &leases, &eval_after, now_ms);
         Ok((session, set_cookie))
     });
@@ -1851,7 +1863,12 @@ pub async fn disable_role(
         );
         st.snapshot_revision = st.snapshot_revision.saturating_add(1);
 
-        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), true, now_ms);
+        let cookie_ok_after = if clear_cookie {
+            false
+        } else {
+            eval.cookie_valid_for_elevated
+        };
+        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), cookie_ok_after, now_ms);
         let session = st.build_session_dto(Some(&login_key), &leases, &eval_after, now_ms);
         Ok((session, clear_cookie))
     });
@@ -1947,6 +1964,16 @@ pub async fn elevate_finish(
         Ok(p) => p,
         Err(e) => return bad_request_response(&format!("Invalid JSON payload: {e}")),
     };
+    if let Some(req_role) = payload
+        .role_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if RoleId::new(req_role).is_err() {
+            return bad_request_response("Invalid role_id");
+        }
+    }
     let Ok(gh_login) = GithubLogin::new(login.clone()) else {
         return authorization_denied_response();
     };
@@ -2003,7 +2030,8 @@ pub async fn elevate_finish(
                 },
             );
             st.record_audit(&login, "passkey.step_up.manage", None, "ok", now_ms);
-            let (_, leases, eval_after) = st.evaluate_principal(Some(&login), true, now_ms);
+            let (_, leases, eval_after) =
+                st.evaluate_principal(Some(&login), eval.cookie_valid_for_elevated, now_ms);
             let session = st.build_session_dto(Some(&login_key), &leases, &eval_after, now_ms);
             return Ok((
                 json!({
@@ -2025,12 +2053,14 @@ pub async fn elevate_finish(
             .or(pending.role_id.as_deref())
             .unwrap_or(crate::auth::ADMIN_TIMED_ROLE_ID);
 
+        let Ok(target_rid) = RoleId::new(target_role_str) else {
+            return err_resp(bad_request_response("Invalid role_id"));
+        };
         if let Some(pending_role) = pending.role_id.as_deref() {
             if pending_role != target_role_str {
                 return err_resp(authorization_denied_response());
             }
         }
-        let target_rid = rid(target_role_str);
         let (_, maybe_lease) =
             activate_server_role_lease(st, &login_key, &target_rid, true, now_ms).map_err(
                 |(code, msg)| Box::new(auth_error_response(StatusCode::FORBIDDEN, code, &msg)),
@@ -2122,7 +2152,7 @@ pub async fn elevate_lock_all(State(state): State<Arc<AppState>>, headers: Heade
         }
         st.record_audit(&login, "roles.lock_all", None, "ok", now_ms);
         st.snapshot_revision = st.snapshot_revision.saturating_add(1);
-        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), true, now_ms);
+        let (_, leases, eval_after) = st.evaluate_principal(Some(&login), false, now_ms);
         Ok(st.build_session_dto(Some(&login_key), &leases, &eval_after, now_ms))
     });
 
@@ -3008,7 +3038,7 @@ pub async fn create_invite(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("https://console.local");
+        .unwrap_or("https://console.lma1980.duckdns.org");
     let invite_url = format!("{}/#redeem={}", base_url.trim_end_matches('/'), raw_token);
 
     json_status(
@@ -3121,19 +3151,6 @@ fn is_authorized_internal_snapshot_caller(
 ) -> AuthResult<()> {
     if has_valid_admin_api_key(config, headers, None) {
         return Ok(());
-    }
-    if let Some(expected_proxy) = config.proxy_secret.as_deref() {
-        let supplied_secret = headers
-            .get("x-proxy-secret")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .unwrap_or_default();
-        let has_forwarded_user = headers.contains_key("x-forwarded-user");
-        if !has_forwarded_user
-            && constant_time_eq(supplied_secret.as_bytes(), expected_proxy.as_bytes())
-        {
-            return Ok(());
-        }
     }
     let eval = EvaluatedRequestAuth::evaluate(config, job_store, headers, None);
     if eval.is_platform_admin() {

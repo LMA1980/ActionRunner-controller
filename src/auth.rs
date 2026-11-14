@@ -573,11 +573,26 @@ impl PlatformAuthState {
             passkey_count,
         };
 
-        let mut leases = if cookie_valid_for_elevated && passkey_count > 0 {
-            self.role_leases
+        let mut leases = if passkey_count > 0 {
+            let mut l = self
+                .role_leases
                 .get(&key)
                 .cloned()
-                .unwrap_or_else(|| RoleLeases::for_login(&self.role_catalog, &principal))
+                .unwrap_or_else(|| RoleLeases::for_login(&self.role_catalog, &principal));
+            if !cookie_valid_for_elevated {
+                // Timed leases (and any Passkey-step-up gated roles) require a valid
+                // __Host-mu_elevated cookie, while Elective StepUpRequirement::None roles
+                // remain independent of the elevated cookie.
+                l.timed_leases.clear();
+                let catalog = &self.role_catalog;
+                l.elective_roles.retain(|role_id| {
+                    catalog.get(role_id).is_some_and(|spec| {
+                        matches!(spec.activation, RoleActivation::Elective)
+                            && spec.step_up == StepUpRequirement::None
+                    })
+                });
+            }
+            l
         } else {
             RoleLeases::for_login(&self.role_catalog, &principal)
         };

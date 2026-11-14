@@ -134,7 +134,7 @@ struct VirtualAuthenticator {
 }
 
 impl VirtualAuthenticator {
-    fn new_one_password(seed: u8, cred_id: &[u8]) -> Self {
+    fn new_synced(seed: u8, cred_id: &[u8]) -> Self {
         Self::with_flags(seed, cred_id, true, true, 0)
     }
 
@@ -419,7 +419,7 @@ async fn canonical_manifests_composite_folios_cycles_and_anonymous_lockdown() {
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "LMA1980"),
     ];
-    let admin_auth = VirtualAuthenticator::new_one_password(1, b"cred-admin-folios");
+    let admin_auth = VirtualAuthenticator::new_synced(1, b"cred-admin-folios");
     enroll_passkey(&app, &admin_hdrs, &admin_auth, "Admin Passkey", None).await;
     let (st, _, cookie_opt) =
         elevate_role(&app, &admin_hdrs, &admin_auth, 0, "platform-admin").await;
@@ -609,7 +609,7 @@ async fn profile_preferences_case_insensitive_logins_and_last_admin_lockout_guar
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "lma1980"),
     ];
-    let admin_auth = VirtualAuthenticator::new_one_password(2, b"cred-admin-guard");
+    let admin_auth = VirtualAuthenticator::new_synced(2, b"cred-admin-guard");
     enroll_passkey(&app, &lma_lower_hdrs, &admin_auth, "Admin Passkey", None).await;
 
     let (st_prof0, prof0, _, _) =
@@ -736,7 +736,7 @@ async fn passkey_counters_clone_detection_management_step_up_and_resets() {
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "LMA1980"),
     ];
-    let admin_1p = VirtualAuthenticator::new_one_password(10, b"cred-admin-1p");
+    let admin_1p = VirtualAuthenticator::new_synced(10, b"cred-admin-1p");
     let cred1_id = enroll_passkey(&app, &admin_hdrs, &admin_1p, "Admin 1P", None).await;
 
     // 1Password repeated sign_count == 0 -> 0 stays allowed across assertions!
@@ -831,7 +831,7 @@ async fn passkey_counters_clone_detection_management_step_up_and_resets() {
         Some(json!({ "invite_token": inv_j["invite_token"] })),
     )
     .await;
-    let op_auth = VirtualAuthenticator::new_one_password(30, b"cred-reset-target");
+    let op_auth = VirtualAuthenticator::new_synced(30, b"cred-reset-target");
     enroll_passkey(&app, &op_hdrs, &op_auth, "Target Key", None).await;
 
     let (st_adm_rst, adm_rst_j, _, _) = req_full(
@@ -885,7 +885,7 @@ async fn role_leases_cookie_tamper_activity_ttl_rejection_and_internal_snapshot_
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "LMA1980"),
     ];
-    let admin_auth = VirtualAuthenticator::new_one_password(40, b"cred-admin-leases");
+    let admin_auth = VirtualAuthenticator::new_synced(40, b"cred-admin-leases");
     enroll_passkey(&app, &admin_hdrs, &admin_auth, "Admin Leases Passkey", None).await;
 
     // 1. Disabling canonical PinnedBaseline "operator" must fail with 403 pinned_baseline_immutable.
@@ -943,6 +943,129 @@ async fn role_leases_cookie_tamper_activity_ttl_rejection_and_internal_snapshot_
         ("X-Forwarded-User", "LMA1980"),
         ("Cookie", cookie.as_str()),
     ];
+
+    // 3a. Omitting Cookie header must NOT inherit Timed elevation (#193):
+    //     session stays at baseline "operator" with empty leases, and /api/auth/invites fails 403.
+    let (st_no_cookie_sess, no_cookie_sess, _, _) =
+        req_full(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st_no_cookie_sess, StatusCode::OK);
+    assert_eq!(no_cookie_sess["role"], "operator");
+    assert_eq!(no_cookie_sess["leases"].as_array().unwrap().len(), 0);
+    let (st_no_cookie_inv, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({ "note": "missing-cookie-bypass" })),
+    )
+    .await;
+    assert_eq!(st_no_cookie_inv, StatusCode::FORBIDDEN);
+
+    // 3b. Elective StepUpRequirement::None role ("ci-operator") stays active without __Host-mu_elevated cookie (#193).
+    let (st_grant_ci, _, _, _) = req_full(
+        &app,
+        "PUT",
+        "/api/auth/users/LMA1980/roles",
+        &elevated_hdrs,
+        Some(json!({ "roles": ["operator", "ci-operator", "platform-admin"] })),
+    )
+    .await;
+    assert_eq!(st_grant_ci, StatusCode::OK);
+    let (st_en_ci, en_ci_j, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/roles/ci-operator/enable",
+        &admin_hdrs,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_en_ci, StatusCode::OK);
+    assert_eq!(en_ci_j["leases"].as_array().unwrap().len(), 0);
+    assert!(en_ci_j["active_policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "ci:jobs.restart"));
+    let (st_ci_sess, ci_sess_j, _, _) =
+        req_full(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st_ci_sess, StatusCode::OK);
+    assert!(ci_sess_j["active_policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "ci:jobs.restart"));
+    assert_eq!(ci_sess_j["leases"].as_array().unwrap().len(), 0);
+
+    // 3c. Invalid role_id in elevate/start and elevate/finish returns 400 Bad Request, never panics (#193).
+    let (st_bad_start, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/elevate/start",
+        &admin_hdrs,
+        Some(json!({ "role_id": "Invalid Role!" })),
+    )
+    .await;
+    assert_eq!(st_bad_start, StatusCode::BAD_REQUEST);
+
+    let (st_good_start, good_start_j, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/elevate/start",
+        &admin_hdrs,
+        Some(json!({ "role_id": "platform-admin" })),
+    )
+    .await;
+    assert_eq!(st_good_start, StatusCode::OK);
+    let bad_fin_cid = good_start_j["challenge_id"].as_str().unwrap().to_string();
+    let bad_fin_chal = URL_SAFE_NO_PAD
+        .decode(
+            good_start_j["options"]["publicKey"]["challenge"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    let bad_fin_cred = admin_auth.assert_response(&bad_fin_chal, 0);
+    let (st_bad_fin, _, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/elevate/finish",
+        &admin_hdrs,
+        Some(json!({
+            "challenge_id": bad_fin_cid,
+            "credential": bad_fin_cred,
+            "role_id": "Invalid Role!",
+        })),
+    )
+    .await;
+    assert_eq!(st_bad_fin, StatusCode::BAD_REQUEST);
+
+    // 3d. Default invite fallback URL uses canonical public domain, never `.local` (#194).
+    let (st_inv_default, inv_default_j, _, _) = req_full(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &elevated_hdrs,
+        Some(json!({ "note": "default-url-check" })),
+    )
+    .await;
+    assert_eq!(st_inv_default, StatusCode::CREATED);
+    let default_inv_url = inv_default_j["invite_url"].as_str().unwrap();
+    assert!(
+        default_inv_url.starts_with("https://console.lma1980.duckdns.org/#redeem="),
+        "unexpected invite fallback URL: {default_inv_url}"
+    );
+    assert!(!default_inv_url.contains(".local"));
+
+    let (st_admin_snap, _, _, _) = req_full(
+        &app,
+        "GET",
+        "/api/internal/auth/snapshot",
+        &elevated_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_admin_snap, StatusCode::OK);
+
     let (st_act, act_j, _, _) = req_full(
         &app,
         "POST",
@@ -993,12 +1116,34 @@ async fn role_leases_cookie_tamper_activity_ttl_rejection_and_internal_snapshot_
     .await;
     assert_eq!(st_stale, StatusCode::FORBIDDEN);
 
-    // 4. GET /api/internal/auth/snapshot requires internal auth, serves ETag, and returns 304 on If-None-Match.
+    // 4. GET /api/internal/auth/snapshot rejects anonymous & proxy-secret-only requests (#194),
+    //    accepts AdminApiKey (or elevated platform-admin), serves ETag, and returns 304 on If-None-Match.
     let (st_unauth, _, _, _) =
         req_full(&app, "GET", "/api/internal/auth/snapshot", &[], None).await;
     assert_eq!(st_unauth, StatusCode::UNAUTHORIZED);
 
-    let internal_hdrs = [("X-Proxy-Secret", PROXY_SECRET)];
+    let (st_proxy_only, _, _, _) = req_full(
+        &app,
+        "GET",
+        "/api/internal/auth/snapshot",
+        &[("X-Proxy-Secret", PROXY_SECRET)],
+        None,
+    )
+    .await;
+    assert_eq!(st_proxy_only, StatusCode::UNAUTHORIZED);
+
+    let (st_non_elev, _, _, _) = req_full(
+        &app,
+        "GET",
+        "/api/internal/auth/snapshot",
+        &admin_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_non_elev, StatusCode::FORBIDDEN);
+
+    let bearer = format!("Bearer {API_KEY}");
+    let internal_hdrs = [("Authorization", bearer.as_str())];
     let (st_snap, snap_j, _, etag_opt) = req_full(
         &app,
         "GET",
@@ -1016,7 +1161,7 @@ async fn role_leases_cookie_tamper_activity_ttl_rejection_and_internal_snapshot_
         "GET",
         "/api/internal/auth/snapshot",
         &[
-            ("X-Proxy-Secret", PROXY_SECRET),
+            ("Authorization", bearer.as_str()),
             ("If-None-Match", etag.as_str()),
         ],
         None,
