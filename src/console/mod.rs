@@ -1444,7 +1444,7 @@ pub fn default_cache_file(workspace: &Path) -> PathBuf {
 }
 
 /// Mask private LAN and documentation IPv4 addresses (`10.x.y.z`, `172.16-31.x.y`,
-/// `192.168.x.y`, `192.0.2.x`) by replacing octet 3 with `###`.
+/// RFC 1918 /16 private ranges, and RFC 5737 `192.0.2.x`) by replacing octet 3 with `###`.
 fn mask_private_ipv4_octets(s: &mut String) {
     let bytes = s.as_bytes();
     let len = bytes.len();
