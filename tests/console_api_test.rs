@@ -5,6 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::Router;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
 use mu_ci_controller::app::create_router;
@@ -13,12 +15,20 @@ use mu_ci_controller::config::Config;
 use mu_ci_controller::console::{ConsoleConfig, ConsoleState};
 use mu_ci_controller::job::{Job, JobMetrics, JobStatus, JobStore, StageRecord, StageStatus};
 use mu_ci_controller::webhook::AppState;
+use p256::ecdsa::signature::Signer as _;
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
+use serde_cbor_2::Value as CborValue;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
+use webauthn_rs_core::proto::{
+    AuthenticatorAssertionResponseRaw, AuthenticatorAttestationResponseRaw, PublicKeyCredential,
+    RegisterPublicKeyCredential,
+};
 
 const API_KEY: &str = "console-test-key";
 const SHA_CORE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -961,13 +971,13 @@ async fn seeded_auth_state() -> (Arc<AppState>, tempfile::TempDir) {
     (state, tmp)
 }
 
-async fn send_req(
+async fn send_req_with_cookie(
     app: &Router,
     method: &str,
     uri: &str,
     headers: &[(&str, &str)],
     body: Option<Value>,
-) -> (StatusCode, Value, String) {
+) -> (StatusCode, Value, String, Option<String>) {
     let mut builder = Request::builder().method(method).uri(uri);
     for (k, v) in headers {
         builder = builder.header(*k, *v);
@@ -985,12 +995,275 @@ async fn send_req(
         .await
         .unwrap();
     let status = resp.status();
+    let elevated_cookie = resp
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|raw| {
+            let pair = raw.split(';').next()?.trim();
+            pair.starts_with("__Host-mu_elevated=")
+                .then(|| pair.to_string())
+        });
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let text = String::from_utf8_lossy(&bytes).to_string();
     let json_val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, json_val, text)
+    (status, json_val, text, elevated_cookie)
+}
+
+async fn send_req(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, Value, String) {
+    let (st, j, text, _) = send_req_with_cookie(app, method, uri, headers, body).await;
+    (st, j, text)
+}
+
+struct TestVirtualAuthenticator {
+    rp_id: String,
+    origin: String,
+    cred_id: Vec<u8>,
+    signing_key: P256SigningKey,
+    pub_x: Vec<u8>,
+    pub_y: Vec<u8>,
+    backup_eligible: bool,
+    backup_state: bool,
+    sign_count: u32,
+}
+
+impl TestVirtualAuthenticator {
+    fn new_synced(seed_byte: u8, cred_tag: &[u8]) -> Self {
+        let mut secret = [0u8; 32];
+        for (idx, b) in secret.iter_mut().enumerate() {
+            *b = seed_byte.wrapping_add((idx as u8).wrapping_mul(17)).max(1);
+        }
+        let signing_key = P256SigningKey::from_slice(&secret).expect("valid p256 seed");
+        let point = signing_key.verifying_key().to_sec1_point(false);
+        let pub_x = point.x().expect("x coord").to_vec();
+        let pub_y = point.y().expect("y coord").to_vec();
+        Self {
+            rp_id: "localhost".to_string(),
+            origin: "http://localhost".to_string(),
+            cred_id: cred_tag.to_vec(),
+            signing_key,
+            pub_x,
+            pub_y,
+            backup_eligible: true,
+            backup_state: true,
+            sign_count: 0,
+        }
+    }
+
+    fn create_registration_response(&self, challenge_bytes: &[u8]) -> RegisterPublicKeyCredential {
+        let mut flags: u8 = 0x01 | 0x04 | 0x40; // UP | UV | AT
+        if self.backup_eligible {
+            flags |= 0x08;
+        }
+        if self.backup_state {
+            flags |= 0x10;
+        }
+
+        let rp_id_hash = Sha256::digest(self.rp_id.as_bytes());
+        let mut cose_map = BTreeMap::new();
+        cose_map.insert(CborValue::Integer(1), CborValue::Integer(2)); // kty = EC2
+        cose_map.insert(CborValue::Integer(3), CborValue::Integer(-7)); // alg = ES256
+        cose_map.insert(CborValue::Integer(-1), CborValue::Integer(1)); // crv = P-256
+        cose_map.insert(CborValue::Integer(-2), CborValue::Bytes(self.pub_x.clone()));
+        cose_map.insert(CborValue::Integer(-3), CborValue::Bytes(self.pub_y.clone()));
+        let cose_cbor = serde_cbor_2::to_vec(&CborValue::Map(cose_map)).unwrap();
+
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&rp_id_hash);
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&self.sign_count.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(&(self.cred_id.len() as u16).to_be_bytes());
+        auth_data.extend_from_slice(&self.cred_id);
+        auth_data.extend_from_slice(&cose_cbor);
+
+        let mut att_obj = BTreeMap::new();
+        att_obj.insert(
+            CborValue::Text("fmt".into()),
+            CborValue::Text("none".into()),
+        );
+        att_obj.insert(
+            CborValue::Text("attStmt".into()),
+            CborValue::Map(BTreeMap::new()),
+        );
+        att_obj.insert(
+            CborValue::Text("authData".into()),
+            CborValue::Bytes(auth_data),
+        );
+        let attestation_object = serde_cbor_2::to_vec(&CborValue::Map(att_obj)).unwrap();
+
+        let client_data = json!({
+            "type": "webauthn.create",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge_bytes),
+            "origin": self.origin,
+            "crossOrigin": false,
+        });
+        let client_data_json = serde_json::to_vec(&client_data).unwrap();
+
+        RegisterPublicKeyCredential {
+            id: URL_SAFE_NO_PAD.encode(&self.cred_id),
+            raw_id: self.cred_id.clone(),
+            response: AuthenticatorAttestationResponseRaw {
+                attestation_object,
+                client_data_json,
+                transports: None,
+            },
+            type_: "public-key".into(),
+            extensions: Default::default(),
+        }
+    }
+
+    fn create_assertion_response(
+        &self,
+        challenge_bytes: &[u8],
+        sign_count: u32,
+    ) -> PublicKeyCredential {
+        let mut flags: u8 = 0x01 | 0x04; // UP | UV
+        if self.backup_eligible {
+            flags |= 0x08;
+        }
+        if self.backup_state {
+            flags |= 0x10;
+        }
+
+        let rp_id_hash = Sha256::digest(self.rp_id.as_bytes());
+        let mut auth_data = Vec::with_capacity(37);
+        auth_data.extend_from_slice(&rp_id_hash);
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+
+        let client_data = json!({
+            "type": "webauthn.get",
+            "challenge": URL_SAFE_NO_PAD.encode(challenge_bytes),
+            "origin": self.origin,
+            "crossOrigin": false,
+        });
+        let client_data_json = serde_json::to_vec(&client_data).unwrap();
+        let client_data_hash = Sha256::digest(&client_data_json);
+
+        let mut signed_msg = Vec::with_capacity(auth_data.len() + client_data_hash.len());
+        signed_msg.extend_from_slice(&auth_data);
+        signed_msg.extend_from_slice(&client_data_hash);
+
+        let sig: P256Signature = self.signing_key.sign(&signed_msg);
+        let der_sig = sig.to_der().as_ref().to_vec();
+
+        PublicKeyCredential {
+            id: URL_SAFE_NO_PAD.encode(&self.cred_id),
+            raw_id: self.cred_id.clone(),
+            response: AuthenticatorAssertionResponseRaw {
+                authenticator_data: auth_data,
+                client_data_json,
+                signature: der_sig,
+                user_handle: None,
+            },
+            extensions: Default::default(),
+            type_: "public-key".into(),
+        }
+    }
+}
+
+async fn enroll_first_passkey(
+    app: &Router,
+    hdrs: &[(&str, &str)],
+    auth: &TestVirtualAuthenticator,
+    label: &str,
+) {
+    let (st_start, start_json, start_text) = send_req(
+        app,
+        "POST",
+        "/api/auth/passkeys/register/start",
+        hdrs,
+        Some(json!({ "label": label })),
+    )
+    .await;
+    assert_eq!(
+        st_start,
+        StatusCode::OK,
+        "register/start failed: {st_start} {start_text}"
+    );
+    let challenge_id = start_json["challenge_id"].as_str().unwrap().to_string();
+    let challenge_b64 = start_json["options"]["publicKey"]["challenge"]
+        .as_str()
+        .unwrap();
+    let challenge_bytes = URL_SAFE_NO_PAD.decode(challenge_b64).unwrap();
+    let cred = auth.create_registration_response(&challenge_bytes);
+
+    let (st_fin, fin_json, fin_text) = send_req(
+        app,
+        "POST",
+        "/api/auth/passkeys/register/finish",
+        hdrs,
+        Some(json!({
+            "challenge_id": challenge_id,
+            "credential": cred,
+            "label": label,
+        })),
+    )
+    .await;
+    assert_eq!(
+        st_fin,
+        StatusCode::OK,
+        "register/finish failed: {st_fin} {fin_text}"
+    );
+    assert_eq!(fin_json["session"]["passkey_enrollment_required"], false);
+    assert_eq!(fin_json["session"]["role"], "operator");
+}
+
+async fn elevate_admin_with_passkey(
+    app: &Router,
+    hdrs: &[(&str, &str)],
+    auth: &TestVirtualAuthenticator,
+) -> String {
+    let (st_start, start_json, start_text) = send_req(
+        app,
+        "POST",
+        "/api/auth/elevate/start",
+        hdrs,
+        Some(json!({ "role_id": "platform-admin" })),
+    )
+    .await;
+    assert_eq!(
+        st_start,
+        StatusCode::OK,
+        "elevate/start failed: {st_start} {start_text}"
+    );
+    let challenge_id = start_json["challenge_id"].as_str().unwrap().to_string();
+    let challenge_b64 = start_json["options"]["publicKey"]["challenge"]
+        .as_str()
+        .unwrap();
+    let challenge_bytes = URL_SAFE_NO_PAD.decode(challenge_b64).unwrap();
+    let cred = auth.create_assertion_response(&challenge_bytes, auth.sign_count);
+
+    let (st_fin, fin_json, fin_text, cookie_opt) = send_req_with_cookie(
+        app,
+        "POST",
+        "/api/auth/elevate/finish",
+        hdrs,
+        Some(json!({
+            "challenge_id": challenge_id,
+            "credential": cred,
+            "role_id": "platform-admin",
+        })),
+    )
+    .await;
+    assert_eq!(
+        st_fin,
+        StatusCode::OK,
+        "elevate/finish failed: {st_fin} {fin_text}"
+    );
+    assert_eq!(fin_json["elevated"], true);
+    assert_eq!(fin_json["session"]["role"], "platform-admin");
+    cookie_opt.expect("elevate/finish must set __Host-mu_elevated cookie")
 }
 
 #[tokio::test]
@@ -1046,7 +1319,7 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // 2. Uninvited GitHub user with valid X-Proxy-Secret gets 200 (invite_bound: false) on /api/auth/session,
-    //    and 403 Forbidden on /log, /events, /restart, /resume, /ha/promote, /ha/demote
+    //    and 403 Forbidden with generic AuthorizationDenied (zero invite hints) on protected endpoints.
     let uninvited_hdrs = [
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "random-github-user"),
@@ -1057,6 +1330,7 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert_eq!(j["github_login"], "random-github-user");
     assert_eq!(j["invite_bound"], false);
     assert_eq!(j["role"], Value::Null);
+    assert_eq!(j["reason_code"], "authorization_denied");
 
     for (method, path) in [
         ("GET", "/api/jobs/job-m7-1/log"),
@@ -1067,12 +1341,13 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
         ("POST", "/api/ha/promote"),
         ("POST", "/api/ha/demote"),
     ] {
-        let (st, j, _) = send_req(&app, method, path, &uninvited_hdrs, None).await;
+        let (st, j, body_text) = send_req(&app, method, path, &uninvited_hdrs, None).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "expected 403 on {method} {path}");
-        assert!(j["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("not bound to an active MuConsole invite"));
+        assert_eq!(j["reason_code"], "authorization_denied");
+        assert!(
+            !body_text.to_ascii_lowercase().contains("invite"),
+            "protected denial must not leak invite onboarding hints: {body_text}"
+        );
     }
 
     // Uninvited user cannot create invites (403)
@@ -1086,7 +1361,8 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
-    // 3. Bootstrap admin ("LMA1980") via X-Proxy-Secret is authenticated as admin and can issue invites
+    // 3. Bootstrap admin ("LMA1980") starts at 0 Passkeys (withheld baseline console access until enrolled),
+    //    enrolls Passkey to become active baseline "operator", and steps up to timed "platform-admin" to issue invites.
     let admin_hdrs = [
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "LMA1980"),
@@ -1096,13 +1372,36 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert_eq!(j["authenticated"], true);
     assert_eq!(j["github_login"], "LMA1980");
     assert_eq!(j["invite_bound"], true);
-    assert_eq!(j["role"], "admin");
+    assert_eq!(j["passkey_enrollment_required"], true);
+    assert_eq!(j["passkey_count"], 0);
+    assert_eq!(j["role"], Value::Null);
+
+    let admin_auth = TestVirtualAuthenticator::new_synced(11, b"cred-admin-lma");
+    enroll_first_passkey(&app, &admin_hdrs, &admin_auth, "Admin 1Password").await;
+
+    // Dormant platform-admin cannot create invites until step-up elevation completes
+    let (st_pre_elev, _, _) = send_req(
+        &app,
+        "POST",
+        "/api/auth/invites",
+        &admin_hdrs,
+        Some(json!({ "note": "pre-elevation" })),
+    )
+    .await;
+    assert_eq!(st_pre_elev, StatusCode::FORBIDDEN);
+
+    let admin_cookie = elevate_admin_with_passkey(&app, &admin_hdrs, &admin_auth).await;
+    let admin_elevated_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", admin_cookie.as_str()),
+    ];
 
     let (st, inv_resp, _) = send_req(
         &app,
         "POST",
         "/api/auth/invites",
-        &admin_hdrs,
+        &admin_elevated_hdrs,
         Some(json!({
             "ttl_seconds": 3600,
             "note": "Operator onboarding",
@@ -1117,8 +1416,9 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert!(invite_token.starts_with(&format!("inv_{invite_id}.")));
     assert_eq!(
         invite_url,
-        format!("https://console.lma1980.duckdns.org/?invite={invite_token}")
+        format!("https://console.lma1980.duckdns.org/#redeem={invite_token}")
     );
+    assert_eq!(inv_resp["granted_role"], "operator");
 
     // 4. Tampered HMAC signature on /api/auth/redeem is rejected with 401
     let tampered_token =
@@ -1133,7 +1433,7 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
-    // 5. Valid single-use redemption binds "random-github-user" as "operator" (200 OK)
+    // 5. Valid single-use redemption binds "random-github-user" strictly as PinnedBaseline ("operator") at 0 Passkeys
     let (st, redeem_json, _) = send_req(
         &app,
         "POST",
@@ -1146,7 +1446,10 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert_eq!(redeem_json["authenticated"], true);
     assert_eq!(redeem_json["github_login"], "random-github-user");
     assert_eq!(redeem_json["invite_bound"], true);
-    assert_eq!(redeem_json["role"], "operator");
+    assert_eq!(redeem_json["baseline_role"], "operator");
+    assert_eq!(redeem_json["passkey_enrollment_required"], true);
+    assert_eq!(redeem_json["passkey_count"], 0);
+    assert_eq!(redeem_json["role"], Value::Null);
 
     // 6. Replay of the already-used invite token returns 409 Conflict
     let second_user_hdrs = [
@@ -1167,11 +1470,52 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
         .unwrap_or("")
         .contains("already been used"));
 
-    // 7. Bound operator now accesses /log, /restart, and private repos in /api/repos (200 OK)
+    // 7. At 0 Passkeys, baseline /log is withheld with 403 passkey_enrollment_required.
+    let (st_0pk, j_0pk, _) =
+        send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
+    assert_eq!(st_0pk, StatusCode::FORBIDDEN);
+    assert_eq!(j_0pk["reason_code"], "passkey_enrollment_required");
+
+    // Once enrolled, bound "operator" accesses /log and private repos, while job /restart requires "ci-operator"
+    let user_auth = TestVirtualAuthenticator::new_synced(22, b"cred-random-operator");
+    enroll_first_passkey(&app, &uninvited_hdrs, &user_auth, "User Passkey").await;
+
     let (st, _, log_text) =
         send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
     assert_eq!(st, StatusCode::OK);
     assert!(log_text.contains("cargo test passed"));
+
+    let (st_pre_ci, j_pre_ci, _) = send_req(
+        &app,
+        "POST",
+        "/api/jobs/job-m7-1/restart",
+        &uninvited_hdrs,
+        None,
+    )
+    .await;
+    assert_eq!(st_pre_ci, StatusCode::FORBIDDEN);
+    assert_eq!(j_pre_ci["reason_code"], "authorization_denied");
+
+    // Elevated platform-admin binds elective "ci-operator", user enables it -> /restart -> 200 OK
+    let (st_grant, _, grant_text) = send_req(
+        &app,
+        "PUT",
+        "/api/auth/users/random-github-user/roles",
+        &admin_elevated_hdrs,
+        Some(json!({ "bound_roles": ["operator", "ci-operator"] })),
+    )
+    .await;
+    assert_eq!(st_grant, StatusCode::OK, "role grant failed: {grant_text}");
+
+    let (st_enable, _, enable_text) = send_req(
+        &app,
+        "POST",
+        "/api/auth/roles/ci-operator/enable",
+        &uninvited_hdrs,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st_enable, StatusCode::OK, "enable failed: {enable_text}");
 
     let (st, restart_json, _) = send_req(
         &app,
@@ -1215,7 +1559,8 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert!(exp_err["error"].as_str().unwrap_or("").contains("expired"));
 
     // 9. GET /api/auth/invites lists invites without raw tokens + bound users
-    let (st, list_inv, _) = send_req(&app, "GET", "/api/auth/invites", &admin_hdrs, None).await;
+    let (st, list_inv, _) =
+        send_req(&app, "GET", "/api/auth/invites", &admin_elevated_hdrs, None).await;
     assert_eq!(st, StatusCode::OK);
     let invites_arr = list_inv["invites"].as_array().unwrap();
     assert_eq!(invites_arr.len(), 2);
@@ -1232,7 +1577,7 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
         &app,
         "DELETE",
         "/api/auth/users/random-github-user",
-        &admin_hdrs,
+        &admin_elevated_hdrs,
         None,
     )
     .await;
@@ -1244,6 +1589,7 @@ async fn invite_lifecycle_single_use_redemption_replay_expiry_and_revocation() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(sess_after["authenticated"], false);
     assert_eq!(sess_after["invite_bound"], false);
+    assert_eq!(sess_after["reason_code"], "authorization_denied");
 
     let (st, _, _) = send_req(&app, "GET", "/api/jobs/job-m7-1/log", &uninvited_hdrs, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -1254,10 +1600,8 @@ async fn invite_redemption_payload_token_compatibility() {
     let (state, _tmp) = seeded_auth_state().await;
     let app = create_router(state.clone());
 
-    let admin_hdrs = [
-        ("X-Proxy-Secret", PROXY_SECRET),
-        ("X-Forwarded-User", "LMA1980"),
-    ];
+    let bearer_auth = format!("Bearer {API_KEY}");
+    let api_hdrs = [("Authorization", bearer_auth.as_str())];
 
     // Mint three invite tokens:
     // 1) For redemption using {"token": ...} (MuConsole web worker format)
@@ -1267,7 +1611,7 @@ async fn invite_redemption_payload_token_compatibility() {
         &app,
         "POST",
         "/api/auth/invites",
-        &admin_hdrs,
+        &api_hdrs,
         Some(json!({
             "ttl_seconds": 3600,
             "note": "MuConsole web worker invite (token field)",
@@ -1282,7 +1626,7 @@ async fn invite_redemption_payload_token_compatibility() {
         &app,
         "POST",
         "/api/auth/invites",
-        &admin_hdrs,
+        &api_hdrs,
         Some(json!({
             "ttl_seconds": 3600,
             "note": "Standard invite (invite_token field)",
@@ -1297,7 +1641,7 @@ async fn invite_redemption_payload_token_compatibility() {
         &app,
         "POST",
         "/api/auth/invites",
-        &admin_hdrs,
+        &api_hdrs,
         Some(json!({
             "ttl_seconds": 3600,
             "note": "Dual field invite (both token and invite_token)",
@@ -1329,7 +1673,9 @@ async fn invite_redemption_payload_token_compatibility() {
     assert_eq!(redeem_token_json["authenticated"], true);
     assert_eq!(redeem_token_json["github_login"], "muconsole-user");
     assert_eq!(redeem_token_json["invite_bound"], true);
-    assert_eq!(redeem_token_json["role"], "operator");
+    assert_eq!(redeem_token_json["baseline_role"], "operator");
+    assert_eq!(redeem_token_json["passkey_enrollment_required"], true);
+    assert_eq!(redeem_token_json["passkey_count"], 0);
 
     // 2. Redeem using controller standard payload format: {"invite_token": token2}
     let user2_hdrs = [
@@ -1352,7 +1698,8 @@ async fn invite_redemption_payload_token_compatibility() {
     assert_eq!(redeem_invite_json["authenticated"], true);
     assert_eq!(redeem_invite_json["github_login"], "standard-user");
     assert_eq!(redeem_invite_json["invite_bound"], true);
-    assert_eq!(redeem_invite_json["role"], "operator");
+    assert_eq!(redeem_invite_json["baseline_role"], "operator");
+    assert_eq!(redeem_invite_json["passkey_enrollment_required"], true);
 
     // 3. Redeem using dual field payload format: {"token": token3, "invite_token": token3}
     let user3_hdrs = [
@@ -1378,7 +1725,8 @@ async fn invite_redemption_payload_token_compatibility() {
     assert_eq!(redeem_dual_json["authenticated"], true);
     assert_eq!(redeem_dual_json["github_login"], "dual-user");
     assert_eq!(redeem_dual_json["invite_bound"], true);
-    assert_eq!(redeem_dual_json["role"], "operator");
+    assert_eq!(redeem_dual_json["baseline_role"], "operator");
+    assert_eq!(redeem_dual_json["passkey_enrollment_required"], true);
 
     // 4. Missing both fields produces 422 Unprocessable Entity
     let user4_hdrs = [
@@ -1466,7 +1814,7 @@ async fn session_resolution_anonymous_untrusted_uninvited_and_bound_operator() {
         assert_eq!(j_empty["role"], Value::Null);
     }
 
-    // 5. Caller with valid X-Proxy-Secret + X-Forwarded-User NOT in auth_users -> UninvitedUser
+    // 5. Caller with valid X-Proxy-Secret + X-Forwarded-User NOT in auth_users -> UninvitedUser (generic denial)
     let (st_uninv, j_uninv, _) = send_req(
         &app,
         "GET",
@@ -1483,34 +1831,46 @@ async fn session_resolution_anonymous_untrusted_uninvited_and_bound_operator() {
     assert_eq!(j_uninv["github_login"], "uninvited-guest");
     assert_eq!(j_uninv["invite_bound"], false);
     assert_eq!(j_uninv["role"], Value::Null);
+    assert_eq!(j_uninv["reason_code"], "authorization_denied");
 
-    // 6. Caller with valid X-Proxy-Secret + X-Forwarded-User who is a bootstrap admin -> BoundUser ("admin")
-    let (st_admin, j_admin, _) = send_req(
-        &app,
-        "GET",
-        "/api/auth/session",
-        &[
-            ("X-Proxy-Secret", PROXY_SECRET),
-            ("X-Forwarded-User", "LMA1980"),
-        ],
-        None,
-    )
-    .await;
+    // 6. Bootstrap admin ("LMA1980") starts with passkey_enrollment_required=true, becomes "operator" after enrollment,
+    //    and elevates to timed "platform-admin" after Passkey assertion.
+    let admin_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+    ];
+    let (st_admin0, j_admin0, _) =
+        send_req(&app, "GET", "/api/auth/session", &admin_hdrs, None).await;
+    assert_eq!(st_admin0, StatusCode::OK);
+    assert_eq!(j_admin0["authenticated"], true);
+    assert_eq!(j_admin0["github_login"], "LMA1980");
+    assert_eq!(j_admin0["invite_bound"], true);
+    assert_eq!(j_admin0["passkey_enrollment_required"], true);
+    assert_eq!(j_admin0["role"], Value::Null);
+
+    let admin_auth = TestVirtualAuthenticator::new_synced(33, b"cred-sess-admin");
+    enroll_first_passkey(&app, &admin_hdrs, &admin_auth, "Admin Passkey").await;
+    let admin_cookie = elevate_admin_with_passkey(&app, &admin_hdrs, &admin_auth).await;
+    let admin_elevated_hdrs = [
+        ("X-Proxy-Secret", PROXY_SECRET),
+        ("X-Forwarded-User", "LMA1980"),
+        ("Cookie", admin_cookie.as_str()),
+    ];
+
+    let (st_admin, j_admin, _) =
+        send_req(&app, "GET", "/api/auth/session", &admin_elevated_hdrs, None).await;
     assert_eq!(st_admin, StatusCode::OK);
     assert_eq!(j_admin["authenticated"], true);
     assert_eq!(j_admin["github_login"], "LMA1980");
     assert_eq!(j_admin["invite_bound"], true);
-    assert_eq!(j_admin["role"], "admin");
+    assert_eq!(j_admin["role"], "platform-admin");
 
-    // 7. Caller with valid X-Proxy-Secret + X-Forwarded-User who was redeemed via invite -> BoundUser ("operator")
+    // 7. Bound user via invite -> passkey enrollment required until Passkey enrolled -> active "operator"
     let (st_inv, inv_resp, _) = send_req(
         &app,
         "POST",
         "/api/auth/invites",
-        &[
-            ("X-Proxy-Secret", PROXY_SECRET),
-            ("X-Forwarded-User", "LMA1980"),
-        ],
+        &admin_elevated_hdrs,
         Some(json!({ "ttl_seconds": 3600, "note": "session resolution test" })),
     )
     .await;
@@ -1521,7 +1881,7 @@ async fn session_resolution_anonymous_untrusted_uninvited_and_bound_operator() {
         ("X-Proxy-Secret", PROXY_SECRET),
         ("X-Forwarded-User", "verified-operator"),
     ];
-    let (st_red, _, _) = send_req(
+    let (st_red, j_red, _) = send_req(
         &app,
         "POST",
         "/api/auth/redeem",
@@ -1530,12 +1890,18 @@ async fn session_resolution_anonymous_untrusted_uninvited_and_bound_operator() {
     )
     .await;
     assert_eq!(st_red, StatusCode::OK);
+    assert_eq!(j_red["passkey_enrollment_required"], true);
+
+    let op_auth = TestVirtualAuthenticator::new_synced(44, b"cred-verified-op");
+    enroll_first_passkey(&app, &op_hdrs, &op_auth, "Verified Operator Passkey").await;
 
     let (st_op, j_op, _) = send_req(&app, "GET", "/api/auth/session", &op_hdrs, None).await;
     assert_eq!(st_op, StatusCode::OK);
     assert_eq!(j_op["authenticated"], true);
     assert_eq!(j_op["github_login"], "verified-operator");
     assert_eq!(j_op["invite_bound"], true);
+    assert_eq!(j_op["passkey_enrollment_required"], false);
+    assert_eq!(j_op["passkey_count"], 1);
     assert_eq!(j_op["role"], "operator");
 }
 
@@ -1544,15 +1910,13 @@ async fn redeem_invite_unauthorized_when_anonymous_spoofed_or_empty_forwarded_us
     let (state, _tmp) = seeded_auth_state().await;
     let app = create_router(state.clone());
 
-    // Mint a valid invite token as bootstrap admin
+    let bearer_auth = format!("Bearer {API_KEY}");
+    // Mint a valid invite token via configured admin API key
     let (st_inv, inv_resp, _) = send_req(
         &app,
         "POST",
         "/api/auth/invites",
-        &[
-            ("X-Proxy-Secret", PROXY_SECRET),
-            ("X-Forwarded-User", "LMA1980"),
-        ],
+        &[("Authorization", bearer_auth.as_str())],
         Some(json!({ "ttl_seconds": 3600, "note": "unauthorized redemption test" })),
     )
     .await;
@@ -1708,17 +2072,13 @@ async fn redeem_invite_valid_token_binds_user_and_grants_operator_role() {
     let (state, _tmp) = seeded_auth_state().await;
     let app = create_router(state.clone());
 
-    let admin_hdrs = [
-        ("X-Proxy-Secret", PROXY_SECRET),
-        ("X-Forwarded-User", "LMA1980"),
-    ];
-
+    let bearer_auth = format!("Bearer {API_KEY}");
     // 1. Issue a valid invite
     let (st_inv, inv_resp, _) = send_req(
         &app,
         "POST",
         "/api/auth/invites",
-        &admin_hdrs,
+        &[("Authorization", bearer_auth.as_str())],
         Some(json!({
             "ttl_seconds": 3600,
             "note": "Onboarding test candidate",
@@ -1743,7 +2103,7 @@ async fn redeem_invite_valid_token_binds_user_and_grants_operator_role() {
     assert_eq!(j_pre["invite_bound"], false);
     assert_eq!(j_pre["role"], Value::Null);
 
-    // 3. Redeem the valid invite token -> 200 OK with BoundUser payload
+    // 3. Redeem the valid invite token -> 200 OK binding PinnedBaseline ("operator") with 0-Passkey enrollment gate
     let (st_redeem, j_redeem, text_redeem) = send_req(
         &app,
         "POST",
@@ -1760,15 +2120,21 @@ async fn redeem_invite_valid_token_binds_user_and_grants_operator_role() {
     assert_eq!(j_redeem["authenticated"], true);
     assert_eq!(j_redeem["github_login"], "new-operator-alice");
     assert_eq!(j_redeem["invite_bound"], true);
-    assert_eq!(j_redeem["role"], "operator");
+    assert_eq!(j_redeem["baseline_role"], "operator");
+    assert_eq!(j_redeem["passkey_enrollment_required"], true);
+    assert_eq!(j_redeem["passkey_count"], 0);
 
-    // 4. Post-condition: Candidate session resolution is now BoundUser ("operator")
+    // 4. After enrolling a Passkey, candidate session resolution activates BoundUser ("operator")
+    let alice_auth = TestVirtualAuthenticator::new_synced(55, b"cred-new-op-alice");
+    enroll_first_passkey(&app, &candidate_hdrs, &alice_auth, "Alice Passkey").await;
+
     let (st_post, j_post, _) =
         send_req(&app, "GET", "/api/auth/session", &candidate_hdrs, None).await;
     assert_eq!(st_post, StatusCode::OK);
     assert_eq!(j_post["authenticated"], true);
     assert_eq!(j_post["github_login"], "new-operator-alice");
     assert_eq!(j_post["invite_bound"], true);
+    assert_eq!(j_post["passkey_enrollment_required"], false);
     assert_eq!(j_post["role"], "operator");
 
     // 5. Replay attempt with same token fails with 409 Conflict

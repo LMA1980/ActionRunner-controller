@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +90,7 @@ impl LeaderLease {
 
 const INTERNAL_LEASE_REPO_KEY: &str = "__ar_ha_lease__";
 const INTERNAL_CONSOLE_REPO_KEY: &str = "__ar_console_registry__";
+const INTERNAL_PLATFORM_AUTH_REPO_KEY: &str = "__ar_platform_auth__";
 /// Read-only virtual snapshot key used by `MuObserveRemoteStorage::get_job_log` on local cache miss
 /// so `MuObserve` reconstructs the job log from `v_logs` (`otel_logs`) without any `__ar_job_logs__` snapshot writes.
 const INTERNAL_LOG_REPO_KEY: &str = "__ar_job_logs__";
@@ -225,6 +227,17 @@ pub trait ControllerStorage: Send + Sync {
     fn load_console_registry(&self) -> Option<String> {
         None
     }
+
+    /// Configures persistent disk auth state path if supported (`#175`).
+    fn configure_auth_state_path(&self, _path: &Path) {}
+
+    /// Accesses underlying platform auth `CatalogStore` (`#172`).
+    fn auth_catalog(&self) -> Option<&CatalogStore> {
+        None
+    }
+
+    /// Replicates updated serialized `PlatformAuthState` JSON to remote storage (`#175`).
+    fn sync_platform_auth_json(&self, _json: &str) {}
 
     /// Seeds `config.bootstrap_admins` as `role = "admin"`, `invited_by = "bootstrap"` (`#93`).
     fn seed_bootstrap_admins(&self, _admins: &[String]) {}
@@ -416,6 +429,14 @@ impl ControllerStorage for InMemoryStorage {
 
     fn load_console_registry(&self) -> Option<String> {
         self.store.load_console_registry()
+    }
+
+    fn configure_auth_state_path(&self, path: &Path) {
+        self.store.configure_auth_state_path(path.to_path_buf());
+    }
+
+    fn auth_catalog(&self) -> Option<&CatalogStore> {
+        Some(&self.store)
     }
 
     fn seed_bootstrap_admins(&self, admins: &[String]) {
@@ -2298,19 +2319,68 @@ impl ControllerStorage for MuObserveRemoteStorage {
             .filter(|s| !s.is_empty())
     }
 
+    fn configure_auth_state_path(&self, path: &Path) {
+        if let Some(remote_json) = self
+            .query_internal_snapshot(INTERNAL_PLATFORM_AUTH_REPO_KEY, "platform", "auth")
+            .and_then(|s| s.latest_active_json)
+            .filter(|s| !s.is_empty())
+        {
+            self.auth_store
+                .import_platform_auth_json_if_newer(&remote_json);
+        }
+        self.auth_store
+            .configure_auth_state_path(path.to_path_buf());
+    }
+
+    fn auth_catalog(&self) -> Option<&CatalogStore> {
+        if let Some(remote_json) = self
+            .query_internal_snapshot(INTERNAL_PLATFORM_AUTH_REPO_KEY, "platform", "auth")
+            .and_then(|s| s.latest_active_json)
+            .filter(|s| !s.is_empty())
+        {
+            self.auth_store
+                .import_platform_auth_json_if_newer(&remote_json);
+        }
+        Some(&self.auth_store)
+    }
+
+    fn sync_platform_auth_json(&self, json: &str) {
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let _ = self.upsert_internal_snapshot(CentralSubmoduleSnapshot {
+            parent_repo_key: INTERNAL_PLATFORM_AUTH_REPO_KEY.to_string(),
+            branch_key: "platform".to_string(),
+            submodule_key: "auth".to_string(),
+            submodule_path_key: "platform".to_string(),
+            latest_active_job_id: Some("state".to_string()),
+            latest_active_json: Some(json.to_string()),
+            latest_active_queued_us: Some(now_us),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        });
+    }
+
     fn seed_bootstrap_admins(&self, admins: &[String]) {
         self.auth_store.seed_bootstrap_admins(admins);
+        if let Some(json) = self.auth_store.export_platform_auth_json() {
+            self.sync_platform_auth_json(&json);
+        }
     }
 
     fn create_auth_invite(&self, invite: &AuthInviteRecord) {
         self.auth_store.create_auth_invite(invite);
+        if let Some(json) = self.auth_store.export_platform_auth_json() {
+            self.sync_platform_auth_json(&json);
+        }
     }
 
     fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.get_auth_invite(invite_id)
     }
 
     fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.list_auth_invites()
     }
 
@@ -2321,20 +2391,35 @@ impl ControllerStorage for MuObserveRemoteStorage {
         github_login: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<AuthUserRecord, RedeemInviteError> {
-        self.auth_store
-            .redeem_auth_invite(invite_id, presented_hmac, github_login, now)
+        let res = self
+            .auth_store
+            .redeem_auth_invite(invite_id, presented_hmac, github_login, now);
+        if res.is_ok() {
+            if let Some(json) = self.auth_store.export_platform_auth_json() {
+                self.sync_platform_auth_json(&json);
+            }
+        }
+        res
     }
 
     fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.get_auth_user(github_login)
     }
 
     fn list_auth_users(&self) -> Vec<AuthUserRecord> {
+        let _ = self.auth_catalog();
         self.auth_store.list_auth_users()
     }
 
     fn revoke_auth_user(&self, github_login: &str) -> bool {
-        self.auth_store.revoke_auth_user(github_login)
+        let revoked = self.auth_store.revoke_auth_user(github_login);
+        if revoked {
+            if let Some(json) = self.auth_store.export_platform_auth_json() {
+                self.sync_platform_auth_json(&json);
+            }
+        }
+        revoked
     }
 
     fn emit_trace_spans(&self, spans: &[OtelSpanEntry]) {

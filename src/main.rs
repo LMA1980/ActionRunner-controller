@@ -13,6 +13,20 @@ use mu_ci_controller::webhook::AppState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(res) = mu_ci_controller::auth::execute_reset_passkeys_cli(&cli_args) {
+        match res {
+            Ok(out) => {
+                println!("{out}");
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

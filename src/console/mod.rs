@@ -9,6 +9,7 @@
 pub mod api;
 pub mod github;
 pub mod gitmodules;
+pub mod platform_auth;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

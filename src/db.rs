@@ -79,6 +79,8 @@ fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+type AuthSyncHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Default)]
 struct InMemoryCatalog {
     jobs: BTreeMap<String, CentralJobRecord>,
@@ -89,6 +91,10 @@ struct InMemoryCatalog {
     console_registry_json: Option<String>,
     auth_invites: BTreeMap<String, AuthInviteRecord>,
     auth_users: BTreeMap<String, AuthUserRecord>,
+    platform_auth: crate::auth::PlatformAuthState,
+    auth_state_path: Option<PathBuf>,
+    auth_state_hash: Option<[u8; 32]>,
+    auth_sync_hook: Option<AuthSyncHook>,
 }
 
 /// Pure-Rust in-memory state catalog for test harnesses and log metric extraction
@@ -498,57 +504,335 @@ impl CatalogStore {
         guard.console_registry_json.clone()
     }
 
-    /// Seeds `config.bootstrap_admins` as `role = "admin"`, `invited_by = "bootstrap"` (`#93`).
+    fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().into()
+    }
+
+    fn parse_rfc3339_ms(raw: &str) -> u64 {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| crate::auth::datetime_to_epoch_ms(dt.with_timezone(&Utc)))
+            .unwrap_or(0)
+    }
+
+    fn migrate_legacy_mirrors_into_platform_auth(guard: &mut InMemoryCatalog) -> bool {
+        let mut migrated = false;
+        let baseline = guard.platform_auth.baseline_role_id().clone();
+        let baseline_str = baseline.to_string();
+        let admin_rid = crate::auth::rid(crate::auth::ADMIN_TIMED_ROLE_ID);
+
+        for legacy_user in guard.auth_users.values() {
+            let clean_login = legacy_user.github_login.trim();
+            if clean_login.is_empty() {
+                continue;
+            }
+            let norm_key = clean_login.to_ascii_lowercase();
+            if !guard.platform_auth.users.contains_key(&norm_key) {
+                let bound_at_ms = Self::parse_rfc3339_ms(&legacy_user.bound_at);
+                let revoked = legacy_user.revoked != 0;
+                guard.platform_auth.users.insert(
+                    norm_key.clone(),
+                    crate::auth::PlatformUserRecord {
+                        github_login: clean_login.to_string(),
+                        display_name: None,
+                        invited_by: legacy_user.invited_by.clone(),
+                        invite_id: legacy_user.invite_id.clone(),
+                        bound_at: legacy_user.bound_at.clone(),
+                        bound_at_ms,
+                        last_seen_ms: None,
+                        revoked,
+                        revoked_at: revoked.then(|| legacy_user.bound_at.clone()),
+                        elevation_epoch: 1,
+                    },
+                );
+                migrated = true;
+            }
+            let roles = guard
+                .platform_auth
+                .user_roles
+                .entry(norm_key.clone())
+                .or_default();
+            if roles.insert(baseline.clone()) {
+                migrated = true;
+            }
+            let legacy_role = legacy_user.role.trim();
+            if legacy_role.eq_ignore_ascii_case("admin") {
+                if guard.platform_auth.role_catalog.get(&admin_rid).is_some()
+                    && roles.insert(admin_rid.clone())
+                {
+                    migrated = true;
+                }
+            } else if !legacy_role.is_empty() && !legacy_role.eq_ignore_ascii_case(&baseline_str) {
+                if let Ok(parsed) = mu_auth::RoleId::new(legacy_role) {
+                    if guard.platform_auth.role_catalog.get(&parsed).is_some()
+                        && roles.insert(parsed)
+                    {
+                        migrated = true;
+                    }
+                }
+            }
+            guard.platform_auth.user_prefs.entry(norm_key).or_default();
+        }
+
+        for (inv_id, legacy_inv) in &guard.auth_invites {
+            if !guard.platform_auth.invites.contains_key(inv_id) {
+                let created_at_ms = Self::parse_rfc3339_ms(&legacy_inv.created_at);
+                let expires_at_ms = Self::parse_rfc3339_ms(&legacy_inv.expires_at);
+                let used_at_ms = legacy_inv.used_at.as_deref().map(Self::parse_rfc3339_ms);
+                guard.platform_auth.invites.insert(
+                    inv_id.clone(),
+                    crate::auth::PlatformInviteRecord {
+                        invite_id: legacy_inv.invite_id.clone(),
+                        token_hmac: legacy_inv.token_hmac.clone(),
+                        created_by: legacy_inv.created_by.clone(),
+                        note: legacy_inv.note.clone(),
+                        created_at: legacy_inv.created_at.clone(),
+                        created_at_ms,
+                        expires_at: legacy_inv.expires_at.clone(),
+                        expires_at_ms,
+                        used_by_github_login: legacy_inv.used_by_github_login.clone(),
+                        used_at: legacy_inv.used_at.clone(),
+                        used_at_ms,
+                        revoked: false,
+                    },
+                );
+                migrated = true;
+            }
+        }
+
+        if migrated {
+            guard.platform_auth.snapshot_revision =
+                guard.platform_auth.snapshot_revision.saturating_add(1);
+        }
+        migrated
+    }
+
+    fn sync_legacy_mirrors(guard: &mut InMemoryCatalog) {
+        guard.auth_users.clear();
+        for (k, u) in &guard.platform_auth.users {
+            let role = if guard.platform_auth.user_has_platform_admin_binding(k) {
+                "admin"
+            } else {
+                crate::auth::BASELINE_ROLE_ID
+            };
+            guard.auth_users.insert(
+                k.clone(),
+                AuthUserRecord {
+                    github_login: u.github_login.clone(),
+                    role: role.to_string(),
+                    invited_by: u.invited_by.clone(),
+                    invite_id: u.invite_id.clone(),
+                    bound_at: u.bound_at.clone(),
+                    revoked: u8::from(u.revoked),
+                },
+            );
+        }
+        guard.auth_invites.clear();
+        for (k, inv) in &guard.platform_auth.invites {
+            guard.auth_invites.insert(
+                k.clone(),
+                AuthInviteRecord {
+                    invite_id: inv.invite_id.clone(),
+                    token_hmac: inv.token_hmac.clone(),
+                    created_by: inv.created_by.clone(),
+                    note: inv.note.clone(),
+                    created_at: inv.created_at.clone(),
+                    expires_at: inv.expires_at.clone(),
+                    used_by_github_login: inv.used_by_github_login.clone(),
+                    used_at: inv.used_at.clone(),
+                },
+            );
+        }
+    }
+
+    fn sync_auth_from_disk_if_changed(guard: &mut InMemoryCatalog) {
+        let Some(ref path) = guard.auth_state_path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let hash = Self::sha256_bytes(&bytes);
+        if guard.auth_state_hash == Some(hash) {
+            return;
+        }
+        if let Ok(Some(loaded)) = crate::auth::load_auth_state_file(path) {
+            guard.platform_auth = loaded;
+            guard.auth_state_hash = Some(hash);
+            Self::sync_legacy_mirrors(guard);
+        }
+    }
+
+    fn persist_auth_if_configured(guard: &mut InMemoryCatalog) {
+        Self::sync_legacy_mirrors(guard);
+        if let Some(ref path) = guard.auth_state_path {
+            if let Err(err) = crate::auth::save_auth_state_atomic(path, &guard.platform_auth) {
+                warn!(
+                    "Failed to persist platform_auth state to {}: {}",
+                    path.display(),
+                    err
+                );
+            } else if let Ok(bytes) = std::fs::read(path) {
+                guard.auth_state_hash = Some(Self::sha256_bytes(&bytes));
+            }
+        }
+        if let Some(ref hook) = guard.auth_sync_hook {
+            if let Ok(json) = serde_json::to_string(&guard.platform_auth) {
+                hook(&json);
+            }
+        }
+    }
+
+    /// Configures persistent JSON storage for [`crate::auth::PlatformAuthState`],
+    /// loading existing state from disk (or migrating legacy rows) idempotently (`#175`).
+    pub fn configure_auth_state_path(&self, path: PathBuf) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.auth_state_path = Some(path.clone());
+        match crate::auth::load_auth_state_file(&path) {
+            Ok(Some(loaded)) => {
+                guard.platform_auth = loaded;
+                if Self::migrate_legacy_mirrors_into_platform_auth(&mut guard) {
+                    Self::persist_auth_if_configured(&mut guard);
+                } else {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        guard.auth_state_hash = Some(Self::sha256_bytes(&bytes));
+                    }
+                    Self::sync_legacy_mirrors(&mut guard);
+                }
+            }
+            Ok(None) => {
+                // Migrate any legacy in-memory users/invites prior to persisting and refreshing mirrors.
+                Self::migrate_legacy_mirrors_into_platform_auth(&mut guard);
+                Self::persist_auth_if_configured(&mut guard);
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to load platform auth state from {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    /// Registers a replication hook invoked with serialized JSON after each auth mutation.
+    pub fn set_auth_sync_hook(&self, hook: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.auth_sync_hook = Some(hook);
+        }
+    }
+
+    /// Replaces in-memory `PlatformAuthState` from a remote snapshot JSON if its revision is newer.
+    pub fn import_platform_auth_json_if_newer(&self, json: &str) {
+        let Ok(mut remote) = serde_json::from_str::<crate::auth::PlatformAuthState>(json) else {
+            return;
+        };
+        remote.reconcile_after_load();
+        if let Ok(mut guard) = self.inner.lock() {
+            if remote.snapshot_revision > guard.platform_auth.snapshot_revision {
+                guard.platform_auth = remote;
+                Self::sync_legacy_mirrors(&mut guard);
+            }
+        }
+    }
+
+    /// Exports current `PlatformAuthState` as JSON for HA snapshot sync.
+    pub fn export_platform_auth_json(&self) -> Option<String> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        serde_json::to_string(&guard.platform_auth).ok()
+    }
+
+    /// Executes a read-only closure against the synchronized [`crate::auth::PlatformAuthState`].
+    pub fn read_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        Some(f(&guard.platform_auth))
+    }
+
+    /// Executes a mutating closure against [`crate::auth::PlatformAuthState`] and persists changes.
+    pub fn mutate_platform_auth<R>(
+        &self,
+        f: impl FnOnce(&mut crate::auth::PlatformAuthState) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        let out = f(&mut guard.platform_auth);
+        Self::persist_auth_if_configured(&mut guard);
+        Some(out)
+    }
+
+    /// Seeds `config.bootstrap_admins` as `operator` + dormant `platform-admin` idempotently (`#175`).
     pub fn seed_bootstrap_admins(&self, admins: &[String]) {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
-        let now_str = Utc::now().to_rfc3339();
-        for raw_login in admins {
-            let clean = raw_login.trim();
-            if clean.is_empty() {
-                continue;
-            }
-            let key = clean.to_ascii_lowercase();
-            guard
-                .auth_users
-                .entry(key)
-                .or_insert_with(|| AuthUserRecord {
-                    github_login: clean.to_string(),
-                    role: "admin".to_string(),
-                    invited_by: "bootstrap".to_string(),
-                    invite_id: None,
-                    bound_at: now_str.clone(),
-                    revoked: 0,
-                });
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        if guard
+            .platform_auth
+            .seed_bootstrap_admins(admins, Utc::now())
+        {
+            Self::persist_auth_if_configured(&mut guard);
+        } else {
+            Self::sync_legacy_mirrors(&mut guard);
         }
     }
 
-    /// Inserts a newly generated one-time invite into `auth_invites` (`#93`).
+    /// Inserts a newly generated one-time invite into `platform_auth` and mirrors (`#93`, `#174`).
     pub fn create_auth_invite(&self, invite: &AuthInviteRecord) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard
-                .auth_invites
-                .insert(invite.invite_id.clone(), invite.clone());
+            Self::sync_auth_from_disk_if_changed(&mut guard);
+            let created_at_ms = Self::parse_rfc3339_ms(&invite.created_at);
+            let expires_at_ms = Self::parse_rfc3339_ms(&invite.expires_at);
+            let used_at_ms = invite.used_at.as_deref().map(Self::parse_rfc3339_ms);
+            guard.platform_auth.invites.insert(
+                invite.invite_id.clone(),
+                crate::auth::PlatformInviteRecord {
+                    invite_id: invite.invite_id.clone(),
+                    token_hmac: invite.token_hmac.clone(),
+                    created_by: invite.created_by.clone(),
+                    note: invite.note.clone(),
+                    created_at: invite.created_at.clone(),
+                    created_at_ms,
+                    expires_at: invite.expires_at.clone(),
+                    expires_at_ms,
+                    used_by_github_login: invite.used_by_github_login.clone(),
+                    used_at: invite.used_at.clone(),
+                    used_at_ms,
+                    revoked: false,
+                },
+            );
+            guard.platform_auth.snapshot_revision =
+                guard.platform_auth.snapshot_revision.saturating_add(1);
+            Self::persist_auth_if_configured(&mut guard);
         }
     }
 
-    /// Looks up a single invite by `invite_id` (`#93`).
+    /// Looks up a single invite by `invite_id` (`#93`, `#174`).
     pub fn get_auth_invite(&self, invite_id: &str) -> Option<AuthInviteRecord> {
-        let guard = self.inner.lock().ok()?;
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
         guard.auth_invites.get(invite_id).cloned()
     }
 
-    /// Lists all invites in `auth_invites` (`#93`, `#96`).
+    /// Lists all invites in `auth_invites` (`#93`, `#96`, `#174`).
     pub fn list_auth_invites(&self) -> Vec<AuthInviteRecord> {
-        let Ok(guard) = self.inner.lock() else {
+        let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
+        Self::sync_auth_from_disk_if_changed(&mut guard);
         guard.auth_invites.values().cloned().collect()
     }
 
     /// Atomically verifies and redeems a single-use invite token, marking `used_by_github_login`
-    /// and `used_at`, and upserting the user into `auth_users` with `revoked = 0` (`#93`, `#95`).
+    /// and `used_at`, and binding the user to `PinnedBaseline` (`#93`, `#95`, `#174`).
     pub fn redeem_auth_invite(
         &self,
         invite_id: &str,
@@ -559,20 +843,33 @@ impl CatalogStore {
         let Ok(mut guard) = self.inner.lock() else {
             return Err(RedeemInviteError::InviteNotFound);
         };
-        let invite = guard
-            .auth_invites
-            .get_mut(invite_id)
-            .ok_or(RedeemInviteError::InviteNotFound)?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
+        let (created_by, expires_at_str, token_hmac, already_used, revoked) = {
+            let invite = guard
+                .platform_auth
+                .invites
+                .get(invite_id)
+                .ok_or(RedeemInviteError::InviteNotFound)?;
+            (
+                invite.created_by.clone(),
+                invite.expires_at.clone(),
+                invite.token_hmac.clone(),
+                invite.used_at.is_some() || invite.used_by_github_login.is_some(),
+                invite.revoked,
+            )
+        };
 
-        if !constant_time_eq_bytes(invite.token_hmac.as_bytes(), presented_hmac.as_bytes()) {
+        if !constant_time_eq_bytes(token_hmac.as_bytes(), presented_hmac.as_bytes()) {
             return Err(RedeemInviteError::InvalidSignature);
         }
-
-        if invite.used_at.is_some() || invite.used_by_github_login.is_some() {
+        if revoked {
+            return Err(RedeemInviteError::InviteExpired);
+        }
+        if already_used {
             return Err(RedeemInviteError::InviteAlreadyUsed);
         }
 
-        let expires_at = DateTime::parse_from_rfc3339(&invite.expires_at)
+        let expires_at = DateTime::parse_from_rfc3339(&expires_at_str)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|_| RedeemInviteError::InviteExpired)?;
         if expires_at <= now {
@@ -582,48 +879,66 @@ impl CatalogStore {
         let login_clean = github_login.trim().to_string();
         let login_key = login_clean.to_ascii_lowercase();
         let now_str = now.to_rfc3339();
+        let now_ms = crate::auth::datetime_to_epoch_ms(now);
 
-        invite.used_by_github_login = Some(login_clean.clone());
-        invite.used_at = Some(now_str.clone());
+        if let Some(inv) = guard.platform_auth.invites.get_mut(invite_id) {
+            inv.used_by_github_login = Some(login_clean.clone());
+            inv.used_at = Some(now_str);
+            inv.used_at_ms = Some(now_ms);
+        }
+        guard
+            .platform_auth
+            .bind_baseline_user(&login_clean, &created_by, Some(invite_id), now);
+        guard.platform_auth.snapshot_revision =
+            guard.platform_auth.snapshot_revision.saturating_add(1);
+        Self::persist_auth_if_configured(&mut guard);
 
-        let invited_by = invite.created_by.clone();
-        let inv_id = invite.invite_id.clone();
-
-        let user = AuthUserRecord {
-            github_login: login_clean,
-            role: "operator".to_string(),
-            invited_by,
-            invite_id: Some(inv_id),
-            bound_at: now_str,
-            revoked: 0,
-        };
-        guard.auth_users.insert(login_key, user.clone());
-        Ok(user)
+        Ok(guard
+            .auth_users
+            .get(&login_key)
+            .cloned()
+            .unwrap_or_else(|| AuthUserRecord {
+                github_login: login_clean,
+                role: crate::auth::BASELINE_ROLE_ID.to_string(),
+                invited_by: created_by,
+                invite_id: Some(invite_id.to_string()),
+                bound_at: now.to_rfc3339(),
+                revoked: 0,
+            }))
     }
 
-    /// Looks up a user in `auth_users` case-insensitively (`#93`).
+    /// Looks up a user in `auth_users` case-insensitively (`#93`, `#174`).
     pub fn get_auth_user(&self, github_login: &str) -> Option<AuthUserRecord> {
-        let guard = self.inner.lock().ok()?;
+        let mut guard = self.inner.lock().ok()?;
+        Self::sync_auth_from_disk_if_changed(&mut guard);
         let key = github_login.trim().to_ascii_lowercase();
         guard.auth_users.get(&key).cloned()
     }
 
-    /// Lists all bound/revoked users in `auth_users` (`#93`, `#96`).
+    /// Lists all bound/revoked users in `auth_users` (`#93`, `#96`, `#174`).
     pub fn list_auth_users(&self) -> Vec<AuthUserRecord> {
-        let Ok(guard) = self.inner.lock() else {
+        let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
+        Self::sync_auth_from_disk_if_changed(&mut guard);
         guard.auth_users.values().cloned().collect()
     }
 
-    /// Revokes a user (`revoked = 1`) in `auth_users` (`#93`, `#96`).
+    /// Revokes a user (`revoked = 1`) across `platform_auth` and mirrors (`#93`, `#96`, `#174`).
     pub fn revoke_auth_user(&self, github_login: &str) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
             return false;
         };
+        Self::sync_auth_from_disk_if_changed(&mut guard);
         let key = github_login.trim().to_ascii_lowercase();
-        if let Some(user) = guard.auth_users.get_mut(&key) {
-            user.revoked = 1;
+        if let Some(user) = guard.platform_auth.users.get_mut(&key) {
+            user.revoked = true;
+            user.revoked_at = Some(Utc::now().to_rfc3339());
+            user.elevation_epoch = user.elevation_epoch.saturating_add(1);
+            guard.platform_auth.role_leases.remove(&key);
+            guard.platform_auth.snapshot_revision =
+                guard.platform_auth.snapshot_revision.saturating_add(1);
+            Self::persist_auth_if_configured(&mut guard);
             true
         } else {
             false
@@ -1159,5 +1474,93 @@ impl CatalogStore {
             full_sha,
             candidate_branch.unwrap_or_else(|| "refs/heads/main".to_string()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    #[test]
+    fn legacy_in_memory_auth_users_and_invites_migrate_on_configure_path_and_stay_consistent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let auth_path = dir.path().join("platform_auth.json");
+        let now = Utc::now();
+
+        let store = CatalogStore::new();
+        let pre_inv = AuthInviteRecord {
+            invite_id: "inv-pre".to_string(),
+            token_hmac: "hmac-pre".to_string(),
+            created_by: "bootstrap".to_string(),
+            note: Some("Pre-config invite".to_string()),
+            created_at: now.to_rfc3339(),
+            expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+            used_by_github_login: None,
+            used_at: None,
+        };
+        store.create_auth_invite(&pre_inv);
+        let redeemed = store
+            .redeem_auth_invite("inv-pre", "hmac-pre", "LegacyAlice", now)
+            .expect("pre-config redeem succeeds");
+        assert_eq!(redeemed.github_login, "LegacyAlice");
+        assert_eq!(redeemed.role, "operator");
+        {
+            let mut guard = store.inner.lock().unwrap();
+            guard.auth_users.insert(
+                "legacyadmin".to_string(),
+                AuthUserRecord {
+                    github_login: "LegacyAdmin".to_string(),
+                    role: "admin".to_string(),
+                    invited_by: "bootstrap".to_string(),
+                    invite_id: None,
+                    bound_at: now.to_rfc3339(),
+                    revoked: 0,
+                },
+            );
+        }
+
+        // Configure persistence path on a fresh file: pre-existing legacy invite/users must migrate
+        // into PlatformAuthState before mirrors are synced.
+        store.configure_auth_state_path(auth_path.clone());
+        assert!(store.get_auth_invite("inv-pre").is_some());
+        assert_eq!(
+            store.get_auth_user("legacyalice").unwrap().github_login,
+            "LegacyAlice"
+        );
+        assert_eq!(store.get_auth_user("legacyadmin").unwrap().role, "admin");
+        let has_migrated = store
+            .read_platform_auth(|st| {
+                st.users.contains_key("legacyalice")
+                    && st.users.contains_key("legacyadmin")
+                    && st.user_has_platform_admin_binding("legacyadmin")
+                    && st.invites.contains_key("inv-pre")
+            })
+            .unwrap();
+        assert!(has_migrated);
+
+        // Post-configuration legacy wrapper writes persist into PlatformAuthState and reload cleanly.
+        let post_inv = AuthInviteRecord {
+            invite_id: "inv-post".to_string(),
+            token_hmac: "hmac-post".to_string(),
+            created_by: "LegacyAlice".to_string(),
+            note: Some("Post-config invite".to_string()),
+            created_at: now.to_rfc3339(),
+            expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+            used_by_github_login: None,
+            used_at: None,
+        };
+        store.create_auth_invite(&post_inv);
+        assert!(store.revoke_auth_user("legacyalice"));
+        assert_eq!(store.get_auth_user("legacyalice").unwrap().revoked, 1);
+
+        let reloaded = CatalogStore::new();
+        reloaded.configure_auth_state_path(auth_path);
+        assert_eq!(reloaded.list_auth_invites().len(), 2);
+        assert_eq!(reloaded.get_auth_user("legacyalice").unwrap().revoked, 1);
+        let platform_revoked = reloaded
+            .read_platform_auth(|st| st.users.get("legacyalice").is_some_and(|u| u.revoked))
+            .unwrap();
+        assert!(platform_revoked);
     }
 }

@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use chrono::Utc;
@@ -52,16 +52,167 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/jobs/{id}/submodules/{submodule}/card.svg",
             get(get_job_submodule_card),
         )
-        // Read-only console API & Operator Auth / Invite Registry (MuConsole)
-        .route("/api/auth/session", get(crate::console::api::auth_session))
+        // Read-only console API & Platform Auth / Folio / Passkey Registry (MuConsole v6)
         .route(
-            "/api/auth/invites",
-            get(crate::console::api::list_invites).post(crate::console::api::create_invite),
+            "/api/auth/session",
+            get(crate::console::platform_auth::auth_session),
         )
-        .route("/api/auth/redeem", post(crate::console::api::redeem_invite))
+        .route(
+            "/api/auth/redeem",
+            post(crate::console::platform_auth::redeem_invite),
+        )
+        .route(
+            "/api/auth/profile",
+            get(crate::console::platform_auth::get_profile)
+                .put(crate::console::platform_auth::update_profile)
+                .patch(crate::console::platform_auth::update_profile),
+        )
+        .route(
+            "/api/auth/passkeys",
+            get(crate::console::platform_auth::list_passkeys),
+        )
+        .route(
+            "/api/auth/passkeys/challenge",
+            post(crate::console::platform_auth::passkey_assert_start),
+        )
+        .route(
+            "/api/auth/passkeys/assert/start",
+            post(crate::console::platform_auth::passkey_assert_start),
+        )
+        .route(
+            "/api/auth/passkeys/assert/finish",
+            post(crate::console::platform_auth::passkey_assert_finish),
+        )
+        .route(
+            "/api/auth/passkeys/manage/start",
+            post(crate::console::platform_auth::passkey_assert_start),
+        )
+        .route(
+            "/api/auth/passkeys/manage/finish",
+            post(crate::console::platform_auth::passkey_assert_finish),
+        )
+        .route(
+            "/api/auth/passkeys/register/start",
+            post(crate::console::platform_auth::passkey_register_start),
+        )
+        .route(
+            "/api/auth/passkeys/register/challenge",
+            post(crate::console::platform_auth::passkey_register_start),
+        )
+        .route(
+            "/api/auth/passkeys/register/finish",
+            post(crate::console::platform_auth::passkey_register_finish),
+        )
+        .route(
+            "/api/auth/passkeys/register/verify",
+            post(crate::console::platform_auth::passkey_register_finish),
+        )
+        .route(
+            "/api/auth/passkeys/{credential_id}",
+            delete(crate::console::platform_auth::delete_passkey),
+        )
+        .route(
+            "/api/auth/passkeys/{credential_id}/delete",
+            post(crate::console::platform_auth::delete_passkey),
+        )
+        .route(
+            "/api/auth/roles",
+            get(crate::console::platform_auth::list_roles)
+                .post(crate::console::platform_auth::upsert_role)
+                .put(crate::console::platform_auth::upsert_role),
+        )
+        .route(
+            "/api/auth/roles/lock",
+            post(crate::console::platform_auth::elevate_lock_all),
+        )
+        .route(
+            "/api/auth/roles/{role_id}",
+            put(crate::console::platform_auth::upsert_role_by_id)
+                .delete(crate::console::platform_auth::delete_role),
+        )
+        .route(
+            "/api/auth/roles/{role_id}/enable",
+            post(crate::console::platform_auth::enable_role),
+        )
+        .route(
+            "/api/auth/roles/{role_id}/disable",
+            post(crate::console::platform_auth::disable_role),
+        )
+        .route(
+            "/api/auth/elevate/start",
+            post(crate::console::platform_auth::elevate_start),
+        )
+        .route(
+            "/api/auth/elevate/challenge",
+            post(crate::console::platform_auth::elevate_start),
+        )
+        .route(
+            "/api/auth/elevate/finish",
+            post(crate::console::platform_auth::elevate_finish),
+        )
+        .route(
+            "/api/auth/elevate/verify",
+            post(crate::console::platform_auth::elevate_finish),
+        )
+        .route(
+            "/api/auth/elevate/lock-all",
+            post(crate::console::platform_auth::elevate_lock_all),
+        )
+        .route(
+            "/api/auth/activity",
+            post(crate::console::platform_auth::record_activity),
+        )
+        .route(
+            "/api/auth/folios",
+            get(crate::console::platform_auth::list_folios)
+                .post(crate::console::platform_auth::upsert_folio)
+                .put(crate::console::platform_auth::upsert_folio),
+        )
+        .route(
+            "/api/auth/folios/{folio_id}",
+            put(crate::console::platform_auth::upsert_folio_by_id)
+                .delete(crate::console::platform_auth::delete_folio),
+        )
+        .route(
+            "/api/auth/role-folio-index",
+            get(crate::console::platform_auth::get_role_folio_index)
+                .put(crate::console::platform_auth::put_role_folio_index)
+                .post(crate::console::platform_auth::put_role_folio_index),
+        )
+        .route(
+            "/api/auth/users",
+            get(crate::console::platform_auth::list_users),
+        )
         .route(
             "/api/auth/users/{github_login}",
-            delete(crate::console::api::revoke_user),
+            delete(crate::console::platform_auth::revoke_user),
+        )
+        .route(
+            "/api/auth/users/{github_login}/roles",
+            put(crate::console::platform_auth::set_user_roles)
+                .post(crate::console::platform_auth::set_user_roles),
+        )
+        .route(
+            "/api/auth/users/{github_login}/passkeys",
+            delete(crate::console::platform_auth::admin_reset_user_passkeys),
+        )
+        .route(
+            "/api/auth/users/{github_login}/passkeys/reset",
+            post(crate::console::platform_auth::admin_reset_user_passkeys)
+                .delete(crate::console::platform_auth::admin_reset_user_passkeys),
+        )
+        .route(
+            "/api/auth/invites",
+            get(crate::console::platform_auth::list_invites)
+                .post(crate::console::platform_auth::create_invite),
+        )
+        .route(
+            "/api/auth/invites/{invite_id}",
+            delete(crate::console::platform_auth::revoke_invite),
+        )
+        .route(
+            "/api/internal/auth/snapshot",
+            get(crate::console::platform_auth::internal_auth_snapshot),
         )
         .route("/api/repos", get(crate::console::api::list_repos))
         .route(
@@ -202,52 +353,39 @@ fn json_response(status: StatusCode, val: serde_json::Value) -> Response {
         .into_response()
 }
 
-fn check_operator_gate(
+fn check_policy_gate(
     state: &AppState,
     headers: &HeaderMap,
     query_key: Option<&str>,
+    policy: &str,
 ) -> Option<Response> {
-    let auth_configured = state.config.log_api_key.is_some()
-        || state.config.proxy_secret.is_some()
-        || headers.contains_key("x-forwarded-user")
-        || headers.contains_key("x-proxy-secret");
-    if !auth_configured {
-        return None;
-    }
-    match crate::console::api::resolve_auth_with_query_key(
+    crate::console::platform_auth::EvaluatedRequestAuth::evaluate(
         &state.config,
         &state.job_store,
         headers,
         query_key,
-    ) {
-        crate::console::api::AuthResolution::AdminApiKey
-        | crate::console::api::AuthResolution::BoundUser { .. } => None,
-        crate::console::api::AuthResolution::UninvitedUser { .. } => Some(json_response(
-            StatusCode::FORBIDDEN,
-            serde_json::json!({
-                "error": "Forbidden: GitHub account is not bound to an active MuConsole invite"
-            }),
-        )),
-        crate::console::api::AuthResolution::Anonymous => Some(json_response(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({
-                "error": "Unauthorized: valid operator session or API key required"
-            }),
-        )),
-    }
+    )
+    .gate_policy(policy)
+}
+
+fn check_public_read_gate(state: &AppState, headers: &HeaderMap, policy: &str) -> Option<Response> {
+    crate::console::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        headers,
+        None,
+    )
+    .gate_public_read(policy)
 }
 
 fn is_authenticated_request(state: &AppState, headers: &HeaderMap) -> bool {
-    matches!(
-        crate::console::api::resolve_auth_with_query_key(
-            &state.config,
-            &state.job_store,
-            headers,
-            None,
-        ),
-        crate::console::api::AuthResolution::AdminApiKey
-            | crate::console::api::AuthResolution::BoundUser { .. }
+    crate::console::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        headers,
+        None,
     )
+    .is_authenticated()
 }
 
 fn parse_node_alias_map() -> Vec<(String, String)> {
@@ -403,6 +541,9 @@ pub async fn health_check(headers: HeaderMap, State(state): State<Arc<AppState>>
 }
 
 pub async fn get_queue(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:queue.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     let mut snap = state.job_store.queue_snapshot().await;
     if !is_auth {
@@ -412,6 +553,9 @@ pub async fn get_queue(headers: HeaderMap, State(state): State<Arc<AppState>>) -
 }
 
 pub async fn get_cluster_nodes(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:nodes.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     let mut nodes = state.cluster.list_nodes_view().await;
     if !is_auth {
@@ -426,6 +570,9 @@ pub async fn get_cluster_status(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:nodes.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     let mut nodes = state.cluster.list_nodes_view().await;
     let online_nodes = nodes.iter().filter(|n| n.is_online).count();
@@ -471,6 +618,9 @@ pub async fn get_cluster_status(
 }
 
 pub async fn get_ha_status(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:ha.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     let mut lease = state.job_store.storage().get_leader_lease();
     let controller_id = if is_auth {
@@ -501,7 +651,7 @@ pub async fn promote_ha_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+    if let Some(denied) = check_policy_gate(&state, &headers, None, "ci:ha.write") {
         return denied;
     }
     let rehydrated = state.promote_to_leader().await;
@@ -519,7 +669,7 @@ pub async fn promote_ha_handler(
 }
 
 pub async fn demote_ha_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+    if let Some(denied) = check_policy_gate(&state, &headers, None, "ci:ha.write") {
         return denied;
     }
     let rehydrated = state.demote_to_standby().await;
@@ -548,6 +698,9 @@ pub async fn list_jobs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<JobsQuery>,
 ) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:jobs.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     let snap = state.job_store.queue_snapshot().await;
     let all_jobs = state.job_store.list_jobs().await;
@@ -620,6 +773,9 @@ pub async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
 ) -> Response {
+    if let Some(denied) = check_public_read_gate(&state, &headers, "ci:jobs.read") {
+        return denied;
+    }
     let is_auth = is_authenticated_request(&state, &headers);
     match state.job_store.get_job(&job_id).await {
         Some(mut record) => {
@@ -650,7 +806,7 @@ pub async fn get_job_log(
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
-    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+    if let Some(denied) = check_policy_gate(&state, &headers, None, "ci:jobs.logs.read") {
         return denied;
     }
 
@@ -823,7 +979,7 @@ pub async fn resume_job_handler(
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
-    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+    if let Some(denied) = check_policy_gate(&state, &headers, None, "ci:jobs.resume") {
         return denied;
     }
     match state.job_store.resume_job(&job_id).await {
@@ -879,7 +1035,7 @@ pub async fn restart_job_handler(
     headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Response {
-    if let Some(denied) = check_operator_gate(&state, &headers, None) {
+    if let Some(denied) = check_policy_gate(&state, &headers, None, "ci:jobs.restart") {
         return denied;
     }
     match state.job_store.restart_job(&job_id).await {
@@ -1373,26 +1529,17 @@ fn resolve_job_stream_operator(
     headers: &HeaderMap,
     query_key: Option<&str>,
 ) -> Result<bool, Box<Response>> {
-    let auth = crate::console::api::resolve_auth_with_query_key(
+    let eval = crate::console::platform_auth::EvaluatedRequestAuth::evaluate(
         &state.config,
         &state.job_store,
         headers,
         query_key,
     );
-    match auth {
-        crate::console::api::AuthResolution::AdminApiKey
-        | crate::console::api::AuthResolution::BoundUser { .. } => Ok(true),
-        crate::console::api::AuthResolution::UninvitedUser { .. } => Err(Box::new(json_response(
-            StatusCode::FORBIDDEN,
-            serde_json::json!({
-                "error": "Forbidden: GitHub account is not bound to an active MuConsole invite"
-            }),
-        ))),
-        crate::console::api::AuthResolution::Anonymous => Ok(state.config.log_api_key.is_none()
-            && state.config.proxy_secret.is_none()
-            && !headers.contains_key("x-forwarded-user")
-            && !headers.contains_key("x-proxy-secret")),
+    if let Some(denied) = eval.gate_public_read("ci:queue.read") {
+        return Err(Box::new(denied));
     }
+    Ok(eval.has_policy("ci:jobs.logs.read")
+        || (!eval.auth_configured && !eval.anonymous_lockdown && !eval.bad_edge_auth))
 }
 
 pub async fn handle_events(
@@ -1410,25 +1557,23 @@ pub async fn handle_events(
         return stream_job_events(state, job_id.clone(), is_operator).await;
     }
 
-    let auth = crate::console::api::resolve_auth_with_query_key(
+    let eval = crate::console::platform_auth::EvaluatedRequestAuth::evaluate(
         &state.config,
         &state.job_store,
         &headers,
         query_key,
     );
+    if let Some(denied) = eval.gate_public_read("ci:queue.read") {
+        return denied;
+    }
     if state.config.log_api_key.is_some()
         && state.config.proxy_secret.is_none()
-        && !auth.is_authenticated()
+        && !eval.is_authenticated()
     {
-        return json_response(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({
-                "error": "Unauthorized: valid operator session or API key required"
-            }),
-        );
+        return crate::console::platform_auth::authentication_required_response();
     }
 
-    let authenticated = auth.is_authenticated();
+    let authenticated = eval.has_policy("ci:jobs.read");
     stream_dashboard_events(state, authenticated)
 }
 

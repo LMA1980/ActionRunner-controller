@@ -10,7 +10,6 @@
 //! private repository get the same `404` as an unknown repository.
 
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
@@ -28,7 +27,6 @@ use super::{
     RepoEntry, RepoStatus, StageState, Station, SubmoduleRef, Visibility,
 };
 use crate::config::{is_safe_repo_name, Config};
-use crate::db::{AuthInviteRecord, AuthInviteView, AuthUserRecord, RedeemInviteError};
 use crate::job::{extract_submodule_job, normalize_ref, JobRecord, JobStatus, JobStore};
 use crate::webhook::AppState;
 
@@ -65,7 +63,7 @@ impl AuthResolution {
     pub fn is_admin(&self) -> bool {
         match self {
             Self::AdminApiKey => true,
-            Self::BoundUser { role, .. } => role == "admin",
+            Self::BoundUser { role, .. } => role == "admin" || role == "platform-admin",
             Self::UninvitedUser { .. } | Self::Anonymous => false,
         }
     }
@@ -95,7 +93,7 @@ pub fn resolve_auth(config: &Config, job_store: &JobStore, headers: &HeaderMap) 
     resolve_auth_with_query_key(config, job_store, headers, None)
 }
 
-/// Resolves operator identity, optionally accepting a query-string API key for SSE streams (`#95`).
+/// Resolves operator identity, optionally accepting a query-string API key for SSE streams (`#95`, `#176`).
 #[must_use]
 pub fn resolve_auth_with_query_key(
     config: &Config,
@@ -103,54 +101,25 @@ pub fn resolve_auth_with_query_key(
     headers: &HeaderMap,
     query_key: Option<&str>,
 ) -> AuthResolution {
-    if !config.bootstrap_admins.is_empty() {
-        job_store.seed_bootstrap_admins(&config.bootstrap_admins);
+    let eval =
+        super::platform_auth::EvaluatedRequestAuth::evaluate(config, job_store, headers, query_key);
+    if eval.is_admin_api_key {
+        return AuthResolution::AdminApiKey;
     }
-
-    if let Some(required) = config.log_api_key.as_deref() {
-        let bearer = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        let api_key = headers.get("x-api-key").and_then(|h| h.to_str().ok());
-        if [bearer, api_key, query_key]
-            .into_iter()
-            .flatten()
-            .any(|presented| constant_time_eq(presented.trim().as_bytes(), required.as_bytes()))
-        {
-            return AuthResolution::AdminApiKey;
-        }
+    if eval.is_uninvited {
+        return AuthResolution::UninvitedUser {
+            github_login: eval.login.unwrap_or_default(),
+        };
     }
-
-    if let Some(expected_proxy_secret) = config.proxy_secret.as_deref() {
-        if let Some(presented_secret) = headers.get("x-proxy-secret").and_then(|h| h.to_str().ok())
-        {
-            if constant_time_eq(
-                presented_secret.trim().as_bytes(),
-                expected_proxy_secret.as_bytes(),
-            ) {
-                if let Some(raw_user) = headers
-                    .get("x-forwarded-user")
-                    .and_then(|h| h.to_str().ok())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    if let Some(user) = job_store.get_auth_user(raw_user) {
-                        if user.revoked == 0 {
-                            return AuthResolution::BoundUser {
-                                github_login: user.github_login,
-                                role: user.role,
-                            };
-                        }
-                    }
-                    return AuthResolution::UninvitedUser {
-                        github_login: raw_user.to_string(),
-                    };
-                }
-            }
-        }
+    if eval.invite_bound && !eval.passkey_enrollment_required {
+        return AuthResolution::BoundUser {
+            github_login: eval.login.unwrap_or_default(),
+            role: eval
+                .session_dto
+                .role
+                .unwrap_or_else(|| crate::auth::BASELINE_ROLE_ID.to_string()),
+        };
     }
-
     AuthResolution::Anonymous
 }
 
@@ -556,7 +525,16 @@ async fn resolve_visible(
 
 /// `GET /api/repos`
 pub async fn list_repos(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let authed = resolve_auth(&state.config, &state.job_store, &headers).is_authenticated();
+    let eval = super::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        &headers,
+        None,
+    );
+    if let Some(denied) = eval.gate_public_read("ci:repos.public.read") {
+        return denied;
+    }
+    let authed = eval.has_policy("ci:repos.private.read");
     let entries = state.console.entries().await;
     let known = known_repo_names(&state.job_store, &entries).await;
     let jobs = state.job_store.list_jobs().await;
@@ -613,7 +591,16 @@ pub async fn repo_summary(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<SummaryQuery>,
 ) -> Response {
-    let authed = resolve_auth(&state.config, &state.job_store, &headers).is_authenticated();
+    let eval = super::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        &headers,
+        None,
+    );
+    if let Some(denied) = eval.gate_public_read("ci:repos.public.read") {
+        return denied;
+    }
+    let authed = eval.has_policy("ci:repos.private.read");
     let Some(res) = resolve_visible(&state, &owner, &repo, authed).await else {
         return not_found(&owner, &repo);
     };
@@ -758,7 +745,16 @@ pub async fn repo_topology(
     headers: HeaderMap,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Response {
-    let authed = resolve_auth(&state.config, &state.job_store, &headers).is_authenticated();
+    let eval = super::platform_auth::EvaluatedRequestAuth::evaluate(
+        &state.config,
+        &state.job_store,
+        &headers,
+        None,
+    );
+    if let Some(denied) = eval.gate_public_read("ci:repos.public.read") {
+        return denied;
+    }
+    let authed = eval.has_policy("ci:repos.private.read");
     let Some(res) = resolve_visible(&state, &owner, &repo, authed).await else {
         return not_found(&owner, &repo);
     };
@@ -867,349 +863,12 @@ pub async fn repo_topology(
 }
 
 // ============================================================================
-// Operator Auth & Invite Registry Endpoints (#95, #96)
+// Operator Auth & Invite Registry Endpoints (#95, #96, #176)
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthSessionResponse {
-    pub authenticated: bool,
-    pub github_login: Option<String>,
-    pub invite_bound: bool,
-    pub role: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct CreateInviteRequest {
-    pub ttl_seconds: Option<u64>,
-    pub note: Option<String>,
-    pub base_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CreateInviteResponse {
-    pub invite_id: String,
-    pub invite_token: String,
-    pub invite_url: String,
-    pub expires_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ListInvitesResponse {
-    pub invites: Vec<AuthInviteView>,
-    pub users: Vec<AuthUserRecord>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RedeemInviteRequest {
-    #[serde(default)]
-    pub invite_token: Option<String>,
-    #[serde(default)]
-    pub token: Option<String>,
-}
-
-impl RedeemInviteRequest {
-    pub fn effective_token(&self) -> Option<&str> {
-        self.invite_token
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.token.as_deref().filter(|s| !s.is_empty()))
-            .or(self.invite_token.as_deref())
-            .or(self.token.as_deref())
-    }
-}
-
-/// `GET /api/auth/session` (`#96`)
-pub async fn auth_session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let resp = match resolve_auth(&state.config, &state.job_store, &headers) {
-        AuthResolution::AdminApiKey => AuthSessionResponse {
-            authenticated: true,
-            github_login: None,
-            invite_bound: true,
-            role: Some("admin".to_string()),
-        },
-        AuthResolution::BoundUser { github_login, role } => AuthSessionResponse {
-            authenticated: true,
-            github_login: Some(github_login),
-            invite_bound: true,
-            role: Some(role),
-        },
-        AuthResolution::UninvitedUser { github_login } => AuthSessionResponse {
-            authenticated: false,
-            github_login: Some(github_login),
-            invite_bound: false,
-            role: None,
-        },
-        AuthResolution::Anonymous => AuthSessionResponse {
-            authenticated: false,
-            github_login: None,
-            invite_bound: false,
-            role: None,
-        },
-    };
-    json_ok(&resp)
-}
-
-/// `POST /api/auth/invites` (`#96`)
-pub async fn create_invite(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let auth = resolve_auth(&state.config, &state.job_store, &headers);
-    let created_by = match auth {
-        AuthResolution::AdminApiKey => "admin".to_string(),
-        AuthResolution::BoundUser { github_login, role } if role == "admin" => github_login,
-        AuthResolution::BoundUser { .. } | AuthResolution::UninvitedUser { .. } => {
-            return json_status(
-                StatusCode::FORBIDDEN,
-                &serde_json::json!({
-                    "error": "Forbidden: admin privileges required to issue invites"
-                }),
-            );
-        }
-        AuthResolution::Anonymous => {
-            return json_status(
-                StatusCode::UNAUTHORIZED,
-                &serde_json::json!({
-                    "error": "Unauthorized: admin API key or admin operator session required"
-                }),
-            );
-        }
-    };
-
-    let Some(signing_key) = state.config.invite_signing_key.as_deref() else {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({
-                "error": "ACTION_RUNNER_INVITE_SIGNING_KEY is not configured"
-            }),
-        );
-    };
-
-    let req: CreateInviteRequest = if body.is_empty() {
-        CreateInviteRequest::default()
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                return json_status(
-                    StatusCode::BAD_REQUEST,
-                    &serde_json::json!({
-                        "error": format!("Invalid request body: {e}")
-                    }),
-                );
-            }
-        }
-    };
-
-    let Some((invite_id, token_hmac, invite_token)) = generate_invite_token(signing_key) else {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({
-                "error": "Failed to generate invite token"
-            }),
-        );
-    };
-
-    let now = Utc::now();
-    let ttl_secs = req.ttl_seconds.unwrap_or(172_800);
-    let expires_at = (now + chrono::Duration::seconds(ttl_secs as i64)).to_rfc3339();
-    let base_url = req
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("https://console.lma1980.duckdns.org")
-        .trim_end_matches('/');
-    let invite_url = format!("{base_url}/?invite={invite_token}");
-
-    let record = AuthInviteRecord {
-        invite_id: invite_id.clone(),
-        token_hmac,
-        created_by,
-        note: req.note,
-        created_at: now.to_rfc3339(),
-        expires_at: expires_at.clone(),
-        used_by_github_login: None,
-        used_at: None,
-    };
-    state.job_store.create_auth_invite(&record);
-
-    json_status(
-        StatusCode::CREATED,
-        &CreateInviteResponse {
-            invite_id,
-            invite_token,
-            invite_url,
-            expires_at,
-        },
-    )
-}
-
-/// `GET /api/auth/invites` (`#96`)
-pub async fn list_invites(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let auth = resolve_auth(&state.config, &state.job_store, &headers);
-    if matches!(auth, AuthResolution::Anonymous) {
-        return json_status(
-            StatusCode::UNAUTHORIZED,
-            &serde_json::json!({
-                "error": "Unauthorized: admin API key or admin operator session required"
-            }),
-        );
-    }
-    if !auth.is_admin() {
-        return json_status(
-            StatusCode::FORBIDDEN,
-            &serde_json::json!({
-                "error": "Forbidden: admin privileges required"
-            }),
-        );
-    }
-
-    let invites: Vec<AuthInviteView> = state
-        .job_store
-        .list_auth_invites()
-        .iter()
-        .map(AuthInviteView::from)
-        .collect();
-    let users = state.job_store.list_auth_users();
-
-    json_ok(&ListInvitesResponse { invites, users })
-}
-
-/// `POST /api/auth/redeem` (`#96`)
-pub async fn redeem_invite(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<RedeemInviteRequest>,
-) -> Response {
-    let auth = resolve_auth(&state.config, &state.job_store, &headers);
-    let github_login = match auth {
-        AuthResolution::BoundUser { github_login, .. }
-        | AuthResolution::UninvitedUser { github_login } => github_login,
-        AuthResolution::AdminApiKey | AuthResolution::Anonymous => {
-            return json_status(
-                StatusCode::UNAUTHORIZED,
-                &serde_json::json!({
-                    "error": "Unauthorized: valid X-Proxy-Secret and X-Forwarded-User headers required to redeem invite"
-                }),
-            );
-        }
-    };
-
-    let Some(signing_key) = state.config.invite_signing_key.as_deref() else {
-        return json_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({
-                "error": "ACTION_RUNNER_INVITE_SIGNING_KEY is not configured"
-            }),
-        );
-    };
-
-    let Some(raw_token) = req.effective_token() else {
-        return json_status(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &serde_json::json!({
-                "error": "Missing invite token: expected 'invite_token' or 'token' field"
-            }),
-        );
-    };
-
-    if parse_invite_token(raw_token).is_none() {
-        return json_status(
-            StatusCode::BAD_REQUEST,
-            &serde_json::json!({
-                "error": "Invalid invite token format: expected inv_<invite_id>.<hmac_sha256_hex>"
-            }),
-        );
-    }
-
-    let Some((invite_id, presented_hmac)) = verify_invite_token(signing_key, raw_token) else {
-        return json_status(
-            StatusCode::UNAUTHORIZED,
-            &serde_json::json!({
-                "error": "Invalid invite token HMAC signature"
-            }),
-        );
-    };
-
-    match state
-        .job_store
-        .redeem_auth_invite(invite_id, presented_hmac, &github_login, Utc::now())
-    {
-        Ok(user) => json_ok(&AuthSessionResponse {
-            authenticated: true,
-            github_login: Some(user.github_login),
-            invite_bound: true,
-            role: Some(user.role),
-        }),
-        Err(RedeemInviteError::InviteAlreadyUsed) => json_status(
-            StatusCode::CONFLICT,
-            &serde_json::json!({
-                "error": "Invite token has already been used"
-            }),
-        ),
-        Err(RedeemInviteError::InviteExpired) => json_status(
-            StatusCode::GONE,
-            &serde_json::json!({
-                "error": "Invite token has expired"
-            }),
-        ),
-        Err(RedeemInviteError::InviteNotFound) => json_status(
-            StatusCode::NOT_FOUND,
-            &serde_json::json!({
-                "error": "Invite not found"
-            }),
-        ),
-        Err(RedeemInviteError::InvalidSignature) => json_status(
-            StatusCode::UNAUTHORIZED,
-            &serde_json::json!({
-                "error": "Invalid invite token signature"
-            }),
-        ),
-    }
-}
-
-/// `DELETE /api/auth/users/{github_login}` (`#96`)
-pub async fn revoke_user(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(github_login): Path<String>,
-) -> Response {
-    let auth = resolve_auth(&state.config, &state.job_store, &headers);
-    if matches!(auth, AuthResolution::Anonymous) {
-        return json_status(
-            StatusCode::UNAUTHORIZED,
-            &serde_json::json!({
-                "error": "Unauthorized: admin API key or admin operator session required"
-            }),
-        );
-    }
-    if !auth.is_admin() {
-        return json_status(
-            StatusCode::FORBIDDEN,
-            &serde_json::json!({
-                "error": "Forbidden: admin privileges required"
-            }),
-        );
-    }
-
-    if state.job_store.revoke_auth_user(&github_login) {
-        json_ok(&serde_json::json!({
-            "status": "ok",
-            "github_login": github_login,
-            "revoked": true
-        }))
-    } else {
-        json_status(
-            StatusCode::NOT_FOUND,
-            &serde_json::json!({
-                "error": "User not found",
-                "github_login": github_login
-            }),
-        )
-    }
-}
+pub use super::platform_auth::{
+    auth_session, create_invite, list_invites, redeem_invite, revoke_user, RedeemInviteRequest,
+};
 
 #[cfg(test)]
 mod tests {
